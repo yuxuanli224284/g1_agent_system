@@ -2,7 +2,7 @@
 
 **Unitree G1 · 手持扫码枪 · Qwen3-VL-8B · GroundingDINO · Isaac Sim**
 
-g1_agent_system 是一个让人形机器人在仓库里**找箱子、找条码、走过去用手持扫码枪逐个扫码**的 agent 系统，运行在 [g1_barcode_sim](https://github.com/yuxuanli224284/g1_barcode_sim) 仿真环境上。系统把所有几何计算放在确定性的工具里，由规则状态机或视觉语言模型（VLM）通过工具调用来编排流程。
+g1_agent_system 是一个让人形机器人在仓库里**找箱子、找条码、走过去用手持扫码枪逐个扫码**的 agent 系统，运行在 [g1_barcode_sim](https://yuxuanli224284.github.io/g1_docs/barcode_sim/) 仿真环境上。系统把所有几何计算放在确定性的工具里，由规则状态机或视觉语言模型（VLM）通过工具调用来编排流程。
 
 ```{figure} images/system_overview.png
 :alt: 系统总图：仿真服务器、VLM 服务、Harness 客户端三个进程，客户端内部的编排层、Harness、工具箱、感知与运动学，以及评测通道

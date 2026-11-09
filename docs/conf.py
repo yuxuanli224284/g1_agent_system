@@ -28,7 +28,6 @@ html_title = "g1_agent_system 文档"
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_theme_options = {
-    "repository_url": "https://github.com/yuxuanli224284/g1_agent_system",
-    "use_repository_button": True,
+    "use_repository_button": False,
     "show_toc_level": 2,
 }

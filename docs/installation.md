@@ -1,6 +1,6 @@
 # 安装与运行
 
-本页说明如何在一台 Linux + NVIDIA GPU 的机器上装好三个进程所需的环境，并跑通第一个场景。仿真环境本身的安装见 [g1_barcode_sim 文档](https://yuxuanli224284.github.io/g1_barcode_sim/installation.html)。
+本页说明如何在一台 Linux + NVIDIA GPU 的机器上装好三个进程所需的环境，并跑通第一个场景。仿真环境本身的安装见 [g1_barcode_sim 文档](https://yuxuanli224284.github.io/g1_docs/barcode_sim/installation.html)。
 
 ## 目录布局
 

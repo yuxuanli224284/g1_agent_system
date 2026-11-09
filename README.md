@@ -4,7 +4,7 @@
 
 ![系统总图](docs/images/system_overview.png)
 
-**详细文档**（每个组件的实现、从最初版本开始的每一次改进、实验记录）：<https://yuxuanli224284.github.io/g1_agent_system/>（源文件在 [`docs/`](docs/)，Sphinx）。
+**详细文档**（每个组件的实现、从最初版本开始的每一次改进、实验记录）：<https://yuxuanli224284.github.io/g1_docs/agent_system/>（源文件在 [`docs/`](docs/)，Sphinx）。
 
 ## 主要内容
 
