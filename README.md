@@ -10,7 +10,7 @@
 
 | 部分 | 说明 |
 |---|---|
-| 三个进程 | 仿真服务器（G1BarcodeEnv + ZeroMQ RPC）、VLM 服务（vLLM，OpenAI 兼容接口）、Harness 客户端（感知、工具、编排、评测） |
+| 三个进程 | 仿真服务器（G1BarcodeEnv + ZeroMQ RPC）、VLM 服务（vLLM 部署 Qwen3-VL-8B-Instruct，bf16，OpenAI 兼容接口）、Harness 客户端（感知、工具、编排、评测） |
 | 编排模式 | `rule` 固定状态机；`agent_assist` 状态机 + LLM 只处理异常；`agent_full` LLM 通过工具调用决定每一步 |
 | 感知 | GroundingDINO 检测箱子和条码标签，深度平面拟合求箱面，下蹲补看低处标签，扫码枪相机近距离修正 |
 | 运动 | pinocchio 正运动学 / 阻尼最小二乘 IK，站位评估，GR00T WBC 行走与下蹲（仿真侧） |
