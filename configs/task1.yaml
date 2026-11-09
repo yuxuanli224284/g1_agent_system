@@ -1,0 +1,36 @@
+# Task 1
+selector_default: left
+d_obs_range: [0.60, 1.00]
+d_obs_step: 0.05
+approach:
+  segment_frac: 0.5          # each segment walks min(remaining * 0.5, max_segment)
+  max_segment_m: 1.0
+  final_below_m: 0.3         # remaining < 0.3 m -> one last move
+  lost_backoff_m: 0.3        # target lost -> back off 0.3 m and re-detect
+  precise_speed_scale: 0.5   # final move and fine moves at half the velocity limits (full-speed short moves overshot
+                             # by up to ~12 cm: the controller saturates at 0.4 m/s until 0.15 m from the goal)
+  final_bias_m: 0.0          # aim at the target itself. Was 0.05 for policy1, which overshot and could not walk back; GR00T
+                             # stops within ~1 cm and walks backwards, 2026-11-06
+  move_timeout_s: 20.0
+  max_segments: 8
+arrive:
+  dist_tol_m: 0.03           # harness-side arrival check (on estimates)
+  yaw_tol_deg: 3.0
+  max_fine_tunes: 2
+  fine_tol_frac: 0.5         # fine moves stop at half the arrival tolerance (1.5 cm / 1.5 deg)
+too_few_inliers_advance_m: 1.0   # step 3 failure: advance toward the detection and retry
+explore_sequence:            # rule mode, with `forward` first: the head camera looks ~48 deg down, so
+  - [forward, 0.5]           # from 4-5 m the boxes sit at the top edge of the image or above it (t1_L0 previews)
+  - [left, 0.5]
+  - [right, 1.0]
+  - [back, 0.5]
+  - [turn_left, 15]
+  - [turn_right, 30]
+budget:
+  max_tool_calls: 40
+  max_explore_steps: 6
+  max_retries_per_tool: 2
+  max_wall_s: 1800
+eval:                        # evaluator only
+  dist_tol_m: 0.05
+  yaw_tol_deg: 5.0

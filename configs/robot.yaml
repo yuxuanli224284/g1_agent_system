@@ -1,0 +1,45 @@
+# Harness-side robot parameters
+urdf: assets/g1_dex1_scanner.urdf      # exported from the simulated USD (scripts/export_urdf.py)
+root_frame: pelvis
+head_cam_frame: head_cam_optical
+arm_side: left
+wrist_point_frame: scanner_tip         # "以后装上扫码枪，就改成枪口位置" -> the scanner tip (exit window centre)
+wrist_cam_frame: wrist_cam_optical     # the camera at the scanner head (DS2208-like imager, 640x480, 32.8 deg hFOV)
+wrist_forward_axis: [1, 0, 0]          # scan direction = x axis of scanner_tip
+ik:
+  dls_lambda: 0.05
+  step_gain: 0.5                       # fraction of the error corrected per iteration (offline, no dynamics)
+  max_iters: 300
+  tol_pos: 0.002                       # m
+  tol_angle_deg: 1.0
+  aim_weight: 0.20                     # m/rad, as the simulator's aim IK (angle error at 0.20 m scan distance)
+  joint_limit_margin: 0.05             # rad kept away from every soft limit
+  restarts: 6                          # extra random starts when the first solve does not converge
+  plan_workers: 16                     # stance planning process pool (tools/stance_eval.py); 0 = serial. Measured
+                                       # 2026-11-07 (3 stack codes, roll constraint, identical stances to serial):
+                                       # serial 10/30/104 s, 8 -> 5/12/53, 16 -> 5/10/47, 32 -> 5/9/50 s (saturated:
+                                       # the remaining time is the serial clearance / robustness checks)
+  plan_stall_window: 100               # stance planning only (never move_arm): stop a solve whose weighted error fell by
+  plan_stall_eps_m: 0.0005             # < 0.5 mm over 100 iterations. Measured on the 0.30 m stack code (2026-11-07):
+                                       # 705 failing solves ran the full 300 iterations (95 % of the IK work); this stops
+                                       # them at a median 118 and cut 1 of 205 successful solves (0.5 %)
+  seed: 0
+arm_motion:
+  duration_s: 2.0                      # set_arm_joints ramp time
+  settle_s: 1.0                        # extra standing time after the ramp
+  correction_iters: 2                  # closed-loop corrections of the commanded target (arm PD sag)
+  correction_tol: 0.01                 # m
+limits:                                # guards
+  max_move_m: 0.5                      # single explore move
+  max_turn_deg: 15.0
+  max_approach_segment_m: 1.0
+  workspace_radius_m: 8.0              # the robot may not leave this radius around its episode start (odom)
+body:                                  # squat / stand (GR00T body command), stance planning with squats (tools/body.py)
+  calibration: assets/gear_body_calibration.json   # measured in Isaac (source inside): planned squat levels = these only
+  ramp_s: 1.0                          # set_base_height ramp = the calibration ramp (every level stable with it)
+  settle_s: 2.0                        # hold after the ramp = the calibration hold (the calibrated values are taken there)
+  clearance_margin_m: 0.03             # min clearance robot-to-face and arm-to-leg in a planned pose: the largest arm
+                                       # aim error in the motion test (8 mm) + the placement distance tolerance 0.02 m
+                                       # (task2.yaml check.dist_tol_m), rounded up
+  stance_robust_pos_m: 0.03            # stance robustness check = the robot's move_relative tolerance (g1_barcode_sim
+  stance_robust_yaw_deg: 1.7           # configs/robot.yaml move_relative pos_tol 0.03 m, yaw_tol 0.03 rad = 1.7 deg)

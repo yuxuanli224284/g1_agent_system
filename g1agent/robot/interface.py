@@ -1,0 +1,40 @@
+"""RobotInterface: everything the harness may do with the robot. The simulator client and a
+future real-robot (DDS) implementation provide the same methods. No ground truth here."""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+
+class RobotInterface(ABC):
+    @abstractmethod
+    def get_robot_info(self) -> dict: ...                       # joint names, camera intrinsics, limits
+    @abstractmethod
+    def get_head_obs(self) -> dict: ...                         # rgb, depth (m), K, T_root_headcam, timestamp
+    @abstractmethod
+    def get_wrist_obs(self, side: str = "left") -> dict: ...    # rgb, depth, K, T_root_wristcam, timestamp
+    @abstractmethod
+    def get_joint_state(self) -> dict: ...                      # names, q
+    @abstractmethod
+    def get_odom(self) -> dict: ...                             # T_odom_root
+    @abstractmethod
+    def walk(self, vx: float, vy: float, wz: float, duration: float) -> dict: ...
+    @abstractmethod
+    def move_root_relative(self, dx: float, dy: float, dyaw: float, timeout: float = 10.0,
+                           pos_tol: float | None = None, yaw_tol: float | None = None, speed_scale: float = 1.0) -> dict: ...
+    @abstractmethod
+    def stand(self, duration: float) -> dict: ...
+    @abstractmethod
+    def set_body_pose(self, height: float | None = None, torso_rpy=None, duration: float = 1.0, settle: float = 1.0) -> dict: ...
+    # squat / stand up (pelvis height command, m) and torso roll/pitch/yaw (rad), standing still
+    @abstractmethod
+    def get_robot_geometry(self) -> dict: ...                   # the robot's own collision points per link (body frames)
+    @abstractmethod
+    def set_arm_joints(self, side: str, q, duration: float) -> dict: ...
+    @abstractmethod
+    def set_gripper(self, side: str, opening: float) -> dict: ...
+    @abstractmethod
+    def scan(self) -> dict: ...                                 # trigger the handheld scanner
+    @abstractmethod
+    def draw_markers(self, markers: list, frame: str = "odom") -> dict: ...   # simulator only (no-op on hardware)
+    @abstractmethod
+    def clear_markers(self) -> dict: ...

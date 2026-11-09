@@ -1,0 +1,15 @@
+# OpenAI-compatible endpoint. To use GPT instead of the local Qwen3-VL: change base_url / model / api_key_env only.
+provider: openai_compatible
+base_url: http://127.0.0.1:47800/v1    # GPT: https://api.openai.com/v1
+model: Qwen/Qwen3-VL-8B-Instruct       # GPT: e.g. gpt-4.1
+api_key_env: LLM_API_KEY               # read from the environment, never written to files (vLLM accepts any value)
+temperature: 0.0
+max_tokens: null                       # global rule: no output-length cap; generation runs to EOS (context = server limit)
+timeout_s: 900                         # longer than a runaway generation to the context limit: 32768 tokens at the measured
+                                       # ~65 tok/s decode (vLLM log, one request) = ~500 s; 2026-11-07 a 120 s timeout cut a
+                                       # runaway reply 3x (SDK resends) and ended the episode. SDK resends are off (client.py)
+image_max_side: 640
+max_retries_on_length: 2               # a reply that still ends with finish_reason == "length" is never parsed: redraw
+# a redraw (after a length-truncated or timed-out reply) samples with the model's own generation config (Qwen3-VL-8B-
+# Instruct generation_config.json): with temperature 0 the redraw would repeat the same runaway reply token for token
+redraw_sampling: {temperature: 0.7, top_p: 0.8, top_k: 20}

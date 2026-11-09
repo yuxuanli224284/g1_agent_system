@@ -1,0 +1,33 @@
+# Perception parameters. Values marked "tuned" were set on L0 previews.
+box_detector:
+  model: IDEA-Research/grounding-dino-tiny
+  prompt: "a cardboard box."
+  box_threshold: 0.30                # groundingdino defaults (model card)
+  text_threshold: 0.25
+  nms_iou: 0.5                       # drop near-duplicate detections
+  container_min_children: 2          # drop a detection that contains >= 2 other detections (a box around the group)
+  container_overlap: 0.8             # "contains" = >= 80 % of the child's area inside
+plane_fit:
+  depth_valid: [0.2, 3.0]            # head depth valid range (camera spec, same as the simulator)
+  stride: 2                          # pixel subsampling inside the detection box
+  ransac_iters: 400
+  inlier_dist: 0.01                  # m
+  max_normal_tilt_deg: 20.0          # front face: normal within 20 deg of horizontal
+  min_inliers: 150
+  seed: 0
+fov_margin_frac: 0.05                # face corners inside the head image with a 5 % border
+barcode:
+  roi_pad_frac: 0.05                 # face ROI padding in the image
+  upscale: 3                         # head-camera ROI is upsampled before detection (labels are ~20-40 px wide)
+  # head camera (fx 243 px): an 8 cm code128 at 0.8 m spans ~24 px (< 0.2 px per module), cv2.barcode found 0/42
+  # (default params) and at most 5/18 (tuned) on t2 previews -> labels are localised with GroundingDINO on the
+  # upsampled box crop (13/13 on the same previews), then refined with cv2 detectors when they succeed
+  label_prompt: "a barcode label."
+  label_threshold: 0.25              # box threshold for the label prompt. 2026-11-07, 14 captured head views (plain + printed
+                                     # stacks): labels 0.25-0.72 (printed boxes 0.25-0.51: 0.35 lost 3 of 5), non-labels
+                                     # (whole box faces) <= 0.20; enclosing boxes are dropped in detect_label_dino
+  label_max_area_frac: 0.5           # a "label" covering > 50 % of the box crop is the face itself
+  wrist_upscale: 1                   # scanner camera (fx 1087 px) resolves the bars directly
+  wrist_decode_rotation_step_deg: 15 # symbol width from the wrist image (refine_with_wrist): zbar decodes 1-D codes only
+                                     # within ~+-17 deg of an image axis -> rotations 0..75; same value and evidence as the
+                                     # simulator's scanner (g1_barcode_sim configs/scanner.yaml scan.rotation_step_deg)

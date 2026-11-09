@@ -1,0 +1,4 @@
+/* Wide tables scroll inside their container instead of widening the page. */
+.bd-article table { display: block; overflow-x: auto; }
+/* Version headings in the evolution logs. */
+.bd-article h3 { margin-top: 1.6rem; }

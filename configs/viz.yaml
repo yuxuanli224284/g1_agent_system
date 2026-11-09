@@ -1,0 +1,44 @@
+# Diagnostic markers (drawn only in third-person renders, invisible to robot cameras)
+colors:                      # RGB 0-1
+  red: [0.95, 0.10, 0.10]    # root target (harness)
+  blue: [0.15, 0.35, 1.00]   # wrist target from the head camera (harness)
+  purple: [0.70, 0.20, 0.90] # wrist target refined with the wrist camera (harness)
+  green: [0.10, 0.85, 0.20]  # ground truth target (simulator, evaluation mode)
+  yellow: [1.00, 0.85, 0.05] # actually reached root / wrist pose (simulator, evaluation mode)
+sizes:
+  root_radius: 0.04
+  root_height: 0.01
+  root_arrow: 0.25
+  pelvis_radius: 0.03       # composite video: dot at the actual root body (pelvis) height, joined to the floor disc
+  point_radius: 0.012
+  pose_arrow: 0.08
+  shaft_radius: 0.006
+third_person:                # snapshot() / final.png camera (aux camera + USD markers), root frame of the robot at capture time
+  eye_offset: [0.6, 1.8, 1.6]
+  look_at: [0.9, 0.0, 0.8]
+  hfov_deg: 60.0
+recording:                   # composite episode video
+  cameras_enabled: true      # sim_server creates the two fixed recording cameras (sim camera_head.yaml recording); they
+                             # render on every policy step, recording or not. false: record_start fails (no MAIN / SIDE)
+  fps: 5                     # frames per SIMULATED second: one frame every round(1 / (fps * policy_dt)) policy steps
+  llm_hold_s: 1.0            # frozen-state frames written after each LLM reply (annotate kind "llm") so it can be read
+  detection_hold_s: 1.0      # frozen-state frames after a robot-port scan() and after a tool result with head-camera
+                             # pixel detections: those overlays belong to that one frame only
+  canvas: [1920, 1080]
+  panels:                    # [x, y, w, h]
+    main: [0, 0, 1280, 720]
+    ego: [1280, 0, 640, 360]
+    side: [1280, 360, 640, 360]
+    wrist: [0, 720, 480, 360]
+    agent: [480, 720, 800, 360]
+    metrics: [1280, 720, 640, 360]
+  font: {path: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc, face: Noto Sans CJK SC, size_px: 18, small_px: 15}
+  overlay: {line_px: 2, min_dot_px: 4, pad_px: 8, dash_px: 6}   # projected markers keep sizes.* in metres, but at least min_dot_px
+  framing:                   # fixed MAIN / SIDE cameras, posed once per episode at record_start (compositor.framing)
+    hfov_deg: 60.0           # = third_person.hfov_deg; the camera distance is then fitted to the content points
+    margin_frac: 0.05        # border kept free around the content (as testsuite factors task2_start.fov_margin_frac)
+    main: {azimuth_deg: 135.0, elevation_deg: 24.0}   # robot-start frame (0 forward, 90 left): 135 = behind-left
+                             # bisector; 24 deg = elevation of the old third-person camera (atan(0.8 / 1.82), see above)
+    side: {azimuth_deg: 0.0, elevation_deg: 24.0}     # target-face frame (0 = robot's left side of the boxes, 90 =
+                             # towards the robot): 0 looks straight across the robot-to-face gap
+invisibility_render_passes: 2  # renders before reading a camera in the invisibility self-check (as aux_render_passes)

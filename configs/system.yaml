@@ -1,0 +1,22 @@
+# Processes and addresses. GPUs: the start scripts use CUDA_VISIBLE_DEVICES, optionally through a launcher ($GPU_LAUNCHER).
+sim_server:
+  conda_env: unitree_sim_env     # conda env name (or a full prefix path) used by scripts/start_sim_server.sh
+  sim_root: ../g1_barcode_sim    # G1BarcodeEnv package; relative to this repo, or set $G1_SIM_ROOT
+  robot_port: 47555              # RobotInterface RPC (what the harness may use); instance i uses port + 10 * i
+  eval_port: 47556               # evaluation / episode control (ground truth, reset, markers in GT colours, recording)
+  instance_port_stride: 10       # several servers in parallel (env SIM_INSTANCE=i) for batch evaluation
+  eval_token_env: G1_EVAL_TOKEN  # the eval port answers only requests carrying this token (env var, not in files)
+  host: 127.0.0.1
+  mode_policies: null            # robot.yaml locomotion: gear_wbc (GR00T switches Balance / Walk itself; must be null).
+                                 # For the old unitree walker set g1_barcode_sim robot.yaml locomotion: unitree and
+                                 # mode_policies: {walk: assets/model/policy1.onnx, stand: assets/model/policy.onnx}
+  rpc_timeout_s: 600             # client receive timeout (a long walk / episode reset can take minutes of wall time)
+vlm_server:
+  conda_env: vllm_env            # used by scripts/start_vllm.sh
+  port: 47800
+  gpu_memory_utilization: 0.85
+  max_model_len: 32768
+harness_client:
+  conda_env: g1_agent
+  detector_device: cuda          # grounding-dino (cpu also works, slower)
+runs_dir: runs

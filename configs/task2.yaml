@@ -1,0 +1,35 @@
+# Task 2
+offset_m: 0.20               # wrist point (scanner tip) to barcode along the normal (fixed stand-off)
+pre_offset_m: 0.30           # pre-pose; with any stand-off d the pre-pose is at d + (pre_offset_m - offset_m)
+standoff:
+  mode: fixed                # fixed: offset_m; adaptive (task 3): from the estimated label width, see task3.yaml
+head_retry_advance_m: 0.10   # step 1: no barcode -> advance 0.1 m and retry once
+stance:                      # grid of root positions relative to the CURRENT BARCODE (facing its face), not the robot
+  min_face_dist_m: 0.35      # root must stay this far (horizontally) from the face plane = nearest grid row
+  max_face_dist_m: 0.70      # farthest grid row. m5 task-2 runs (61 stances, old robot-relative grid) chose 0.52-0.63 m
+  lateral_range: [-0.40, 0.40]   # root offset from the barcode along the robot's left axis; the same 61 stances lay at
+                                 # -0.37..+0.11 m (old grid: +-0.30 m around wherever the robot stood)
+  step: 0.05
+refine:
+  search_offsets_m: [[0.05, 0.0], [-0.05, 0.0], [0.0, 0.05], [0.0, -0.05]]   # in-plane (right, up) wrist search
+stereo:
+  baseline_m: 0.04
+  max_disagreement_m: 0.02
+place:
+  max_iters: 2
+  tol_m: 0.01
+scan:
+  retries_on_no_read: 1      # design decision (task 3 design): one retry (refine_with_wrist + move_arm final + scan)
+check:                       # harness-side placement check
+  dist_tol_m: 0.02
+  axis_offset_max_m: 0.02
+  angle_max_deg: 10.0
+budget:
+  max_tool_calls: 40
+  max_explore_steps: 6
+  max_retries_per_tool: 2
+  max_wall_s: 1800
+eval:                        # evaluator only
+  dist_tol_m: 0.03
+  axis_offset_max_m: 0.03
+  angle_max_deg: 15.0

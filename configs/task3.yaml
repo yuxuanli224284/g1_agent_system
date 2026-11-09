@@ -1,0 +1,28 @@
+# Task 3 = task 1 (find the boxes, walk to the observation pose of ALL boxes) + scan every barcode once, in the fixed
+# order "columns left to right, top to bottom inside a column".
+# Every task-1 / task-2 key is inherited (configs/task1.yaml, configs/task2.yaml); keys set here replace them.
+inherits: [task1, task2]
+selector_default: all        # phase 1 observes every detected box (the scenario's left/right target is not used)
+standoff:                    # scanner stand-off d = symbol_width / (2 tan(hfov_scanner / 2)) / fill_frac, clamped
+  mode: adaptive             # hfov_scanner from the wrist intrinsics (robot info wrist_K / wrist_size)
+  # symbol_width = the printed symbol (bars / modules), not the optional white backing: the symbol is what the scanner
+  # has to fit and resolve, and it exists with or without a backing. Planned with the head estimate (the label detection
+  # box, an upper bound of the symbol: farther, conservative), replaced by the wrist measurement (decoded symbol
+  # outline on the face plane) at the pre-pose, before the final pose.
+  fill_frac: 0.68            # the nominal 0.08 m code128 symbol lands at the validated 0.20 m (fx 1087, 640 px -> 32.8 deg:
+                             # 0.08 / (2 tan 16.40 deg) / 0.20 = 0.679). Was 0.85 on the 0.10 m label (2026-11-06 v1)
+  min_m: 0.12                # user decision (design requirement 5)
+  max_m: 0.30
+budget:                      # phase 1 = the task-1 budget; extended by per_barcode x the number of planned barcodes
+  max_tool_calls: 40         # (the Harness extends it when plan_scans returns the plan)
+  max_explore_steps: 6
+  max_retries_per_tool: 2    # per barcode: the Harness resets the failure streaks on next_barcode
+  max_wall_s: 1800
+  per_barcode:
+    max_tool_calls: 28       # task-2 maximum measured in the m5 rule runs (21 calls, 57 episodes) + next_barcode 1
+                             # + scan 1 + one no_read retry (refine, final, scan) 3 + move_arm home before / after 2
+    max_wall_s: 600          # task-2 maximum measured wall time 518 s (same 57 episodes; p90 324 s) + the scan retry
+                             # and two arm-home motions (3 s each), rounded up
+eval:                        # evaluator only; the per-read placement check uses task2.yaml eval
+  dist_tol_m: 0.05           # task-1 phase (same as task1.yaml eval)
+  yaw_tol_deg: 5.0

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+runs/
+local.env
+docs/_build/
+*.mp4
+*.npz
+*.npy
+*.log
+*.out
+.eval_token
