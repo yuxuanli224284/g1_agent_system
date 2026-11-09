@@ -2,7 +2,10 @@
 
 本页介绍 agent 系统里和大模型有关的部分。它分成两层：
 
-- **服务端**：用 vLLM 在本机一张 GPU 上部署多模态模型 Qwen3-VL-8B-Instruct，对外提供 OpenAI 兼容的 HTTP 接口；
+- **服务端**：用 vLLM 在本机一张 GPU 上部署多模态模型 Qwen3-VL-8B-Instruct，对外提供 OpenAI 兼容的 HTTP 接口。具体如下：
+  - 模型为 Hugging Face 上的 `Qwen/Qwen3-VL-8B-Instruct`，约 80 亿参数，是 Instruct 版，不是 Thinking 版；
+  - 以 bfloat16 精度加载，没有量化，vLLM 日志记录权重占 16.8 GiB 显存；
+  - 上下文长度设为 32768 token（`configs/system.yaml` 的 `max_model_len`）；
 - **客户端**：`g1agent/llm/client.py` 里的 `LLMClient`，负责把对话、图像和工具定义发给服务端，处理截断和超时，并把模型返回的工具调用解析成 Python 对象。
 
 本页涉及的文件（路径相对于仓库根目录 `g1_agent_system/`）：
