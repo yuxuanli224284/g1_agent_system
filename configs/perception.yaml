@@ -8,8 +8,8 @@ box_detector:
   container_min_children: 2          # drop a detection that contains >= 2 other detections (a box around the group)
   container_overlap: 0.8             # "contains" = >= 80 % of the child's area inside
 head_depth:                          # where the head depth image comes from (perception/stereo_depth.py)
-  source: stereo                     # stereo: own matching on the D435i infrared pair (default since 2026-11-13);
-                                     # render: the camera's depth as delivered (simulator render, ideal) - baseline only
+  # source (stereo: own matching on the infrared pair | render: the camera's delivered depth, simulator render) is set
+  # per head camera: robot.yaml head_camera.<model>.depth_source (D435i: stereo; upstream single camera: render)
   valid_range_m: [0.3, 3.0]          # D435i: min-Z ~0.3 m at 848 x 480 (G1 depth camera spec 0.4 m), ideal range to 3 m
   disparity_sigma_px: 0.20           # measured: robust std of the disparity error vs the render depth, 0.18-0.22 px over
                                      # 10 frames at 0.6-2.5 m (2026-11-13, g1_barcode_sim scripts/d435i_check.py); depth noise

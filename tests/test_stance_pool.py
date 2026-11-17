@@ -33,7 +33,7 @@ class R:
 
 def _tb(workers):
     tb = tbmod.Toolbox.__new__(tbmod.Toolbox)
-    tb.cfg = config.load_all(); tb.ws = WorldState(); tb.markers = {}; tb.task = 3
+    tb.cfg = config.apply_head_camera(config.load_all(), "d435i"); tb.ws = WorldState(); tb.markers = {}; tb.task = 3
     tb.kin = Kinematics(); tb.ik = ArmIK(tb.kin); tb.ik.cfg = dict(tb.ik.cfg, plan_workers=workers)
     tb.robot = R(tb.kin); tb.side = "left"; tb.arm_at_home = True; tb.head = None
     tb._last_label = tb._wrist_detection = None

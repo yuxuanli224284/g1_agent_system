@@ -73,14 +73,17 @@ try:
             s += f'<axis xyz="{axis[0]:.7f} {axis[1]:.7f} {axis[2]:.7f}"/><limit lower="{lim[0]:.7f}" upper="{lim[1]:.7f}" effort="100" velocity="10"/>'
         joints.append(s + "</joint>")
     # extra frames
-    cc = env.cfg["camera"]
+    # both head-camera models (camera_head.yaml model), whichever the env was built with: head_cam_optical = the D435i
+    # colour camera, head_cam_optical_upstream = unitree's single camera, head_ir_left/right_optical = the D435i pair
+    from g1_barcode_sim.config import load_camera_cfg
+    cc, cu = load_camera_cfg({"model": "d435i"}), load_camera_cfg({"model": "upstream"})
     extra = [("head_cam_optical", cc["prim_parent_link"], make_T(cc["offset_pos"], cc["offset_rot_wxyz"])),
+             ("head_cam_optical_upstream", cu["prim_parent_link"], make_T(cu["offset_pos"], cu["offset_rot_wxyz"])),
              ("scanner_mount", env.cfg["robot"]["scanner_mount"]["parent_link"], env._T_body_mount),
              ("scanner_tip", env.cfg["robot"]["scanner_mount"]["parent_link"], env._T_body_tip),
              ("wrist_cam_optical", env.cfg["robot"]["scanner_mount"]["parent_link"], env._T_body_wcam)]
-    if cc.get("stereo") is not None:          # D435i infrared pair (camera_head.yaml model d435i)
-        extra += [(f"head_ir_{s}_optical", cc["prim_parent_link"], make_T(cc["stereo"][f"{s}_pos"], cc["offset_rot_wxyz"]))
-                  for s in ("left", "right")]
+    extra += [(f"head_ir_{s}_optical", cc["prim_parent_link"], make_T(cc["stereo"][f"{s}_pos"], cc["offset_rot_wxyz"]))
+              for s in ("left", "right")]
     for name, parent, T in extra:
         links.add(name)
         joints.append(f'  <joint name="{name}_joint" type="fixed"><parent link="{parent}"/><child link="{name}"/>{origin(T)}</joint>')

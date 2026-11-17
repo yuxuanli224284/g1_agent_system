@@ -80,6 +80,7 @@ class Toolbox:
         self.ik = ArmIK(self.kin)
         self.det = box_detector or BoxDetector(device)
         self.info = robot.get_robot_info()
+        config.apply_head_camera(self.cfg, self.info.get("head_camera_model"))   # frames, depth source, lean views
         self.side = self.cfg["robot"]["arm_side"]
         self.ws = WorldState()
         self.head = None
@@ -172,7 +173,8 @@ class Toolbox:
             if abs(up["pitch_cmd"]) > 1e-9:
                 raise ValueError("view calibration has no upright level (pitch_cmd 0)")
             higher = [l for l in ok_ if l["cam_pitch_below_horizontal_deg"] < up["cam_pitch_below_horizontal_deg"] - 1e-6]
-            self._leans = [up] + sorted(higher, key=lambda l: abs(l["pitch_cmd"]))
+            # a head camera without lean views (robot.yaml head_camera.<model>.lean_views) stays upright
+            self._leans = [up] + (sorted(higher, key=lambda l: abs(l["pitch_cmd"])) if self.cfg["robot"]["lean_views"] else [])
         return self._leans
 
     def _cam_T_at(self, x, y, yaw, lv):

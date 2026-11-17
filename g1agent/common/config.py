@@ -35,6 +35,7 @@ def _resolve_paths(name: str, cfg: dict) -> dict:
     if name == "system":
         s = cfg["sim_server"]
         s["sim_root"] = os.path.abspath(os.environ.get("G1_SIM_ROOT") or os.path.join(ROOT, s["sim_root"]))
+        s["head_camera"] = os.environ.get("G1_HEAD_CAMERA") or s["head_camera"]
     return cfg
 
 
@@ -46,6 +47,24 @@ def load(name: str, _seen: tuple = ()) -> dict:
     if not parents:
         return _resolve_paths(name, own)
     return merge_inherited(own, {p: load(p, _seen + (name,)) for p in parents})
+
+
+def apply_head_camera(cfg: dict, model: str | None) -> dict:
+    """Settings of the head camera the robot has (robot info head_camera_model) from robot.yaml head_camera.<model>:
+    robot.head_cam_frame / head_ir_left_frame / lean_views / head_camera_model and perception.head_depth.source.
+    Changes cfg in place and returns it; an unknown or missing model is an error (no default camera)."""
+    profiles = cfg["robot"]["head_camera"]
+    if model not in profiles:
+        raise ValueError(f"head camera model {model!r} has no robot.yaml head_camera entry (known: {sorted(profiles)})")
+    p = profiles[model]
+    if p["depth_source"] not in ("stereo", "render"):
+        raise ValueError(f"robot.yaml head_camera.{model}.depth_source must be stereo | render, got {p['depth_source']!r}")
+    if p["depth_source"] == "stereo" and not p["ir_left_frame"]:
+        raise ValueError(f"robot.yaml head_camera.{model}: stereo depth needs ir_left_frame")
+    cfg["robot"].update(head_camera_model=model, head_cam_frame=p["frame"], head_ir_left_frame=p["ir_left_frame"],
+                        lean_views=bool(p["lean_views"]))
+    cfg["perception"]["head_depth"]["source"] = p["depth_source"]
+    return cfg
 
 
 def load_all() -> dict:

@@ -10,6 +10,11 @@ sim_server:
   mode_policies: null            # robot.yaml locomotion: gear_wbc (GR00T switches Balance / Walk itself; must be null).
                                  # For the old unitree walker set g1_barcode_sim robot.yaml locomotion: unitree and
                                  # mode_policies: {walk: assets/model/policy1.onnx, stand: assets/model/policy.onnx}
+  head_camera: d435i             # head camera the simulator builds (g1_barcode_sim camera_head.yaml model): d435i (Intel
+                                 # D435i: colour + infrared stereo pair, default) | upstream (unitree's single 105 deg
+                                 # camera, the G1 version before the D435i change, tag g1-v1-upstream-cam).
+                                 # $G1_HEAD_CAMERA overrides it per server, so both can run side by side. The agent follows
+                                 # the model the robot reports (robot.yaml head_camera).
   rpc_timeout_s: 600             # client receive timeout (a long walk / episode reset can take minutes of wall time)
 vlm_server:
   conda_env: vllm_env            # used by scripts/start_vllm.sh

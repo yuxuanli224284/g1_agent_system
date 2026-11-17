@@ -6,6 +6,7 @@ import argparse, json, os, sys, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import numpy as np
+from g1agent.common import config
 from g1agent.common.transforms import inv_T, angle_between
 from g1agent.eval.eval_client import EvalClient
 from g1agent.kinematics.fk import Kinematics
@@ -20,7 +21,10 @@ res = {}
 t = time.time(); res["ping"] = robot.ping(); res["ping_s"] = round(time.time() - t, 3)
 res["reset"] = ev.reset("t2_L0_0000")
 info = robot.get_robot_info()
-h = robot.get_head_obs(); w = robot.get_wrist_obs("left")
+# head camera frame of the model the simulator built (system.yaml head_camera / $G1_HEAD_CAMERA)
+HEAD_FRAME = config.apply_head_camera(config.load_all(), info.get("head_camera_model"))["robot"]["head_cam_frame"]
+res["head_camera_model"] = info.get("head_camera_model")
+h = robot.get_head_obs(depth=True); w = robot.get_wrist_obs("left")
 res["head_obs"] = {"rgb": list(h["rgb"].shape), "depth": list(h["depth"].shape), "K00": float(h["K"][0, 0])}
 res["wrist_obs"] = {"rgb": list(w["rgb"].shape), "K00": float(w["K"][0, 0])}
 
@@ -29,7 +33,7 @@ def fk_check(tag):
     js = robot.get_joint_state(); h = robot.get_head_obs(); w = robot.get_wrist_obs("left")
     q = kin.q_from_state(js["names"], js["q"])
     out = {}
-    for name, T_sim, frame in (("head", h["T_root_headcam"], "head_cam_optical"), ("wrist", w["T_root_wristcam"], "wrist_cam_optical")):
+    for name, T_sim, frame in (("head", h["T_root_headcam"], HEAD_FRAME), ("wrist", w["T_root_wristcam"], "wrist_cam_optical")):
         T_fk = kin.pose(q, frame)
         dp = float(np.linalg.norm(T_fk[:3, 3] - T_sim[:3, 3]))
         R = T_fk[:3, :3].T @ T_sim[:3, :3]

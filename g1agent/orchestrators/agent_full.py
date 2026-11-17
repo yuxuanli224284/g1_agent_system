@@ -64,12 +64,22 @@ def barcode_boundary_text(h, nb_result: dict, later: list) -> str:
     return "\n".join(lines)
 
 
+# task-3 prompt sentence for a head camera with lean views (robot.yaml head_camera.<model>.lean_views); without them
+# the prompt is the one before lean views (v7 text)
+LEAN_VIEW_NOTE = ("\n  detect_boxes and the perception tools lean the torso back by themselves to look higher (the robot "
+                  "stands upright again\n  before it walks or moves the arm); you do not control the head view.")
+
+
 def run_agent_full(h, tcfg, selector, llm, log):
     b = tcfg["budget"]
-    kw = {"selector": selector, "max_tool_calls": b["max_tool_calls"], "max_explore_steps": b["max_explore_steps"]}
+    lean = h.task == 3 and h.tb.cfg["robot"]["lean_views"]      # only the task-3 prompt has the lean-view note
+    kw = {"selector": selector, "max_tool_calls": b["max_tool_calls"], "max_explore_steps": b["max_explore_steps"],
+          "head_view_note": LEAN_VIEW_NOTE if lean else ""}
     if h.task == 3:
         kw["per_barcode_calls"] = b["per_barcode"]["max_tool_calls"]
     system, version = load_prompt(f"task{h.task}_agent_full", **kw)
+    if h.task == 3 and not lean:
+        version += " (head camera without lean views: no lean-view note)"
     tools = openai_tools(TASK_TOOLS[h.task])
     if "move_arm" in TASK_TOOLS[h.task]:
         # move_arm("home") needs the episode's initial arm pose (the rule orchestrators record it the same way); without

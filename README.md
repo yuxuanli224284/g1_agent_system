@@ -34,13 +34,27 @@ python scripts/run_task.py --scenario t2_L0_0000 --mode rule             # 桌�
 python scripts/run_task.py --scenario stack4c_L0_0001 --mode agent_full  # 纸箱箱堆，LLM 全程决策
 ```
 
+## 头部相机：D435i 与原版单目相机
+
+仿真服务器按 `configs/system.yaml` 的 `sim_server.head_camera` 构建头部相机，环境变量 `G1_HEAD_CAMERA` 可以按服务器覆盖它，两种相机的服务器可以同时运行。agent 读取机器人报告的相机型号（robot info `head_camera_model`），自动选用 `configs/robot.yaml` 中 `head_camera.<型号>` 的设置：
+
+| 型号 | 头部相机 | 深度来源 | 躯干后仰补看 | task 3 提示词 |
+|---|---|---|---|---|
+| `d435i`（默认） | 真机参数：彩色 848×480 / 69°，红外双目 848×480 / 87°，基线 50 mm，带散斑投射器 | 对红外双目做立体匹配（SGBM） | 有 | v8 |
+| `upstream` | unitree 上游单目 105° 相机 | 仿真渲染深度 | 无 | 与 v7 文字相同 |
+
+```bash
+G1_HEAD_CAMERA=upstream setsid nohup bash scripts/start_sim_server.sh > runs/sim_server_upstream.log 2>&1 &
+```
+
+`upstream` 是"原版相机 + 当前 agent 逻辑"。要完整复现 D435i 改动之前的系统，请检出标签 `g1-v1-upstream-cam`。
+
 ## 版本与分支
 
 | 版本 | 位置 | 说明 |
 |---|---|---|
-| D435i 头部相机（当前） | `main` | 头部深度由红外双目立体匹配得到，带躯干后仰补看 |
+| D435i 头部相机（当前） | `main` | 默认 `head_camera: d435i`，可切换为 `upstream`（见上） |
 | 原版 G1 | 标签 `g1-v1-upstream-cam` | D435i 改动之前的完整版本（单目 105° 相机 + 渲染深度），`git checkout g1-v1-upstream-cam` |
-| 新旧相机一键切换（验证中） | 分支 `g1-camera-switch` | agent 按机器人报告的相机型号自动切换；仿真验证通过后合并进 `main` |
 | T800 Pro（未完成） | 分支 `t800` | EngineAI T800 Pro 适配（`--robot t800`），基于 D435i 改动之前的 `main`，尚未完成和合并 |
 
 ## 目录结构

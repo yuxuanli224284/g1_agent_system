@@ -42,9 +42,9 @@ def main():
     token = os.environ.get(SYS["eval_token_env"])
     if not token:
         raise SystemExit(f"set ${SYS['eval_token_env']} (evaluation token) before starting the server")
-    overrides = {"robot": {"mode_policies": SYS["mode_policies"]}}
+    overrides = {"robot": {"mode_policies": SYS["mode_policies"]}, "camera": {"model": SYS["head_camera"]}}
     if REC["cameras_enabled"]:
-        overrides["camera"] = {"recording": {"enabled": True}}
+        overrides["camera"]["recording"] = {"enabled": True}
     env = G1BarcodeEnv("scenario", headless=True, seed=0, config_overrides=overrides)
     import cv2
     import omni.usd
@@ -492,6 +492,7 @@ def robot_info(env):
     from g1_barcode_sim.arm import ARM_JOINTS
     o = env.get_obs()
     return {"joint_names": list(env.robot.data.joint_names), "arm_joints": ARM_JOINTS,
+            "head_camera_model": env.cfg["camera"]["model"],      # d435i | upstream (system.yaml head_camera)
             "head_K": o["K"], "head_size": list(o["rgb"].shape[:2]),
             # D435i infrared pair (None for the single upstream camera): intrinsics, size, baseline
             "head_stereo": (None if env.ir_cams is None else

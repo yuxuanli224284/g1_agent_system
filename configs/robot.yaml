@@ -1,8 +1,18 @@
 # Harness-side robot parameters
 urdf: assets/g1_dex1_scanner.urdf      # exported from the simulated USD (scripts/export_urdf.py)
 root_frame: pelvis
-head_cam_frame: head_cam_optical       # D435i: the colour camera (15 mm left of the left infrared imager)
-head_ir_left_frame: head_ir_left_optical   # D435i left infrared imager (depth origin)
+head_camera:                           # per head-camera model; the agent follows the model the robot reports (robot info
+                                       # head_camera_model, config.apply_head_camera; simulator: system.yaml head_camera)
+  d435i:                               # Intel D435i as on the G1 (default since 2026-11-13)
+    frame: head_cam_optical            # the colour camera (15 mm left of the left infrared imager)
+    ir_left_frame: head_ir_left_optical   # left infrared imager (depth origin)
+    depth_source: stereo               # own matching on the infrared pair (perception.yaml head_depth)
+    lean_views: true                   # torso lean-back views (view block below): the 42 deg colour view needs them
+  upstream:                            # unitree upstream single camera, 105 deg (the version of tag g1-v1-upstream-cam)
+    frame: head_cam_optical_upstream   # at the d435_link origin
+    ir_left_frame: null
+    depth_source: render               # the camera's delivered depth (simulator render)
+    lean_views: false                  # that version had no lean views
 arm_side: left
 wrist_point_frame: scanner_tip         # "以后装上扫码枪，就改成枪口位置" -> the scanner tip (exit window centre)
 wrist_cam_frame: wrist_cam_optical     # the camera at the scanner head (DS2208-like imager, 640x480, 32.8 deg hFOV)

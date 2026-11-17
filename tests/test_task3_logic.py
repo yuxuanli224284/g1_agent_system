@@ -114,7 +114,7 @@ def bare_toolbox(robot, task=3):
     """A Toolbox without models / kinematics: only the state the bookkeeping tools need."""
     tb = tbmod.Toolbox.__new__(tbmod.Toolbox)
     tb.robot = robot
-    tb.cfg = config.load_all()
+    tb.cfg = config.apply_head_camera(config.load_all(), "d435i")
     tb.ws = WorldState()
     tb.markers = {}
     tb.task = task
@@ -1065,3 +1065,40 @@ def test_stack_side_views_reach_the_known_stack_top():
     assert np.allclose(out[4:, :2], C[2:, :2])                       # the top corners raised, same x / y
     tb.ws.stack["faces"][0]["corners"][:, 2] = [0, 0, 0.5, 0.5]      # stack lower than this side: unchanged
     assert np.array_equal(tb._to_stack_top(C), C)
+
+
+def test_head_camera_profiles_follow_the_reported_model():
+    """robot.yaml head_camera: the D435i gets stereo depth, its colour frame and lean views; the upstream single camera
+    gets render depth, its own frame (d435_link origin, 15 mm right of the D435i colour camera) and no lean views."""
+    from g1agent.kinematics.fk import Kinematics
+    d = config.apply_head_camera(config.load_all(), "d435i")
+    u = config.apply_head_camera(config.load_all(), "upstream")
+    assert (d["perception"]["head_depth"]["source"], d["robot"]["lean_views"]) == ("stereo", True)
+    assert (u["perception"]["head_depth"]["source"], u["robot"]["lean_views"]) == ("render", False)
+    kin = Kinematics()
+    q = kin.q_from_state([], [])
+    Td, Tu = kin.pose(q, d["robot"]["head_cam_frame"]), kin.pose(q, u["robot"]["head_cam_frame"])
+    assert np.allclose(Td[:3, :3], Tu[:3, :3]) and abs(np.linalg.norm(Td[:3, 3] - Tu[:3, 3]) - 0.015) < 1e-6
+    for bad in (None, "t800"):
+        try:
+            config.apply_head_camera(config.load_all(), bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"model {bad!r} accepted")
+
+
+def test_no_lean_views_without_them():
+    """upstream camera: only the upright view is planned; the task-3 prompt has no lean-view sentence (v7 text)."""
+    from g1agent.orchestrators import agent_full as af
+    tb = bare_toolbox(FakeRobot())
+    tb.cfg = config.apply_head_camera(config.load_all(), "upstream")
+    tb.body_cmd = {"height_default": 0.74, "height_range": [0.3, 0.8], "rpy_default": [0, 0, 0]}
+    lv = tb._lean_levels()
+    assert len(lv) == 1 and abs(lv[0]["pitch_cmd"]) < 1e-9
+    tb.cfg = config.apply_head_camera(config.load_all(), "d435i"); tb._leans = None
+    assert len(tb._lean_levels()) > 1
+    from g1agent.orchestrators.common import load_prompt
+    kw = {"selector": "all", "max_tool_calls": 1, "max_explore_steps": 1, "per_barcode_calls": 1}
+    with_note, _ = load_prompt("task3_agent_full", head_view_note=af.LEAN_VIEW_NOTE, **kw)
+    without, _ = load_prompt("task3_agent_full", head_view_note="", **kw)
+    assert "lean the torso back" in with_note and "lean the torso back" not in without
