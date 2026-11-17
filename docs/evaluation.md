@@ -47,7 +47,7 @@
 
 `g1agent/eval/eval_client.py` 中的 `EvalClient` 是评测端口的客户端，只有评测器和测试集运行脚本使用它。
 
-- 构造参数 `instance`：缺省时取环境变量 `SIM_INSTANCE`，再缺省为 0。端口为 `eval_port + i · instance_port_stride`，即 `47556 + 10·i`。机器人端口同样按 `10·i` 偏移，所以一台机器上可以并行跑多个仿真实例。
+- 构造参数 `instance`：缺省时取环境变量 `SIM_INSTANCE`，再缺省为 0。端口为 `eval_port + i · instance_port_stride`，即 `31556 + 10·i`。机器人端口同样按 `10·i` 偏移，所以一台机器上可以并行跑多个仿真实例。
 - 令牌：从环境变量读取，变量名由 `configs/system.yaml` 的 `eval_token_env` 指定（值为 `G1_EVAL_TOKEN`）。没有令牌时抛出 `RuntimeError`。令牌由启动脚本 `scripts/start_sim_server.sh` 第一次运行时生成，保存在 `runs/.eval_token`；仿真服务器本身在没有令牌时拒绝启动。
 - 超时：`rpc_timeout_s = 600 s`。配置注释的理由是，一次长距离行走或一次 episode reset 可能要几分钟墙钟时间。
 - 方法都是对 `rpc.call` 的一行封装，直接返回服务器的回复：
@@ -453,7 +453,7 @@ evaluate(task, gt, actual, ws, stages=None, scan_log=None)
 | `configs/task3.yaml` standoff | fill_frac | 0.68 | 名义 0.08 m 符号落在已验证的 0.20 m |
 | 同上 | min_m / max_m | 0.12 / 0.30 m | min：设计需求第 5 条；max：未给出 |
 | `evaluator.scanner_hfov_gt` | hFOV | 32.8° | 由仿真扫码相机定义推导 |
-| `configs/system.yaml` | eval_port / instance_port_stride / rpc_timeout_s | 47556 / 10 / 600 s | 本机默认端口被占用；超时：长距离行走或 reset 可能要几分钟 |
+| `configs/system.yaml` | eval_port / instance_port_stride / rpc_timeout_s | 31556 / 10 / 600 s | 本机默认端口被占用；端口在 Linux 临时端口范围之外；超时：长距离行走或 reset 可能要几分钟 |
 | `run_suite.py` | DETECTOR_THREADS 默认值 | 16 | 未给出 |
 | `select_agent_subset.py` | K | 2 | 2026-11-06 的决定 |
 | `summarize.py` | 因素标签截断 / 图尺寸 / dpi | 14 字符 / 5×3 / 110 | 未给出（只影响显示） |

@@ -2,8 +2,11 @@
 sim_server:
   conda_env: unitree_sim_env     # conda env name (or a full prefix path) used by scripts/start_sim_server.sh
   sim_root: ../g1_barcode_sim    # G1BarcodeEnv package; relative to this repo, or set $G1_SIM_ROOT
-  robot_port: 47555              # RobotInterface RPC (what the harness may use); instance i uses port + 10 * i
-  eval_port: 47556               # evaluation / episode control (ground truth, reset, markers in GT colours, recording)
+  robot_port: 31555              # RobotInterface RPC (what the harness may use); instance i uses port + 10 * i.
+                                 # Ports below 32768: Linux gives outgoing connections local ports from 32768-60999
+                                 # (ip_local_port_range), so a fixed port there can be taken for a moment by any
+                                 # connection (2026-11-16: 47586 and 47800 were, the server / vLLM failed to bind)
+  eval_port: 31556               # evaluation / episode control (ground truth, reset, markers in GT colours, recording)
   instance_port_stride: 10       # several servers in parallel (env SIM_INSTANCE=i) for batch evaluation
   eval_token_env: G1_EVAL_TOKEN  # the eval port answers only requests carrying this token (env var, not in files)
   host: 127.0.0.1
@@ -18,7 +21,7 @@ sim_server:
   rpc_timeout_s: 600             # client receive timeout (a long walk / episode reset can take minutes of wall time)
 vlm_server:
   conda_env: vllm_env            # used by scripts/start_vllm.sh
-  port: 47800
+  port: 31800                    # below 32768, see sim_server.robot_port
   gpu_memory_utilization: 0.85
   max_model_len: 32768
 harness_client:

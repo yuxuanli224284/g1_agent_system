@@ -20,7 +20,7 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 grep -q "Application startup complete" $OUT.vllm.log || { echo "ABORT vLLM not up after 10 min"; kill -TERM -- -$VPGID; exit 3; }
-echo "VLLM_READY $(date +%T) gpu7_used=$(nvidia-smi -i 7 --query-gpu=memory.used --format=csv,noheader)"
+echo "VLLM_READY $(date +%T) gpu${GPU}_used=$(nvidia-smi -i $GPU --query-gpu=memory.used --format=csv,noheader)"
 ( while sleep 30; do $SP --id $RUN --status "Running episodes" --done $(ls $OUT/agent_full/*/result.json 2>/dev/null | wc -l) --total $N; done ) &
 WATCH=$!
 CL=""; for s in $SCENS; do CL="${CL:+$CL;}scripts/run_task.py --scenario $s --mode agent_full --task $TASK --run_dir $OUT/agent_full"; done

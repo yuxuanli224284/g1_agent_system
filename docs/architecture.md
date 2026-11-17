@@ -18,8 +18,8 @@
 
 | 进程 | conda 环境 | 启动方式 | 对外接口 | 里面运行什么 |
 |---|---|---|---|---|
-| 仿真服务器 | `unitree_sim_env` | `scripts/start_sim_server.sh` | ZeroMQ REP：robot port `47555 + 10·i`，eval port `47556 + 10·i` | 仿真环境 `G1BarcodeEnv`（Isaac Sim，无界面，来自仿真包 `g1_barcode_sim`，行走控制器在仿真包内）、回合状态 `Episode`（录像、阶段日志、扫码日志）、USD 诊断标记 |
-| VLM 服务 | vLLM 环境 | `scripts/start_vllm.sh` | HTTP，OpenAI 兼容接口 `http://127.0.0.1:47800/v1` | vLLM 0.11.2 加载 `Qwen/Qwen3-VL-8B-Instruct`，工具调用解析器 `hermes`，上下文长度 32768 |
+| 仿真服务器 | `unitree_sim_env` | `scripts/start_sim_server.sh` | ZeroMQ REP：robot port `31555 + 10·i`，eval port `31556 + 10·i` | 仿真环境 `G1BarcodeEnv`（Isaac Sim，无界面，来自仿真包 `g1_barcode_sim`，行走控制器在仿真包内）、回合状态 `Episode`（录像、阶段日志、扫码日志）、USD 诊断标记 |
+| VLM 服务 | vLLM 环境 | `scripts/start_vllm.sh` | HTTP，OpenAI 兼容接口 `http://127.0.0.1:31800/v1` | vLLM 0.11.2 加载 `Qwen/Qwen3-VL-8B-Instruct`，工具调用解析器 `hermes`，上下文长度 32768 |
 | Harness 客户端 | `g1_agent` | `scripts/run_task.py`（单个场景）、`scripts/run_suite.py`（整套测试集） | 不监听端口 | 感知（GroundingDINO、平面拟合）、运动学（pinocchio）、工具箱 `Toolbox`、守门层 `Harness`、编排器、LLM 客户端、评测器 |
 
 `i` 是实例号，取自环境变量 `SIM_INSTANCE`（默认 0）。端口步长 `instance_port_stride: 10` 写在 `configs/system.yaml` 里，用于在同一台机器上并行跑多组"仿真服务器 + 客户端"做批量评测。rule 模式不调用 LLM，可以不启动 VLM 服务。
@@ -51,7 +51,7 @@
 
 #### 1.2 VLM 服务（`scripts/start_vllm.sh`）
 
-- 从 `configs/system.yaml` 读端口 `47800`、`gpu_memory_utilization`、`max_model_len: 32768`，从 `configs/llm.yaml` 读模型名，离线加载权重（`HF_HUB_OFFLINE=1`）。
+- 从 `configs/system.yaml` 读端口 `31800`、`gpu_memory_utilization`、`max_model_len: 32768`，从 `configs/llm.yaml` 读模型名，离线加载权重（`HF_HUB_OFFLINE=1`）。
 - 关键参数：`--enable-auto-tool-choice --tool-call-parser hermes`（Qwen 聊天模板的工具调用格式，由 `scripts/smoke_vlm.py` 验证）；`--limit-mm-per-prompt '{"image": 8, "video": 0}'`。
 - 取卡方式和仿真服务器一样先读 `local.env`：没有设置 `VLLM_GPU` 时，若定义了 `gpu_launch` 就由它包装（我们机器上是通过共享 GPU 排队工具租一张卡），否则沿用继承的 `CUDA_VISIBLE_DEVICES`，用 `system.yaml` 的 `gpu_memory_utilization`；设置 `VLLM_GPU` 时进入"共享卡模式"，必须同时给出 `VLLM_KV_GIB` 和 `VLLM_GMU`，并加 `--kv-cache-memory-bytes` 和 `--enforce-eager`（原因见演进记录 v4）。
 - 上下文长度 32768 是显存方面的设置。系统任何地方都不设输出长度上限（见第 5 节）。

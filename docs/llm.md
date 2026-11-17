@@ -55,7 +55,7 @@ LLMClient.chat()  ── HTTP（OpenAI chat.completions + tools）──►  vLL
 | 键 | 当前值 | 含义与依据 |
 |---|---|---|
 | `provider` | `openai_compatible` | 说明性字段 |
-| `base_url` | `http://127.0.0.1:47800/v1` | 本机 vLLM。换 GPT 时改成 `https://api.openai.com/v1` |
+| `base_url` | `http://127.0.0.1:31800/v1` | 本机 vLLM。换 GPT 时改成 `https://api.openai.com/v1` |
 | `model` | `Qwen/Qwen3-VL-8B-Instruct` | 换 GPT 时改成例如 `gpt-4.1` |
 | `api_key_env` | `LLM_API_KEY` | 从这个环境变量读 key，key 不写进任何文件；vLLM 接受任意值 |
 | `temperature` | `0.0` | 正常请求用贪心解码。配置里没有写依据 |
@@ -116,7 +116,7 @@ LLMClient.chat()  ── HTTP（OpenAI chat.completions + tools）──►  vLL
 用法：`setsid nohup bash scripts/start_vllm.sh > runs/vllm.log 2>&1 &`，脱离终端在后台运行。
 
 1. 切到仓库根目录。仓库根目录下如果有不进版本库的 `local.env`，先 `source` 它。它可以设置下面用到的环境变量，也可以定义一个 shell 函数 `gpu_launch <label> <cmd...>`，用来把启动命令包进本机的 GPU 排队工具。
-2. 用内嵌 Python 读 `configs/system.yaml` 的 `vlm_server` 段（`port`、`gpu_memory_utilization`、`max_model_len`、`conda_env`）和 `configs/llm.yaml` 的 `model`。当前 `system.yaml` 的值是端口 47800、显存比例 0.85、`max_model_len` 32768、环境 `vllm_env`。
+2. 用内嵌 Python 读 `configs/system.yaml` 的 `vlm_server` 段（`port`、`gpu_memory_utilization`、`max_model_len`、`conda_env`）和 `configs/llm.yaml` 的 `model`。当前 `system.yaml` 的值是端口 31800、显存比例 0.85、`max_model_len` 32768、环境 `vllm_env`。
 3. 激活 conda 环境（`G1_CONDA_PREFIX` 可指定环境所在目录）；清掉 `CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS`；默认 `HF_HUB_OFFLINE=1`，只从本地缓存读模型。`HF_HOME`、`TMPDIR`、`VLLM_CACHE_ROOT` 由环境变量给出。
 4. 公共参数：
    - `serve $MODEL --host 127.0.0.1 --port $PORT --max-model-len $MAXLEN`；

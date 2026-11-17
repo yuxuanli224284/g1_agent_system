@@ -1,6 +1,6 @@
 # OpenAI-compatible endpoint. To use GPT instead of the local Qwen3-VL: change base_url / model / api_key_env only.
 provider: openai_compatible
-base_url: http://127.0.0.1:47800/v1    # GPT: https://api.openai.com/v1
+base_url: http://127.0.0.1:31800/v1    # GPT: https://api.openai.com/v1
 model: Qwen/Qwen3-VL-8B-Instruct       # GPT: e.g. gpt-4.1
 api_key_env: LLM_API_KEY               # read from the environment, never written to files (vLLM accepts any value)
 temperature: 0.0

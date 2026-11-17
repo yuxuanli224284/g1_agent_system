@@ -11,9 +11,9 @@ agent 系统分成几个独立进程：harness 进程（工具层、编排器、
  ┌───────────────────────────────┐                ┌───────────────────────────────────────────┐
  │ Toolbox / 编排器               │                │                                           │
  │   └ SimRobot (RobotInterface) │── robot port ─▶│ REP socket rs → 方法表 R（不含真值）        │
- │        └ RpcClient (REQ)      │  47555 + 10·i  │                                           │
+ │        └ RpcClient (REQ)      │  31555 + 10·i  │                                           │
  │ run_task.py 中的 EvalClient    │── eval port ──▶│ REP socket es → 方法表 E（需令牌，含真值）  │
- │   （回合控制、阶段、录像）       │  47556 + 10·i  │        │                                  │
+ │   （回合控制、阶段、录像）       │  31556 + 10·i  │        │                                  │
  └───────────────────────────────┘                │        ▼                                  │
        消息格式：msgpack + numpy                   │ G1BarcodeEnv（Isaac 仿真） + Episode       │
        （g1agent/common/serialization.py）         │  （阶段日志、扫码日志、合成录像）            │
@@ -306,14 +306,14 @@ while running:
 |---|---|---|
 | `sim_server.conda_env` | `unitree_sim_env` | 环境名，或完整前缀路径；启动脚本用它激活环境 |
 | `sim_server.sim_root` | `../g1_barcode_sim` | 仿真包目录，相对本仓库；可用 `$G1_SIM_ROOT` 覆盖 |
-| `sim_server.robot_port` | `47555` | RobotInterface RPC；实例 i 使用 port + 10·i |
-| `sim_server.eval_port` | `47556` | 评测与回合控制：真值、reset、真值颜色的标记、录像 |
+| `sim_server.robot_port` | `31555` | RobotInterface RPC；实例 i 使用 port + 10·i |
+| `sim_server.eval_port` | `31556` | 评测与回合控制：真值、reset、真值颜色的标记、录像 |
 | `sim_server.instance_port_stride` | `10` | 并行跑多个服务器（`SIM_INSTANCE=i`）做批量评测 |
 | `sim_server.eval_token_env` | `G1_EVAL_TOKEN` | eval port 只接受带这个令牌的请求；令牌放在环境变量里，不写进文件 |
 | `sim_server.host` | `127.0.0.1` | 只监听本机 |
 | `sim_server.mode_policies` | `null` | 当前行走控制器是 `gear_wbc`（GR00T 自己在 Balance 和 Walk 之间切换），必须为 null。注释保留了切回旧 unitree 行走控制器的写法 |
 | `sim_server.rpc_timeout_s` | `600` | 客户端接收超时；一次长距离行走或回合 reset 可能要几分钟墙钟时间 |
-| `vlm_server.conda_env` / `port` | `vllm_env` / `47800` | VLM 服务（见 LLM 相关页面） |
+| `vlm_server.conda_env` / `port` | `vllm_env` / `31800` | VLM 服务（见 LLM 相关页面） |
 | `vlm_server.gpu_memory_utilization` | `0.85` | 注释没有给出依据 |
 | `vlm_server.max_model_len` | `32768` | 上下文长度，是显存方面的设置，不限制输出长度；注释没有给出具体数值的依据 |
 | `harness_client.conda_env` | `g1_agent` | — |

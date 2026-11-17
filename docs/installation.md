@@ -72,7 +72,7 @@ setsid nohup bash scripts/start_vllm.sh > runs/vllm.log 2>&1 &
 
 仓库根目录下的 `local.env`（不进 git）会被两个启动脚本先读入，可以把本机的设置写在里面；其中还可以定义一个 shell 函数 `gpu_launch <标签> <命令...>`，用来把命令交给本机的 GPU 排队工具。
 
-端口在 `configs/system.yaml` 里：机器人端口 47555、评测端口 47556、vLLM 47800。
+端口在 `configs/system.yaml` 里：机器人端口 31555、评测端口 31556、vLLM 31800（都在 Linux 临时端口范围 32768–60999 之外，2026-11-16 起）。
 
 ## 自检
 
