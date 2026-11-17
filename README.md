@@ -12,7 +12,7 @@
 |---|---|
 | 三个进程 | 仿真服务器（G1BarcodeEnv + ZeroMQ RPC）、VLM 服务（vLLM 部署 Qwen3-VL-8B-Instruct，bf16，OpenAI 兼容接口）、Harness 客户端（感知、工具、编排、评测） |
 | 编排模式 | `rule` 固定状态机；`agent_assist` 状态机 + LLM 只处理异常；`agent_full` LLM 通过工具调用决定每一步 |
-| 感知 | GroundingDINO 检测箱子和条码标签，深度平面拟合求箱面，下蹲补看低处标签，扫码枪相机近距离修正 |
+| 感知 | 头部深度来自 D435i 红外双目的立体匹配（OpenCV SGBM），不用仿真渲染深度；GroundingDINO 检测箱子和条码标签，深度平面拟合求箱面，躯干后仰 / 下蹲补看高处和低处标签，扫码枪相机近距离修正 |
 | 运动 | pinocchio 正运动学 / 阻尼最小二乘 IK，站位评估，GR00T WBC 行走与下蹲（仿真侧） |
 | 任务 | 任务 1 找箱并接近；任务 2 条码前手腕就位；任务 3 找到所有箱子并按固定顺序扫完所有码（含四面箱堆） |
 | 评测 | 只有评测器能通过带令牌的端口读取真值；合成视频、时间线和汇总报告 |
@@ -33,6 +33,15 @@ python -m pytest tests                                                   # 单�
 python scripts/run_task.py --scenario t2_L0_0000 --mode rule             # 桌面场景，规则编排
 python scripts/run_task.py --scenario stack4c_L0_0001 --mode agent_full  # 纸箱箱堆，LLM 全程决策
 ```
+
+## 版本与分支
+
+| 版本 | 位置 | 说明 |
+|---|---|---|
+| D435i 头部相机（当前） | `main` | 头部深度由红外双目立体匹配得到，带躯干后仰补看 |
+| 原版 G1 | 标签 `g1-v1-upstream-cam` | D435i 改动之前的完整版本（单目 105° 相机 + 渲染深度），`git checkout g1-v1-upstream-cam` |
+| 新旧相机一键切换（验证中） | 分支 `g1-camera-switch` | agent 按机器人报告的相机型号自动切换；仿真验证通过后合并进 `main` |
+| T800 Pro（未完成） | 分支 `t800` | EngineAI T800 Pro 适配（`--robot t800`），基于 D435i 改动之前的 `main`，尚未完成和合并 |
 
 ## 目录结构
 
