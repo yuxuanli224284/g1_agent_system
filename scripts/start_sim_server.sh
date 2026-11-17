@@ -7,6 +7,7 @@
 #   SIM_GPU=k          run on GPU k (sets CUDA_VISIBLE_DEVICES); otherwise the inherited CUDA_VISIBLE_DEVICES is used
 #   G1_CONDA_PREFIX    directory holding the conda envs, if they are not registered by name
 #   G1_SIM_ROOT        path of g1_barcode_sim (default ../g1_barcode_sim)
+#   G1_ROBOT           robot to simulate: g1 (default) | t800 (EngineAI T800 Pro); the harness must run with the same
 # A file `local.env` in the repo root (not tracked) is sourced first; it may set the variables above and define a shell
 # function `gpu_launch <label> <cmd...>` that wraps the command (e.g. a GPU queue on a shared machine).
 cd "$(dirname "$0")/.."

@@ -68,6 +68,7 @@ class Task1:
         """Find the target (or all boxes) and walk to the observation pose. Returns {"success", "summary", "walked",
         "result"}; walked = the approach was run to its end (its arrival check decided)."""
         h = self.h
+        replanned = False                         # one re-plan after backing up from a face cut by the image border
         while h.finished is None:
             stop = h.over_budget()
             if stop:
@@ -88,9 +89,15 @@ class Task1:
                 if not self._advance_toward_target():
                     return {"success": False, "walked": False, "summary": f"front face not fitted: {r['reason']}"}
                 continue
-            h.call("compute_obs_pose", {})
+            ob = h.call("compute_obs_pose", {})
+            cut = bool(((ob.get("data") or {}).get("root_target_odom") or {}).get("cut_by_image_border"))
             args = {"target": "root_target"}
             r = h.call("approach", args)
+            if cut and not replanned and (r["status"] == "ok" or r["data"].get("walk_done")):
+                # the pose was planned on a face cut by the image border (robot file obs_back_off_cut_faces): the robot
+                # has backed up to the farthest observation distance; plan again on the whole face seen from there
+                replanned = True
+                continue
             if r["status"] != "ok" and not (self.fast_end and r["data"].get("walk_done")):
                 r = recover(h, self.recover, "approach", args, r)
             ok = r["status"] == "ok"

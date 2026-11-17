@@ -1,0 +1,64 @@
+# Harness-side robot parameters: EngineAI T800 Pro (43 joints, scanner held rigidly in the RIGHT hand, no squat / body
+# command). Loaded INSTEAD of configs/robot.yaml when the process runs with G1_ROBOT=t800 (--robot t800 on run_task /
+# run_suite / sim_server / export_urdf; common/config.py). Top-level keys not set here are the G1 values of robot.yaml
+# (inherits; a block set here replaces the whole G1 block): ik, arm_motion, limits, wrist_point_frame,
+# wrist_cam_frame, wrist_forward_axis. The simulator side is g1_barcode_sim configs/robot_t800.yaml (selected with
+# config_overrides {"robot": {"model": "t800"}}, which sim_server passes for G1_ROBOT=t800).
+inherits: [robot]
+model: t800
+urdf: assets/t800pro_scanner.urdf      # scripts/export_urdf.py --robot t800 --source usd: kinematic tree of the simulated
+                                       # T800 USD + head_cam_optical / scanner_mount / scanner_tip / wrist_cam_optical
+root_frame: LINK_BASE                  # articulation root body (sim body_names[0]); T_root_* of the sim are in it
+head_cam_frame: head_cam_optical       # O2S left RGB optical frame on LINK_HEAD_YAW (sim robot_t800.yaml head_camera)
+arm_side: right                        # sim robot_t800.yaml scanner_mount.side (scanner on LINK_WRIST_ROLL_R)
+arm_joints:                            # sim robot_t800.yaml arm_ik.joints (IK order = sim order)
+  left: [J13_SHOULDER_PITCH_L, J14_SHOULDER_ROLL_L, J15_SHOULDER_YAW_L, J16_ELBOW_PITCH_L, J17_ELBOW_YAW_L,
+         J18_WRIST_PITCH_L, J19_WRIST_ROLL_L]
+  right: [J27_SHOULDER_PITCH_R, J28_SHOULDER_ROLL_R, J29_SHOULDER_YAW_R, J30_ELBOW_PITCH_R, J31_ELBOW_YAW_R,
+          J32_WRIST_PITCH_R, J33_WRIST_ROLL_R]
+body:
+  # No body (height) command: the T800 walker has none (robot_info body_command None), set_base_height fails with
+  # "this robot has no body (height) command" and stances are planned standing only (no squat levels).
+  calibration: null
+  standing_clearance: true             # still build the clearance model (tools/body.py) for the standing stances:
+                                       # PhysX self-collision is off in the T800 sim (g1_barcode_sim robot_t800.yaml
+                                       # t800_walk.self_collision), so an arm through the torso would go unnoticed there
+  clearance_margin_m: 0.03             # G1 value (robot.yaml body: aim error + placement tolerance)
+  stance_robust_pos_m: 0.03            # = sim robot_t800.yaml move_relative pos_tol 0.03 m (same as G1)
+  stance_robust_yaw_deg: 1.7           # = sim robot_t800.yaml move_relative yaw_tol 0.03 rad = 1.7 deg (same as G1)
+  links:                               # link groups of the clearance model (G1: derived from its link names). Only links
+                                       # with sim collision geometry take part (T800 USD colliders: base sphere, hip
+                                       # pitch / yaw cylinders, knee sphere + cylinder, ankle-roll mesh, waist 2 boxes,
+                                       # shoulder-roll / elbow-pitch / wrist-roll spheres, shoulder-yaw / elbow-yaw
+                                       # cylinders, head-yaw sphere; the scanner parts are added on LINK_WRIST_ROLL_R)
+    legs: [LINK_HIP_PITCH_L, LINK_HIP_ROLL_L, LINK_HIP_YAW_L, LINK_KNEE_PITCH_L, LINK_ANKLE_PITCH_L, LINK_ANKLE_ROLL_L,
+           LINK_HIP_PITCH_R, LINK_HIP_ROLL_R, LINK_HIP_YAW_R, LINK_KNEE_PITCH_R, LINK_ANKLE_PITCH_R, LINK_ANKLE_ROLL_R]
+    trunk: [LINK_BASE, LINK_WAIST_YAW, LINK_HEAD_PITCH, LINK_HEAD_YAW]   # G1 trunk = pelvis + torso; the T800 head is
+                                       # a separate link (G1's sits in its torso mesh): an obstacle for the raised arm too
+    arm: [LINK_ELBOW_PITCH_R, LINK_ELBOW_YAW_R, LINK_WRIST_PITCH_R, LINK_WRIST_ROLL_R, LINK_THUMB_BASE_R,
+          LINK_THUMB_MID_R, LINK_THUMB_TIP_R, LINK_INDEX_BASE_R, LINK_INDEX_TIP_R, LINK_MIDDLE_BASE_R, LINK_MIDDLE_TIP_R]
+                                       # = the G1 rule (scanner-side elbow, wrist and hand links)
+    arm_chain: [LINK_SHOULDER_PITCH_R, LINK_SHOULDER_ROLL_R, LINK_SHOULDER_YAW_R, LINK_ELBOW_PITCH_R, LINK_ELBOW_YAW_R,
+                LINK_WRIST_PITCH_R, LINK_WRIST_ROLL_R, scanner_tip]
+prompt:
+  robot_name: EngineAI T800
+  scanner_hand: right
+  head_camera_task1: "The head camera looks nearly level (8 deg down): far boxes\n  appear near the image centre and a close box can be cut off at the bottom edge, so moving back helps when it is too close."
+  head_camera_task3: the head camera looks nearly level (8 deg down), so far boxes appear near the image centre and close ones can be cut off at the bottom edge.
+  head_camera_explore: it looks nearly level, 8 deg down; close objects can be cut off at the bottom edge
+  body_height_task3: "This robot cannot squat: plan_stance plans standing stances only and reports a barcode it cannot reach standing as\n  unreachable; do not call set_base_height."
+task_overrides:
+  task1:
+    # Observation distance search (compute_obs_pose: smallest d whose head image holds the whole face with the fov
+    # margin). User decision 2026-11-10: the T800 backs up with its head held at 0 to see a whole face. Upper bound
+    # derived from the T800 head camera (g1_barcode_sim configs/testsuite/head_camera_nominal_t800.yaml): camera
+    # 1.612 m above the floor, 8.0 deg down, 0.081 m ahead of the root; the lowest image row inside the 5 % margin
+    # (perception.yaml fov_margin_frac) looks 49.6 deg down -> the floor line of a face is in view from 1.452 m
+    # root-to-face -> 1.50 on the 0.05 grid. Lower bound and step: task1.yaml. Same range as the simulator's
+    # ground truth (g1_barcode_sim configs/testsuite/factors_t800.yaml task2_start.d_obs_range); task3 inherits it.
+    # tests/test_t800.py recomputes the bound.
+    d_obs_range: [0.60, 1.50]
+obs_back_off_cut_faces: true           # compute_obs_pose: a fitted face cut by the head image border (corner outside the
+                                       # fov margin) is only partly known -> plan at the far end of d_obs_range (where a
+                                       # floor-standing face fits), refit there and plan again (rule Task1 does this once).
+                                       # User decision 2026-11-10 (back up, head at 0). G1: key absent = off (unchanged)

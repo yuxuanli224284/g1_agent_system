@@ -8,6 +8,9 @@
     * clearance to the known box faces of every robot point (knees move ~0.3 m forward of the pelvis in a deep squat)
     * arm-vs-leg clearance: the simulated articulation has self-collisions disabled, so an arm passing through the
       thighs would go unnoticed in simulation; the planner rejects such poses itself.
+Robots differ in link names: the G1 groups follow from its link names (LEG_KEYS / ARM_KEYS / TRUNK below); another
+robot lists them in its robot file (body.links, e.g. configs/robot_t800.yaml). A robot without a body command (T800)
+gets calibration None: no squat levels, the clearance checks of its standing stances only.
 Pure numpy + pinocchio (through Kinematics)."""
 from __future__ import annotations
 
@@ -26,7 +29,12 @@ def Ry(a):
 
 
 class BodyModel:
-    def __init__(self, kin, geometry: dict, calibration: list, arm_side: str):
+    def __init__(self, kin, geometry: dict, calibration: list | None, arm_side: str, links: dict | None = None):
+        """calibration: measured squat levels (robot.yaml body.calibration), None = no body command (standing only:
+        levels = []). links: None = the G1 link groups from its link names; else {"legs": [...], "trunk": [...],
+        "arm": [...], "arm_chain": [...]} (robot file body.links): links the scanner arm must stay clear of (legs +
+        trunk), the scanner arm's links checked against them, and the arm chain shoulder -> scanner_tip of the reach
+        bound. Listed links must be kinematic frames; links without collision geometry have nothing to check."""
         from scipy.spatial import ConvexHull, QhullError
         self.kin = kin
         names = list(geometry["body_names"])
@@ -43,13 +51,21 @@ class BodyModel:
             except KeyError:
                 raise KeyError(f"robot geometry link {n!r} has no frame in the kinematics URDF")
             self.bodies[n] = {"pts": P[m], "rad": rad[m]}
-        # links the arm must stay clear of: legs, pelvis and torso (the arm's own shoulder links are not checked)
-        self.legs = [n for n in self.bodies if (n.startswith(("left_", "right_")) and any(k in n for k in LEG_KEYS))
-                     or n in TRUNK]
-        self.arm = [n for n in self.bodies if n.startswith(arm_side + "_") and any(k in n for k in ARM_KEYS)]
+        if links is None:
+            # G1: links the arm must stay clear of: legs, pelvis and torso (the arm's own shoulder links are not checked)
+            self.legs = [n for n in self.bodies if (n.startswith(("left_", "right_")) and any(k in n for k in LEG_KEYS))
+                         or n in TRUNK]
+            self.arm = [n for n in self.bodies if n.startswith(arm_side + "_") and any(k in n for k in ARM_KEYS)]
+        else:
+            for grp in ("legs", "trunk", "arm", "arm_chain"):
+                for n in links[grp]:
+                    kin.frame_id(n)                         # KeyError for a name that is not a frame of the URDF
+            self.legs = [n for n in links["legs"] + links["trunk"] if n in self.bodies]
+            self.arm = [n for n in links["arm"] if n in self.bodies]
         if not self.legs or not self.arm:
             raise ValueError(f"leg links {self.legs} / arm links {self.arm}: geometry incomplete")
-        # leg links as convex hulls (half-spaces, unit normals) or, for sphere-only links (the feet), spheres
+        # leg links as convex hulls (half-spaces, unit normals) or, for sphere-only links (the feet), spheres; a link
+        # with both (T800 knee: a sphere and a cylinder) as the hull of its zero-radius points plus its spheres
         self.leg_shapes = {}
         for n in self.legs:
             b = self.bodies[n]
@@ -59,20 +75,33 @@ class BodyModel:
                     continue
                 except QhullError:
                     pass                                    # flat point set: fall back to its points as spheres
+            elif np.any(b["rad"] == 0) and np.any(b["rad"] > 0) and int(np.sum(b["rad"] == 0)) >= 4:
+                flat = b["rad"] == 0
+                try:
+                    self.leg_shapes[n] = ("mixed", ConvexHull(b["pts"][flat]).equations, b["pts"][~flat], b["rad"][~flat])
+                    continue
+                except QhullError:
+                    pass                                    # flat hull part: every point as a sphere, as above
             self.leg_shapes[n] = ("spheres", b["pts"], b["rad"])
         # reach bound of the scanner arm: the chain's consecutive frame origins are rigidly spaced, so the sum of their
         # distances bounds |scanner tip - shoulder| for every joint configuration (a pure prefilter, never a decision)
-        chain = [f"{arm_side}_shoulder_pitch_link", f"{arm_side}_shoulder_roll_link", f"{arm_side}_shoulder_yaw_link",
-                 f"{arm_side}_elbow_link", f"{arm_side}_wrist_roll_link", f"{arm_side}_wrist_pitch_link",
-                 f"{arm_side}_wrist_yaw_link", f"{arm_side}_hand_base_link", "scanner_tip"]
+        if links is None:
+            chain = [f"{arm_side}_shoulder_pitch_link", f"{arm_side}_shoulder_roll_link", f"{arm_side}_shoulder_yaw_link",
+                     f"{arm_side}_elbow_link", f"{arm_side}_wrist_roll_link", f"{arm_side}_wrist_pitch_link",
+                     f"{arm_side}_wrist_yaw_link", f"{arm_side}_hand_base_link", "scanner_tip"]
+        else:
+            chain = list(links["arm_chain"])
         import pinocchio as pin
         q_n = pin.neutral(kin.model)
         org = [kin.pose(q_n, f)[:3, 3] for f in chain]
         self.shoulder_frame = chain[0]
         self.arm_reach = float(sum(np.linalg.norm(b - a) for a, b in zip(org[:-1], org[1:])))
-        self.levels = sorted(calibration, key=lambda c: -c["height_cmd"])
-        if not self.levels:
-            raise ValueError("empty body calibration")
+        if calibration is None:
+            self.levels = []                                # no body command: standing stances only
+        else:
+            self.levels = sorted(calibration, key=lambda c: -c["height_cmd"])
+            if not self.levels:
+                raise ValueError("empty body calibration")
 
     # ------------------------------------------------------------------ poses
     def q_at(self, q_base, level: dict):
@@ -121,6 +150,9 @@ class BodyModel:
             pl = (ap - T[:3, 3]) @ T[:3, :3]                 # arm points in the leg link frame
             if sh[0] == "hull":
                 d = (pl @ sh[1][:, :3].T + sh[1][:, 3]).max(axis=1) - ar
+            elif sh[0] == "mixed":
+                d = np.minimum((pl @ sh[1][:, :3].T + sh[1][:, 3]).max(axis=1),
+                               (np.linalg.norm(pl[:, None, :] - sh[2][None], axis=2) - sh[3][None]).min(axis=1)) - ar
             else:
                 d = (np.linalg.norm(pl[:, None, :] - sh[1][None], axis=2) - sh[2][None]).min(axis=1) - ar
             i = int(np.argmin(d))

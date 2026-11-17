@@ -1,5 +1,5 @@
 <!-- prompt: task3_agent_full v7 -->
-You control a Unitree G1 humanoid robot holding a barcode scanner in its left hand. Task 3 has two phases.
+You control a {robot_name} humanoid robot holding a barcode scanner in its {scanner_hand} hand. Task 3 has two phases.
 Phase 1 (find): find the cardboard boxes (on a table, on the floor or stacked) and walk to the observation pose in front of ALL of them, where
 every front face is visible in the head camera.
 Phase 2 (scan): scan every barcode label on the boxes once, in the order fixed by the tools.
@@ -9,7 +9,7 @@ Rules:
   which tool to call, exploration directions, and what to do after a failure.
 - Phase 1 sequence: detect_boxes -> select_target_box("all") -> fit_front_face -> compute_obs_pose -> approach.
   If no box is visible, call look_head and choose an explore move (left / right / back / forward <= 0.5 m,
-  turn_left / turn_right <= 15 deg); the head camera looks down steeply, so far boxes appear at the top edge or above it.
+  turn_left / turn_right <= 15 deg); {head_camera_task3}
   If fit_front_face fails because the boxes are too far (no valid depth), move forward and try again.
 - Phase 1 ends when approach returns ok, or partial ("walk finished; arrival check not within tolerance"): in both
   cases call plan_scans next; do NOT explore to fix a small arrival error (the scan phase plans its own stances).
@@ -21,8 +21,7 @@ Rules:
   move_arm("home") -> approach(target="stance_target") -> move_arm("pre") -> refine_with_wrist -> move_arm("final") ->
   check_wrist_placement -> scan -> move_arm("home") -> plan_scans (adds labels seen for the first time from this
   closer / lower view).
-  plan_stance chooses the body height (low barcodes need a squat); approach(stance_target) squats to it on arrival and
-  every walking tool stands the robot up first, so you do not call set_base_height yourself.
+  {body_height_task3}
   move_arm or check_wrist_placement returning "partial" (reached with a small residual / placement a little outside
   the check tolerances) is NOT a failure: continue the sequence and call scan (it reads from a few cm off and
   retries by itself). Only if move_arm("pre") or move_arm("final") FAILS as not reachable (IK):

@@ -34,6 +34,18 @@ python scripts/run_task.py --scenario t2_L0_0000 --mode rule             # 桌�
 python scripts/run_task.py --scenario stack4c_L0_0001 --mode agent_full  # 纸箱箱堆，LLM 全程决策
 ```
 
+**机器人选择（G1 / EngineAI T800 Pro）**：按进程用环境变量 `G1_ROBOT` 选择（默认 `g1`，行为与以前完全相同）；
+`G1_ROBOT=t800` 时 harness 读 `configs/robot_t800.yaml`（继承 `robot.yaml`：右手持扫码枪、`assets/t800pro_scanner.urdf`、
+无下蹲、观察距离上限 1.50 m——头保持 0°，靠后退看全整面），仿真服务器以 `config_overrides={"robot": {"model": "t800"}}`
+启动 T800。仿真端与 harness 端必须同一机器人（`get_robot_info` 的 `robot_model` 不一致时 Toolbox 直接报错）。
+
+```bash
+G1_ROBOT=t800 SIM_INSTANCE=100 setsid nohup bash scripts/start_sim_server.sh > runs/sim_t800.log 2>&1 &   # 端口 48555/48556
+SIM_INSTANCE=100 python scripts/run_task.py --robot t800 --scenario wall6x5_L0_0000 --mode rule
+scripts/usd_python.sh scripts/export_urdf.py --robot t800 --source usd     # 从 T800 USD 离线导出 URDF（CPU，无需 Isaac 应用）
+G1_ROBOT=t800 python scripts/reach_report.py --scenario wall6x5_L0_0000     # 站立可达性（每行标签）
+```
+
 ## 目录结构
 
 ```

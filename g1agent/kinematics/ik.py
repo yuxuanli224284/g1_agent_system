@@ -1,6 +1,7 @@
-"""Left-arm IK for the scanner tip: position (3) + scan direction (2) and, with a roll axis, the roll about the scan axis
-(the scanner image's horizontal axis parallel to the barcode's long axis, sign free: 6 constraints); 7 arm joints,
-damped least squares on the pinocchio model (the same task the simulator's aim controller uses, solved offline).
+"""Scanner-arm IK for the scanner tip: position (3) + scan direction (2) and, with a roll axis, the roll about the scan
+axis (the scanner image's horizontal axis parallel to the barcode's long axis, sign free: 6 constraints); the 7 arm
+joints of the scanner side (robot file arm_side / arm_joints: G1 left arm, T800 right arm), damped least squares on the
+pinocchio model (the same task the simulator's aim controller uses, solved offline).
 
 xr_teleoperate's IK was the obvious candidate; that solver targets the Dex3/Inspire hand frames of its own
 URDF, while this robot carries a Dex1 gripper holding a scanner, so the task frame (scanner tip) only exists in our
@@ -12,8 +13,6 @@ import numpy as np
 
 from ..common import config
 from .fk import Kinematics
-
-ARM = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw"]
 
 
 def rotation_vector(a, b):
@@ -35,14 +34,14 @@ class ArmIK:
         self.kin = kin or Kinematics()
         self.side = side or rc["arm_side"]
         self.frame = rc["wrist_point_frame"]
-        self.joints = [f"{self.side}_{j}_joint" for j in ARM]
+        self.joints = list(rc["arm_joints"][self.side])     # 7 joints of that arm (robot file)
         self.qi = np.array([self.kin.joint_q_index[j] for j in self.joints])
         self.vi = np.array([self.kin.joint_v_index[j] for j in self.joints])
         m = self.cfg["joint_limit_margin"]
         self.lo, self.hi = self.kin.lower[self.qi] + m, self.kin.upper[self.qi] - m
         self.rng = np.random.default_rng(self.cfg["seed"])
         # the scanner image's horizontal axis (wrist camera optical x) in the scanner-tip frame: a fixed transform of the
-        # model ([0, -1, 0] for this URDF); the roll constraint aligns it with the barcode's long axis
+        # model ([0, -1, 0] for the G1 URDF); the roll constraint aligns it with the barcode's long axis
         import pinocchio as pin
         q_n = pin.neutral(self.kin.model)
         R_tc = np.linalg.inv(self.kin.pose(q_n, self.frame))[:3, :3] @ self.kin.pose(q_n, rc["wrist_cam_frame"])[:3, :3]

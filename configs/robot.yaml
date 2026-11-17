@@ -1,4 +1,8 @@
-# Harness-side robot parameters
+# Harness-side robot parameters: Unitree G1 (29 DoF + Dex1, scanner in the left gripper). `model: g1` identifies this
+# file and must stay g1: the robot is chosen per process with $G1_ROBOT (default g1; --robot on run_task / run_suite /
+# sim_server / export_urdf), and G1_ROBOT=t800 loads configs/robot_t800.yaml (EngineAI T800 Pro, inherits this file)
+# instead (common/config.py).
+model: g1
 urdf: assets/g1_dex1_scanner.urdf      # exported from the simulated USD (scripts/export_urdf.py)
 root_frame: pelvis
 head_cam_frame: head_cam_optical
@@ -6,6 +10,18 @@ arm_side: left
 wrist_point_frame: scanner_tip         # "以后装上扫码枪，就改成枪口位置" -> the scanner tip (exit window centre)
 wrist_cam_frame: wrist_cam_optical     # the camera at the scanner head (DS2208-like imager, 640x480, 32.8 deg hFOV)
 wrist_forward_axis: [1, 0, 0]          # scan direction = x axis of scanner_tip
+arm_joints:                            # the 7 arm joints per side (IK order), as g1_barcode_sim arm.py ARM_JOINTS
+  left: [left_shoulder_pitch_joint, left_shoulder_roll_joint, left_shoulder_yaw_joint, left_elbow_joint,
+         left_wrist_roll_joint, left_wrist_pitch_joint, left_wrist_yaw_joint]
+  right: [right_shoulder_pitch_joint, right_shoulder_roll_joint, right_shoulder_yaw_joint, right_elbow_joint,
+          right_wrist_roll_joint, right_wrist_pitch_joint, right_wrist_yaw_joint]
+prompt:                                # robot-specific prompt text (prompts/*.md placeholders), G1 = the original wording
+  robot_name: Unitree G1
+  scanner_hand: left
+  head_camera_task1: "The head camera looks down steeply: far boxes\n  appear at the top edge of the image or above it, so moving forward helps when the table is far away."
+  head_camera_task3: the head camera looks down steeply, so far boxes appear at the top edge or above it.
+  head_camera_explore: it looks down steeply; far objects appear at the top edge or above it
+  body_height_task3: "plan_stance chooses the body height (low barcodes need a squat); approach(stance_target) squats to it on arrival and\n  every walking tool stands the robot up first, so you do not call set_base_height yourself."
 ik:
   dls_lambda: 0.05
   step_gain: 0.5                       # fraction of the error corrected per iteration (offline, no dynamics)

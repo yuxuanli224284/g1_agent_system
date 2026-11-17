@@ -1,6 +1,8 @@
 """Run one scenario (one task) end to end and evaluate it.
 
 python scripts/run_task.py --scenario t2_L0_0000 --mode rule [--task 3] [--run_dir runs/xxx] [--no_video]
+python scripts/run_task.py --robot t800 --scenario wall6x5_L0_0000 --mode rule   # EngineAI T800 Pro (the sim server
+                                                                                  # must run the same robot)
 --task overrides the scenario's task on the agent / evaluation side (e.g. --task 3 runs a t1 scenario as the merged
 "find + scan all barcodes" task); the simulator is reset with the scenario unchanged.
 Needs the sim server (scripts/start_sim_server.sh) and, for agent modes, the VLM server (scripts/start_vllm.sh).
@@ -112,6 +114,7 @@ def make_episode_runner(device=None):
             ws.update({k: summ[k] for k in ("scan_plan", "scanned", "current_barcode_id")}, **stage_ws)
         metrics = evaluate(task, gt, actual, ws, stages=stages, scan_log=scan_log)
         res = {"scenario": sc["id"], "task": task, "scenario_task": sc["task"], "mode": mode, "harness_finish": h.finished,
+               **({} if config.robot_model() == "g1" else {"robot": config.robot_model()}),
                "orchestrator_error": err, "tool_calls": h.n_calls, "explore_steps": tb.ws.explore_steps,
                "wall_s": round(time.time() - t0, 1), "llm": dict(llm.stats) if llm else None, "world_state": summ,
                "metrics": metrics, "stages": stages, "stage_log": stage_log, "scan_log": scan_log, "factor": sc.get("factor"), "level": sc["level"]}
@@ -133,8 +136,14 @@ if __name__ == "__main__":
     ap.add_argument("--no_video", action="store_true")
     ap.add_argument("--device", default=None)
     ap.add_argument("--task", type=int, default=None, choices=TASKS, help="override the scenario's task (e.g. 3)")
+    ap.add_argument("--robot", choices=sorted(config.ROBOT_FILES), default=None,
+                    help=f"robot (sets ${config.ROBOT_ENV} for this process and its workers; default: ${config.ROBOT_ENV} or g1)")
     a = ap.parse_args()
+    if a.robot is not None:
+        os.environ[config.ROBOT_ENV] = a.robot
     tag = f"_task{a.task}" if a.task is not None else ""
+    if config.robot_model() != "g1":
+        tag += f"_{config.robot_model()}"
     rd = a.run_dir or os.path.join(ROOT, "runs", time.strftime("%Y%m%d_%H%M%S") + f"_{a.scenario}_{a.mode}{tag}")
     run = make_episode_runner(a.device)
     r = run(a.scenario, a.mode, os.path.join(rd, a.scenario), video=not a.no_video, task=a.task)

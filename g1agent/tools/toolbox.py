@@ -80,6 +80,12 @@ class Toolbox:
         self.ik = ArmIK(self.kin)
         self.det = box_detector or BoxDetector(device)
         self.info = robot.get_robot_info()
+        # the robot behind the interface must be the one the configs describe ($G1_ROBOT, common/config.py); a server
+        # without the key is a G1 server from before the robot selection existed
+        served = self.info.get("robot_model", "g1")
+        if served != self.cfg["robot"]["model"]:
+            raise RuntimeError(f"the robot server runs {served!r}, this harness is configured for "
+                               f"{self.cfg['robot']['model']!r} (set {config.ROBOT_ENV} / --robot on both sides)")
         self.side = self.cfg["robot"]["arm_side"]
         self.ws = WorldState()
         self.head = None
@@ -106,16 +112,24 @@ class Toolbox:
 
     # ================================================================== body (squat / stand)
     def _body(self):
-        """BodyModel (tools/body.py), built on first use: squat calibration + the robot's collision geometry."""
-        if self.body_cmd is None:
+        """BodyModel (tools/body.py), built on first use: squat calibration + the robot's collision geometry. A robot
+        without a body command has none, unless its robot file asks for the standing clearance model
+        (body.standing_clearance, T800: no squat levels, the clearance checks of standing stances)."""
+        B = self.cfg["robot"]["body"]
+        standing_only = self.body_cmd is None and B.get("standing_clearance", False)
+        if self.body_cmd is None and not standing_only:
             return None
         if self._body_model is None:
             import json
             import os
             from .body import BodyModel
-            B = self.cfg["robot"]["body"]
-            cal = json.load(open(os.path.join(config.ROOT, B["calibration"])))["levels"]
-            self._body_model = BodyModel(self.kin, self.robot.get_robot_geometry(), cal, self.side)
+            if standing_only:
+                cal = None
+            else:
+                if B["calibration"] is None:
+                    raise ValueError("the robot has a body command but the robot file has no body.calibration")
+                cal = json.load(open(os.path.join(config.ROOT, B["calibration"])))["levels"]
+            self._body_model = BodyModel(self.kin, self.robot.get_robot_geometry(), cal, self.side, B.get("links"))
         return self._body_model
 
     def _standing(self):
@@ -424,7 +438,16 @@ class Toolbox:
         K = np.asarray(self.info["head_K"], float)
         n_steps = int(round((c1["d_obs_range"][1] - c1["d_obs_range"][0]) / c1["d_obs_step"]))
         chosen, fits = None, False
-        for k in range(n_steps + 1):
+        cut = self._faces_cut_by_border(faces) if self.cfg["robot"].get("obs_back_off_cut_faces", False) else None
+        if cut:
+            # A face fitted from a view that cuts it at the image border is only a part of the face (T800 at 0.6 m
+            # from a wall: the level head camera sees the wall down to ~0.9 m only), so its extent cannot place the
+            # whole face in the image. Robot file obs_back_off_cut_faces (T800, user decision 2026-11-10: back up,
+            # head at 0): plan at the far end of d_obs_range, the distance at which a face standing on the floor fits
+            # the image (robot_t800.yaml task_overrides); the caller refits there and plans again on the whole face.
+            d = c1["d_obs_range"][1]
+            chosen = (center + d * nh, d)
+        for k in range(0 if cut else n_steps + 1):
             d = c1["d_obs_range"][0] + k * c1["d_obs_step"]
             p = center + d * nh
             T_odom_cam = T_from_xy_yaw(p[0], p[1], yaw, z_root) @ T_root_cam
@@ -438,6 +461,8 @@ class Toolbox:
         p, d = chosen
         self.ws.root_target = {"pos": [float(p[0]), float(p[1])], "yaw": yaw, "d_obs": d, "box_id": box_id, "fits": fits,
                                "n_faces": len(faces)}
+        if cut:
+            self.ws.root_target["cut_by_image_border"] = cut
         # The faces this pose was planned with (full extents, normally seen from far) are frozen for the approach:
         # close-range refits see the faces cut by the image edge, so their extents (and hence the union reference
         # point, d_obs and the in-view test) are no longer the boxes' (2026-11-06: the goal moved by ~0.15 m between
@@ -448,7 +473,33 @@ class Toolbox:
         data = {"root_target_odom": self.ws.root_target}
         if fits:
             return ok(data)
+        if cut:
+            return partial(f"the fitted face is cut by the head image border ({', '.join(cut)}): only part of it is "
+                           f"known, so the robot backs up to the farthest observation distance {d:.2f} m; after "
+                           "approach, call detect_boxes, fit_front_face and compute_obs_pose again (whole face in view) "
+                           "and approach the new pose", data)
         return partial("face does not fit the image with the margin at any d in range; using the upper bound", data)
+
+    def _faces_cut_by_border(self, faces) -> list:
+        """Image borders ("bottom", "top", "left", "right") beyond which a face fitted from the current head capture
+        may continue: one of its corners lies outside the image region inside the fov margin (perception.yaml
+        fov_margin_frac, the same margin that defines "whole face in view"). Faces fitted from another capture
+        are not judged (their image is not this one)."""
+        h = self.head
+        if h is None:
+            return []
+        cur = [f for f in faces if f.get("t") == h["t"]]
+        if not cur:
+            return []
+        H, W = h["rgb"].shape[:2]
+        m = self.cfg["perception"]["fov_margin_frac"]
+        uv, z = self._project_odom(h, np.vstack([np.asarray(f["corners"], float) for f in cur]))
+        out = []
+        for name, bad in (("bottom", uv[:, 1] > H * (1 - m)), ("top", uv[:, 1] < H * m), ("left", uv[:, 0] < W * m),
+                          ("right", uv[:, 0] > W * (1 - m)), ("behind", z <= 0)):
+            if np.any(bad):
+                out.append(name)
+        return out
 
     def check_face_in_view(self, box_id: str | None = None):
         box_id = box_id or self.ws.target_box_id
@@ -589,7 +640,9 @@ class Toolbox:
                 if r["status"] != "ok":
                     return fail(f"squat to the stance height {bh}: {r['reason']}", data)
                 data["base_height"] = r["data"]
-            return ok(data, f"at the stance, body height command {self.base_height_cmd:.2f} m")
+            # no body command (T800): base_height_cmd is None and the reply has no height
+            return ok(data, "at the stance" + ("" if self.base_height_cmd is None
+                                               else f", body height command {self.base_height_cmd:.2f} m"))
         return self.arrive_check(log)
 
     def _reperceive_target(self):
@@ -860,7 +913,7 @@ class Toolbox:
         with the fov margin) more finely than standing (focal length / depth, worst bottom corner); none -> no low look.
         New labels are merged into the plan after each look (same rule as a plan update), then the robot stands up."""
         body = self._body()
-        if body is None or not self._standing() or not self.arm_at_home \
+        if body is None or not body.levels or not self._standing() or not self.arm_at_home \
                 or not (self.ws.scan_plan or (self.ws.stack or {}).get("planned")):
             return None
         faces = [b.face for b in self.ws.boxes.values() if b.face is not None
@@ -1403,9 +1456,10 @@ class Toolbox:
             pre_dists = list(np.arange(t["offset"] + gap0, t["offset"] - 1e-9, -S["step"]))
         body = self._body()
         # body heights to try, standing first: the walker's measured squat levels (robot.yaml body.calibration), or
-        # only the current height for a walker without a body command. The first (highest) level with a feasible
+        # only the current height for a walker without a body command (T800: its standing clearance model still
+        # checks the stances, robot_t800.yaml body.standing_clearance). The first (highest) level with a feasible
         # stance wins: squatting costs time and balance margin.
-        levels = body.levels if body is not None else [None]
+        levels = body.levels if body is not None and body.levels else [None]
         margin = self.cfg["robot"]["body"]["clearance_margin_m"]
         R_yaw = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
         rejected = {"reach": 0, "ik": 0, "face_clearance": 0, "self_clearance": 0, "not_robust": 0}

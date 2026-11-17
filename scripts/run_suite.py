@@ -53,7 +53,11 @@ def main():
     ap.add_argument("--scenarios", nargs="+", default=None, help="run only these scenario ids of the given suites")
     ap.add_argument("--task", type=int, default=None, choices=[1, 2, 3],
                     help="override every scenario's task (e.g. --task 3 runs t1 scenarios as the merged find + scan task)")
+    ap.add_argument("--robot", choices=sorted(config.ROBOT_FILES), default=None,
+                    help=f"robot (sets ${config.ROBOT_ENV}; default: ${config.ROBOT_ENV} or g1); the sim server must run it too")
     a = ap.parse_args()
+    if a.robot is not None:
+        os.environ[config.ROBOT_ENV] = a.robot
     known = [m["suite"] for m in list_suites()]
     names = [n for s in a.suite for n in (known if s == "all" else [k for k in known if k == s or k.startswith(s + "_")])]
     if not names:
@@ -68,7 +72,9 @@ def main():
     out = os.path.join(ROOT, "runs", run_name)
     os.makedirs(out, exist_ok=True)
     json.dump({"suites": names, "mode": a.mode, "task_override": a.task, "n": len(scs), "argv": sys.argv[1:],
-               "sim_instance": os.environ.get("SIM_INSTANCE", "0")}, open(os.path.join(out, "run.json"), "w"), indent=1)
+               "sim_instance": os.environ.get("SIM_INSTANCE", "0"),
+               **({} if config.robot_model() == "g1" else {"robot": config.robot_model()})},
+              open(os.path.join(out, "run.json"), "w"), indent=1)
     SY = os.environ.get("PROGRESS_CLIENT_DIR")      # optional progress reporter (a dir with switchyard_progress.py)
     prog = None
     if SY:

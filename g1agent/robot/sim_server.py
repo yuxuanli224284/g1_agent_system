@@ -15,6 +15,7 @@ steps (no extra renders, no USD marker toggling, no get_obs); markers and detect
 The video runs in simulated time; LLM replies, scans and head detections add frozen-state "hold" frames.
 
 python -m g1agent.robot.sim_server            (see scripts/start_sim_server.sh)
+G1_ROBOT=t800 python -m g1agent.robot.sim_server   (or --robot t800): EngineAI T800 Pro (g1_barcode_sim robot_t800.yaml)
 """
 from __future__ import annotations
 
@@ -43,9 +44,14 @@ def main():
     if not token:
         raise SystemExit(f"set ${SYS['eval_token_env']} (evaluation token) before starting the server")
     overrides = {"robot": {"mode_policies": SYS["mode_policies"]}}
+    model = config.robot_model()
+    if model != "g1":               # the simulator picks the robot file from the model (G1: no key, as before)
+        overrides["robot"]["model"] = model
     if REC["cameras_enabled"]:
         overrides["camera"] = {"recording": {"enabled": True}}
     env = G1BarcodeEnv("scenario", headless=True, seed=0, config_overrides=overrides)
+    if env.robot_model != model:
+        raise RuntimeError(f"simulator robot {env.robot_model!r} != selected robot {model!r}")
     import cv2
     import omni.usd
     from g1_barcode_sim.camera import inv_T, look_at_ros
@@ -475,15 +481,17 @@ def set_arm_joints(env, side, q, duration):
 
 
 def robot_info(env):
-    from g1_barcode_sim.arm import ARM_JOINTS
+    arm_joints = env.arm.arm_joints                 # the robot's arm joints (G1: g1_barcode_sim arm.py ARM_JOINTS)
     o = env.get_obs()
-    return {"joint_names": list(env.robot.data.joint_names), "arm_joints": ARM_JOINTS,
+    return {"robot_model": env.robot_model,
+            "joint_names": list(env.robot.data.joint_names), "arm_joints": arm_joints,
             "head_K": o["K"], "head_size": list(o["rgb"].shape[:2]),
             "wrist_side": env.scanner_side if env.scanner_on else None,
             "wrist_K": o.get("wrist_K"), "wrist_size": list(o["wrist_rgb"].shape[:2]) if "wrist_rgb" in o else None,
             "policy_dt": env.policy_dt, "velocity_limits": env.cfg["robot"]["velocity_limits"],
-            "arm_soft_limits": {s: env.arm.limits[s] for s in ARM_JOINTS},
-            "wrist_point": "scanner tip (exit-window centre) of the scanner held by the left gripper",
+            "arm_soft_limits": {s: env.arm.limits[s] for s in arm_joints},
+            "wrist_point": f"scanner tip (exit-window centre) of the scanner held by the {env.scanner_side} "
+                           + ("gripper" if env.cfg["robot"]["gripper"] is not None else "hand"),
             # body (squat / torso) command of the GR00T walker; None for a walker without one
             "body_command": ({"height_default": env.walker.height_default, "height_range": list(env.walker.height_range),
                               "rpy_limit_rad": [float(v) for v in env.walker.rpy_limit]}
@@ -491,4 +499,11 @@ def robot_info(env):
 
 
 if __name__ == "__main__":
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--robot", choices=sorted(config.ROBOT_FILES), default=None,
+                     help=f"robot to simulate (sets ${config.ROBOT_ENV}; default: ${config.ROBOT_ENV} or g1)")
+    _a = _ap.parse_args()
+    if _a.robot is not None:
+        os.environ[config.ROBOT_ENV] = _a.robot
     main()
