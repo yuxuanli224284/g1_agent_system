@@ -38,7 +38,7 @@ def _tb(workers):
     tb.robot = R(tb.kin); tb.side = "left"; tb.arm_at_home = True; tb.head = None
     tb._last_label = tb._wrist_detection = None
     tb.wrist_hfov = so.hfov_from_intrinsics(1087.0, 640.0)
-    tb.body_cmd = None; tb.base_height_cmd = None; tb._body_model = None; tb.multi_face = False
+    tb.body_cmd = None; tb.base_height_cmd = None; tb._body_model = None; tb.multi_face = False; tb.view_pitch = 0.0; tb._leans = None
     face = {"center": np.array([1.3, 0.0, 0.9]), "normal": np.array([-1.0, 0, 0]), "right": np.array([0, -1.0, 0]),
             "up": np.array([0, 0, 1.0]), "corners": np.array([[1.3, y, z] for y in (-0.2, 0.2) for z in (0.75, 1.05)])}
     bc = BarcodeEstimate("bc0", "box0", np.array([1.2985, 0.05, 0.92]), np.array([-1.0, 0, 0]), np.array([0, 0, 1.0]), "head",

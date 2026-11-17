@@ -127,6 +127,8 @@ def bare_toolbox(robot, task=3):
     tb.base_height_cmd = None
     tb._body_model = None
     tb.multi_face = False
+    tb.view_pitch = 0.0                  # head view upright (torso lean, robot.yaml view)
+    tb._leans = None
     tb._plan_update_from_here = lambda: None   # next_barcode's automatic look (needs the head camera); tested separately
     robot.tb = tb
     return tb
@@ -226,7 +228,7 @@ def test_plan_scans_orders_columns_and_dedupes(monkeypatch):
         recs.append({"name": name, "kind": "label", "corners": q, "center": q.mean(axis=0), "score": 0.6, "bar_dir": np.array([1.0, 0.0])})
     dup = dict(recs[0], corners=recs[0]["corners"] + 1.0, center=recs[0]["center"] + 1.0, score=0.5)   # a second detection
 
-    def fake_detect_boxes():
+    def fake_detect_boxes(prompt="cardboard box", view="auto"):
         tb.head = h
         tb.ws.boxes = {k: tbmod.BoxEstimate(k, [0, 0, 1, 1], 0.9, 3.0) for k in faces}
         return {"status": "ok", "data": {}, "reason": ""}
@@ -292,7 +294,7 @@ def test_stack_side_without_labels(monkeypatch, multi_face):
     h = _head_frame()
     faces = {"box0": _face(0.0, 0.4, x=1.5), "box1": _face(-0.4, 0.0, x=1.5)}
 
-    def fake_detect_boxes():
+    def fake_detect_boxes(prompt="cardboard box", view="auto"):
         tb.head = h
         tb.ws.boxes = {k: tbmod.BoxEstimate(k, [0, 0, 1, 1], 0.9, 3.0) for k in faces}
         return {"status": "ok", "data": {}, "reason": ""}
@@ -860,10 +862,10 @@ def test_infrastructure_errors_end_the_episode_instead_of_a_tool_failure():
     def oom():
         import torch
         raise torch.cuda.OutOfMemoryError("CUDA out of memory")
-    tb.detect_boxes = lambda prompt="cardboard box": oom()
+    tb.detect_boxes = lambda prompt="cardboard box", view="auto": oom()
     with pytest.raises(Exception, match="out of memory"):
         h.call("detect_boxes", {})
-    tb.detect_boxes = lambda prompt="cardboard box": (_ for _ in ()).throw(ValueError("bad box"))
+    tb.detect_boxes = lambda prompt="cardboard box", view="auto": (_ for _ in ()).throw(ValueError("bad box"))
     assert h.call("detect_boxes", {})["status"] == "fail"           # an ordinary tool error stays a structured failure
 
 
@@ -1050,3 +1052,16 @@ def test_the_same_failing_call_is_stopped_even_with_successes_in_between():
         h.call("move_arm", {"pose": "home"})
         reasons.append(h.call("move_arm", {"pose": "pre"})["reason"])
     assert "this exact move_arm call failed" in reasons[-1]
+
+
+def test_stack_side_views_reach_the_known_stack_top():
+    """A side fitted without its top row is looked at up to the stack's known top (other sides): views only."""
+    tb = bare_toolbox(FakeRobot())
+    C = np.array([[2.0, -0.4, 0.0], [2.0, 0.4, 0.0], [2.0, 0.4, 0.76], [2.0, -0.4, 0.76]])
+    assert np.array_equal(tb._to_stack_top(C), C)                    # no stack model: unchanged
+    tb.ws.stack = {"faces": {0: {"corners": np.array([[0, 0, 0.0], [0, 1, 0.0], [0, 1, 1.14], [0, 0, 1.14]])}}}
+    out = tb._to_stack_top(C)
+    assert out.shape == (6, 3) and np.allclose(sorted(out[:, 2])[-2:], [1.14, 1.14])
+    assert np.allclose(out[4:, :2], C[2:, :2])                       # the top corners raised, same x / y
+    tb.ws.stack["faces"][0]["corners"][:, 2] = [0, 0, 0.5, 0.5]      # stack lower than this side: unchanged
+    assert np.array_equal(tb._to_stack_top(C), C)

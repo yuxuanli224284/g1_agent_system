@@ -116,8 +116,7 @@ def main():
     R = {
         "ping": lambda: {"status": "ok", "t": env.get_obs()["timestamp"]},
         "get_robot_info": lambda: robot_info(env),
-        "get_head_obs": lambda: {k: v for k, v in (lambda o: {"rgb": o["rgb"], "depth": o["depth"], "K": o["K"],
-                                 "T_root_headcam": o["T_root_cam"], "timestamp": o["timestamp"]})(env.get_obs()).items()},
+        "get_head_obs": lambda depth=False: head_obs(env, depth),
         "get_wrist_obs": lambda side="left": wrist_obs(env, side),
         "get_joint_state": lambda: {"names": list(env.robot.data.joint_names), "q": env.robot.data.joint_pos[0].cpu().numpy(),
                                     "timestamp": env.get_obs()["timestamp"]},
@@ -474,11 +473,31 @@ def set_arm_joints(env, side, q, duration):
     return {"status": r["status"], "reason": r["reason"], "q_cmd": qc, "q_now": jp[env.arm.joint_idx[side]]}
 
 
+def head_obs(env, depth: bool = False) -> dict:
+    """Head camera frame as the robot gives it. D435i (camera_head.yaml model d435i): the colour image and the
+    infrared pair (images + stereo calibration); the depth image only when asked for (depth=True): the render depth
+    stands in for the camera's own on-chip depth, and is used only by the render-depth baseline (perception.yaml
+    head_depth.source: render). Single upstream camera: rgb + its render depth."""
+    o = env.get_obs()
+    out = {"rgb": o["rgb"], "K": o["K"], "T_root_headcam": o["T_root_cam"], "timestamp": o["timestamp"]}
+    if env.ir_cams is None or depth:
+        out["depth"] = o["depth"]
+    if env.ir_cams is not None:
+        st = env.head_stereo_obs()
+        out.update({k: st[k] for k in ("ir_left", "ir_right", "K_ir", "K_ir_right", "T_root_ir_left", "T_irleft_irright")})
+    return out
+
+
 def robot_info(env):
     from g1_barcode_sim.arm import ARM_JOINTS
     o = env.get_obs()
     return {"joint_names": list(env.robot.data.joint_names), "arm_joints": ARM_JOINTS,
             "head_K": o["K"], "head_size": list(o["rgb"].shape[:2]),
+            # D435i infrared pair (None for the single upstream camera): intrinsics, size, baseline
+            "head_stereo": (None if env.ir_cams is None else
+                            {"K_ir": env.ir_cams["left"].data.intrinsic_matrices[0].cpu().numpy().astype(float),
+                             "size": [env.cfg["camera"]["stereo"]["height"], env.cfg["camera"]["stereo"]["width"]],
+                             "baseline_m": env.cfg["camera"]["stereo"]["baseline_m"]}),
             "wrist_side": env.scanner_side if env.scanner_on else None,
             "wrist_K": o.get("wrist_K"), "wrist_size": list(o["wrist_rgb"].shape[:2]) if "wrist_rgb" in o else None,
             "policy_dt": env.policy_dt, "velocity_limits": env.cfg["robot"]["velocity_limits"],
@@ -486,7 +505,8 @@ def robot_info(env):
             "wrist_point": "scanner tip (exit-window centre) of the scanner held by the left gripper",
             # body (squat / torso) command of the GR00T walker; None for a walker without one
             "body_command": ({"height_default": env.walker.height_default, "height_range": list(env.walker.height_range),
-                              "rpy_limit_rad": [float(v) for v in env.walker.rpy_limit]}
+                              "rpy_limit_rad": [float(v) for v in env.walker.rpy_limit],
+                              "rpy_default": [float(v) for v in env.walker.rpy_default]}
                              if hasattr(env.walker, "set_body_command") else None)}
 
 

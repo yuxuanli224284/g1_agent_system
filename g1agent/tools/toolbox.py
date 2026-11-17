@@ -100,6 +100,8 @@ class Toolbox:
         self.body_cmd = bc
         self.base_height_cmd = None if bc is None else float(bc["height_default"])
         self._body_model = None
+        self.view_pitch = 0.0             # torso pitch offset of the current head view (0 = upright; robot.yaml view)
+        self._leans = None
         # task parameter: scan every vertical face of the stack (front, right, back, left) instead of the front only
         # (set by the runner from the task instruction; the default keeps the single-face behaviour)
         self.multi_face = False
@@ -132,12 +134,132 @@ class Toolbox:
         if not lo <= float(height) <= hi:
             return fail(f"height must be in [{lo}, {hi}] m")
         B = self.cfg["robot"]["body"]
-        r = self.robot.set_body_pose(float(height), None, B["ramp_s"], B["settle_s"])
+        # squat levels are calibrated with the torso upright: a leaned head view is undone with the height change
+        r = self.robot.set_body_pose(float(height), self._torso_rpy(0.0), B["ramp_s"], B["settle_s"])
         if r["status"] != "ok":
             return fail(f"body command: {r['status']}: {r['reason']}")
         self.base_height_cmd = float(height)
+        self.view_pitch = 0.0
         return ok({"height_cmd": float(height), "standing": self._standing(), "pelvis_z": r.get("pelvis_z"),
                    "tilt_deg": r.get("tilt_deg")}, r["reason"])
+
+    # ================================================================== head views (torso lean)
+    # The D435i head camera looks ~52 deg down with a 42 deg vertical field of view (colour): standing upright it sees
+    # the floor 0.5-2 m ahead and the lower ~0.8 m of a stack at 0.6 m, nothing above. Leaning the torso back
+    # (GR00T torso pitch command, waist joint) raises the view. A head view = (body height, torso pitch); the tools
+    # choose it from what they have to see: the calibrated lean levels (robot.yaml view.calibration, measured in Isaac)
+    # and FK give the camera pose of every view at any root pose. Walking, squatting and arm motions are upright.
+    def _torso_rpy(self, pitch):
+        r = np.asarray(self.body_cmd["rpy_default"], float).copy()
+        r[1] += float(pitch)
+        return r.tolist()
+
+    def _view_now(self):
+        return {"height_cmd": self.base_height_cmd, "pitch": self.view_pitch}
+
+    def _lean_levels(self):
+        """Calibrated standing head views, upright first, then increasingly leaned back (the levels whose head camera
+        points higher than upright; measured: status ok). [] for a robot without a body command."""
+        if self.body_cmd is None:
+            return []
+        if self._leans is None:
+            import json
+            import os
+            V = self.cfg["robot"]["view"]
+            cal = json.load(open(os.path.join(config.ROOT, V["calibration"])))["levels"]
+            ok_ = [l for l in cal if l["status"] == "ok"]
+            up = min(ok_, key=lambda l: abs(l["pitch_cmd"]))
+            if abs(up["pitch_cmd"]) > 1e-9:
+                raise ValueError("view calibration has no upright level (pitch_cmd 0)")
+            higher = [l for l in ok_ if l["cam_pitch_below_horizontal_deg"] < up["cam_pitch_below_horizontal_deg"] - 1e-6]
+            self._leans = [up] + sorted(higher, key=lambda l: abs(l["pitch_cmd"]))
+        return self._leans
+
+    def _cam_T_at(self, x, y, yaw, lv):
+        """Head camera pose (odom) standing at root ground position (x, y), yaw, in lean level lv (measured joints,
+        pelvis height and tilt; the arm as it is now)."""
+        from .body import Ry
+        q = self._q()
+        for n, v in lv["q"].items():
+            if n in self.kin.joint_q_index and not any(k in n for k in ("shoulder", "elbow", "wrist", "hand")):
+                q[self.kin.joint_q_index[n]] = float(v)
+        T = T_from_xy_yaw(x, y, yaw, float(lv["pelvis_z"]))
+        T[:3, :3] = T[:3, :3] @ Ry(math.radians(lv["pelvis_pitch_deg"]))
+        return T @ self.kin.pose(q, self.cfg["robot"]["head_cam_frame"])
+
+    def _in_view(self, Tc, pts):
+        K = np.asarray(self.info["head_K"], float)
+        H, W = self.info["head_size"]
+        uv, z = geo.project(K, inv_T(Tc), np.asarray(pts, float))
+        return geo.in_image(uv, z, W, H, self.cfg["perception"]["fov_margin_frac"]), z
+
+    def _view_for(self, pts, x=None, y=None, yaw=None):
+        """Lean level that puts the points (odom) in the head image from root pose (x, y, yaw) (default: here): the
+        least lean that sees all of them, else the one that sees most (ties: less lean). (level, n_in)."""
+        T0 = self._odom()
+        x = T0[0, 3] if x is None else x
+        y = T0[1, 3] if y is None else y
+        yaw = yaw_of(T0) if yaw is None else yaw
+        best = None
+        for lv in self._lean_levels():
+            inside, _ = self._in_view(self._cam_T_at(x, y, yaw, lv), pts)
+            n = int(np.sum(inside))
+            if n == len(inside):
+                return lv, n
+            if best is None or n > best[1]:
+                best = (lv, n)
+        return best
+
+    def _set_view(self, lv):
+        """Stand upright or lean back to a calibrated level, standing still (arm at home)."""
+        p = float(lv["pitch_cmd"])
+        if abs(p - self.view_pitch) < 1e-9 and self._standing():
+            return ok({"pitch": p})
+        if not self.arm_at_home:
+            return fail("changing the head view needs the arm at home (call move_arm('home'))")
+        V = self.cfg["robot"]["view"]
+        r = self.robot.set_body_pose(float(self.body_cmd["height_default"]), self._torso_rpy(p), V["ramp_s"], V["settle_s"])
+        if r["status"] != "ok":
+            return fail(f"head view (torso pitch {p}): {r['status']}: {r['reason']}")
+        self.view_pitch = p
+        self.base_height_cmd = float(self.body_cmd["height_default"])
+        return ok({"pitch": p, "tilt_deg": r.get("tilt_deg")})
+
+    def _upright(self):
+        """Standing upright (walking, squatting and arm motions start from here)."""
+        if self.body_cmd is None or (abs(self.view_pitch) < 1e-9 and self._standing()):
+            return None
+        r = self._set_view(self._lean_levels()[0])
+        return None if r["status"] == "ok" else r
+
+    def _target_points(self):
+        """Corners (odom) of what the robot is working toward: the faces compute_obs_pose planned with, else the fitted
+        faces of the selected target; None when nothing is known yet."""
+        if getattr(self, "_obs_faces", None):
+            return np.vstack([f["corners"] for f in self._obs_faces.values()])
+        if self.ws.target_box_id is not None:
+            fs = self._faces(self.ws.target_box_id)
+            if fs:
+                return np.vstack([np.asarray(f["corners"], float) for f in fs])
+        return None
+
+    def _to_stack_top(self, C):
+        """Corners (odom) to look at for a stack side: the given ones plus, when the stack model knows a higher top on
+        any side, the top corners raised to it. The sides of a free-standing stack share its height; a side first seen
+        from its near edge may be fitted without its top row (2026-11-13 stack4c_L0_0001: the back side was fitted
+        without its top boxes, the observation pose was planned for a 0.9 m side, and the top label at 1.1 m was never
+        in view). Views only: label positions still come from the faces actually fitted."""
+        st = self.ws.stack
+        C = np.asarray(C, float)
+        if st is None or not st.get("faces"):
+            return C
+        H = max(float(np.asarray(f["corners"], float)[:, 2].max()) for f in st["faces"].values())
+        zt = float(C[:, 2].max())
+        if H <= zt + 1e-6:
+            return C
+        top = C[C[:, 2] > zt - 1e-6].copy()
+        top[:, 2] = H
+        return np.vstack([C, top])
 
     def _c1(self):
         """Task-1 parameters (approach, arrival, observation distance) of the running task."""
@@ -156,12 +278,48 @@ class Toolbox:
         return self.kin.q_from_state(js["names"], js["q"])
 
     def _capture_head(self):
-        o = self.robot.get_head_obs()
+        """Head frame: colour image, depth registered to it, camera pose (FK) and odometry. Depth source: perception.yaml
+        head_depth.source (stereo = own matching on the infrared pair; render = the camera's delivered depth)."""
+        src = self.cfg["perception"]["head_depth"]["source"]
+        o = self.robot.get_head_obs(depth=src == "render")
         q = self._q()
-        self.head = {"rgb": o["rgb"], "depth": o["depth"], "K": np.asarray(o["K"], float),
+        stereo_stats = None
+        if src == "stereo":
+            if "ir_left" not in o:
+                raise RuntimeError("head_depth.source is stereo but the head camera gives no infrared pair")
+            depth, stereo_stats = self._stereo(o).compute(o["ir_left"], o["ir_right"])
+        elif src == "render":
+            depth = o["depth"]
+        else:
+            raise ValueError(f"perception.yaml head_depth.source must be stereo | render, got {src!r}")
+        self.head = {"rgb": o["rgb"], "depth": depth, "K": np.asarray(o["K"], float),
                      "T_root_cam": self.kin.pose(q, self.cfg["robot"]["head_cam_frame"]),
-                     "T_odom_root": self._odom(), "t": o["timestamp"]}
+                     "T_odom_root": self._odom(), "t": o["timestamp"], "q": q, "stereo": stereo_stats,
+                     "depth_sigma_coeff": self._stereo_depth.sigma_coeff if src == "stereo" else 0.0,
+                     "view": self._view_now()}
+        if src == "stereo":
+            self.head["ir_left"] = o["ir_left"]
         return self.head
+
+    def _min_structure_px(self):
+        """Smallest surface the head depth resolves (px): the stereo matching window; 0 for delivered depth."""
+        hd = self.cfg["perception"]["head_depth"]
+        return int(hd["sgbm"]["block_size"]) if hd["source"] == "stereo" else 0
+
+    def _stereo(self, o):
+        """StereoDepth for the head's infrared pair, built on the first stereo frame (its calibration)."""
+        if getattr(self, "_stereo_depth", None) is None:
+            from ..perception.stereo_depth import StereoDepth
+            si = self.info.get("head_stereo")
+            if si is None:
+                raise RuntimeError("robot info has no head_stereo (the head camera is not a stereo camera)")
+            q = self._q()
+            fr = self.cfg["robot"]
+            T_color_left = inv_T(self.kin.pose(q, fr["head_cam_frame"])) @ self.kin.pose(q, fr["head_ir_left_frame"])
+            self._stereo_depth = StereoDepth(self.cfg["perception"]["head_depth"], o["K_ir"], o["K_ir_right"],
+                                             o["T_irleft_irright"], si["size"], self.info["head_K"], self.info["head_size"],
+                                             T_color_left)
+        return self._stereo_depth
 
     def _capture_wrist(self):
         o = self.robot.get_wrist_obs(self.side)
@@ -197,18 +355,66 @@ class Toolbox:
         w = self._capture_wrist()
         return ok({"timestamp": w["t"]}, "wrist (scanner) camera image attached"), w["rgb"]
 
-    def detect_boxes(self, prompt: str = "cardboard box"):
-        h = self._capture_head()
+    def detect_boxes(self, prompt: str = "cardboard box", view: str = "auto"):
+        """Detect boxes in the head image. view "auto" (standing, arm at home): with a target known (faces planned by
+        compute_obs_pose / fitted), the head view that sees its faces from here (_view_for); with nothing known, the
+        view with the most detections, searched from upright to the most leaned level (D435i: from the start pose the
+        upright view sees only the floor). view "keep": the current view (plan updates while squatting / leaning)."""
+        prompt = f"a {prompt}." if not prompt.startswith("a ") else prompt
         prev_target_face = self._face(self.ws.target_box_id) if self.ws.target_box_id else None
-        dets = self.det.detect(h["rgb"], prompt=f"a {prompt}." if not prompt.startswith("a ") else prompt)
+        searched = None
+        can_move = view == "auto" and self.body_cmd is not None and self.arm_at_home and self._standing()
+        pts = self._target_points() if can_move else None
+        if can_move and pts is not None:
+            lv, _ = self._view_for(pts)
+            r = self._set_view(lv)
+            if r["status"] != "ok":
+                return r
+        h = self._capture_head()
+        dets = self.det.detect(h["rgb"], prompt=prompt)
+        if can_move and pts is None:
+            # nothing known: look from every standing view and keep the one with the most detections that are box
+            # faces, i.e. whose depth region fits a vertical face plane (perception.yaml plane_fit, the test
+            # fit_front_face applies next), then the most detections. 2026-11-13, D435i from the start pose (2.5 m):
+            # upright the head sees only the floor, and the detector returned floor regions as "boxes" (one covering the
+            # whole image, or two floor patches); a plain count, or the detection boxes' sides inside the image, kept
+            # the floor view.
+            def faces_in(hh, ds):
+                return sum(fit_front_face(hh["depth"], hh["K"], hh["T_root_cam"], d["bbox"], sigma_coeff=hh["depth_sigma_coeff"], min_structure_px=self._min_structure_px())["status"] == "ok" for d in ds)
+            searched = [{"pitch": self.view_pitch, "n": len(dets), "faces": faces_in(h, dets)}]
+            best = ((searched[0]["faces"], len(dets)), self.view_pitch, h, dets)
+            for lv in self._lean_levels():
+                if abs(lv["pitch_cmd"] - searched[0]["pitch"]) < 1e-9:
+                    continue
+                r = self._set_view(lv)
+                if r["status"] != "ok":
+                    return r
+                hh = self._capture_head()
+                dd = self.det.detect(hh["rgb"], prompt=prompt)
+                sc = (faces_in(hh, dd), len(dd))
+                searched.append({"pitch": lv["pitch_cmd"], "n": sc[1], "faces": sc[0]})
+                if sc > best[0]:
+                    best = (sc, lv["pitch_cmd"], hh, dd)
+            if abs(best[1] - self.view_pitch) > 1e-9:
+                r = self._set_view(next(l for l in self._lean_levels() if abs(l["pitch_cmd"] - best[1]) < 1e-9))
+                if r["status"] != "ok":
+                    return r
+                h = self._capture_head()                  # the frame at the chosen view (its pose for fitting)
+                dets = self.det.detect(h["rgb"], prompt=prompt)
+            else:
+                h, dets = best[2], best[3]
+                self.head = h
         self.ws.boxes = {f"box{i}": BoxEstimate(f"box{i}", d["bbox"], d["score"], h["t"]) for i, d in enumerate(dets)}
         self.ws.target_box_id = None
         if self.ws.target_selector is not None:
             self._reselect(prev_target_face)
+        view_info = {"pitch": self.view_pitch, "height_cmd": self.base_height_cmd, "searched": searched,
+                     "stereo": h.get("stereo")}
         if not dets:
-            return fail("no box detected in the head image", {"n": 0})
+            return fail("no box detected in the head image", {"n": 0, "view": view_info})
         return ok({"n": len(dets), "boxes": [{"id": f"box{i}", "bbox": d["bbox"], "score": d["score"]} for i, d in enumerate(dets)],
-                   "order": "left to right in the image (robot's left first)", "target_box_id": self.ws.target_box_id})
+                   "order": "left to right in the image (robot's left first)", "target_box_id": self.ws.target_box_id,
+                   "view": view_info})
 
     def _reselect(self, prev_face):
         ids = list(self.ws.boxes)                     # left -> right
@@ -379,7 +585,7 @@ class Toolbox:
         if box_id not in self.ws.boxes:
             return fail(f"unknown box {box_id!r}; call detect_boxes", {"known": list(self.ws.boxes)})
         h = self.head
-        r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], self.ws.boxes[box_id].bbox)
+        r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], self.ws.boxes[box_id].bbox, sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px())
         if r["status"] != "ok":
             return fail(r["reason"], {"n_valid": r.get("n_valid")})
         T = h["T_odom_root"]
@@ -416,28 +622,35 @@ class Toolbox:
             return fail("no front face for this box (call fit_front_face)")
         c1 = self._c1()
         center, nh = self._faces_reference(faces)
-        corners = np.vstack([np.asarray(f["corners"], float) for f in faces])
+        corners = self._to_stack_top(np.vstack([np.asarray(f["corners"], float) for f in faces]))
         yaw = math.atan2(-nh[1], -nh[0])
         T_root_cam = self.head["T_root_cam"] if self.head is not None else self.kin.pose(self._q(), self.cfg["robot"]["head_cam_frame"])
         z_root = self._odom()[2, 3]
         W, H = self.info["head_size"][1], self.info["head_size"][0]
         K = np.asarray(self.info["head_K"], float)
         n_steps = int(round((c1["d_obs_range"][1] - c1["d_obs_range"][0]) / c1["d_obs_step"]))
+        leans = self._lean_levels()
         chosen, fits = None, False
+        # the nearest distance at which some standing head view (upright first, then leaned back) sees every corner
         for k in range(n_steps + 1):
             d = c1["d_obs_range"][0] + k * c1["d_obs_step"]
             p = center + d * nh
-            T_odom_cam = T_from_xy_yaw(p[0], p[1], yaw, z_root) @ T_root_cam
-            uv, z = geo.project(K, inv_T(T_odom_cam), corners)
-            if np.all(geo.in_image(uv, z, W, H, self.cfg["perception"]["fov_margin_frac"])):
-                chosen, fits = (p, d), True
+            for lv in (leans or [None]):
+                T_odom_cam = (T_from_xy_yaw(p[0], p[1], yaw, z_root) @ T_root_cam if lv is None
+                              else self._cam_T_at(p[0], p[1], yaw, lv))
+                uv, z = geo.project(K, inv_T(T_odom_cam), corners)
+                if np.all(geo.in_image(uv, z, W, H, self.cfg["perception"]["fov_margin_frac"])):
+                    chosen, fits = (p, d, lv), True
+                    break
+            if chosen is not None:
                 break
         if chosen is None:
             d = c1["d_obs_range"][1]
-            chosen = (center + d * nh, d)
-        p, d = chosen
+            p = center + d * nh
+            chosen = (p, d, None if not leans else self._view_for(corners, p[0], p[1], yaw)[0])
+        p, d, lv = chosen
         self.ws.root_target = {"pos": [float(p[0]), float(p[1])], "yaw": yaw, "d_obs": d, "box_id": box_id, "fits": fits,
-                               "n_faces": len(faces)}
+                               "n_faces": len(faces), "view_pitch": None if lv is None else float(lv["pitch_cmd"])}
         # The faces this pose was planned with (full extents, normally seen from far) are frozen for the approach:
         # close-range refits see the faces cut by the image edge, so their extents (and hence the union reference
         # point, d_obs and the in-view test) are no longer the boxes' (2026-11-06: the goal moved by ~0.15 m between
@@ -483,8 +696,13 @@ class Toolbox:
         they extend). 2026-11-07: the agent_full LLM squatted before walking and never squatted again at the stance, so
         standing up / squatting belong to the tools, not to the call order."""
         self._stance_reached = None                     # every walking tool calls this guard first: the robot leaves
-        if self._standing():                            # the stance it may have reached
+        if self._standing() and abs(self.view_pitch) < 1e-9:   # the stance it may have reached
             return None
+        if self._standing():                            # leaned back for a head view: upright before walking
+            if not self.arm_at_home:
+                return fail("the robot is leaning back with the arm raised: call move_arm('home') first")
+            r = self._upright()
+            return None if r is None else fail(f"upright before walking: {r['reason']}")
         if not self.arm_at_home:
             return fail(f"the robot is squatting (height command {self.base_height_cmd:.2f} m) with the arm raised: "
                         "call move_arm('home') first (walking tools stand the robot up themselves)")
@@ -759,7 +977,8 @@ class Toolbox:
         place on the face) are kept as they are, labels seen for the first time are added as pending and ordered with
         the other pending ones by the same rule in the planning frame; scanned / failed entries never move."""
         ws = self.ws
-        r = self.detect_boxes()
+        # an internal update looks from the view it was called in (a squat / lean of the extra looks, the stance)
+        r = self.detect_boxes(view="keep" if _update else "auto")
         if r["status"] != "ok":
             return fail("no box detected in the head image")
         h = self.head
@@ -853,12 +1072,13 @@ class Toolbox:
                   f"has nothing to scan; call next_barcode to move on")
 
     def _low_view_update(self):
-        """Second look at the lower part of the faces from a squat, right after the first plan (task 3, robot standing
-        with the arm home). The head camera looks ~47 deg down from ~1.2 m: low labels on a wide / tall face are far
-        and oblique (2026-11-07 3x3 stack: 1-2 of the bottom-row labels missed standing, found after squatting). The
-        robot looks from every calibrated squat level whose head camera sees the faces' bottom corners (inside the image
-        with the fov margin) more finely than standing (focal length / depth, worst bottom corner); none -> no low look.
-        New labels are merged into the plan after each look (same rule as a plan update), then the robot stands up."""
+        """Extra looks right after the first plan of a side (task 3, robot standing, arm home): the plan view does not
+        resolve the whole side equally. Low part: the head camera looks ~50 deg down from ~1.2 m, so low labels on a
+        wide / tall face are far and oblique (2026-11-07 3x3 stack: 1-2 bottom-row labels missed standing, found after
+        squatting) -> every calibrated squat level (upright) whose view holds the faces' bottom corners more finely than
+        the plan view (focal length / depth at the worst bottom corner). High part (D435i, 42 deg vertical view): every
+        calibrated lean level whose view holds the faces' top corners more finely than the plan view. New labels are
+        merged into the plan after each look (same rule as a plan update); the robot ends standing upright."""
         body = self._body()
         if body is None or not self._standing() or not self.arm_at_home \
                 or not (self.ws.scan_plan or (self.ws.stack or {}).get("planned")):
@@ -867,54 +1087,68 @@ class Toolbox:
                  and (self.ws.stack is None or self._face_id(b.face["normal"]) == self.ws.stack["current"])]
         if not faces:
             return None
-        bottoms = []
-        for f in faces:
-            C = np.asarray(f["corners"], float)
-            zmin = C[:, 2].min()
-            bottoms += [c for c in C if c[2] < zmin + 1e-6] or [C[np.argmin(C[:, 2])]]
-        bottoms = np.asarray(bottoms)
+
+        def extreme(top):
+            out = []
+            for f in faces:
+                C = np.asarray(f["corners"], float)
+                zz = C[:, 2].max() if top else C[:, 2].min()
+                out += [c for c in C if abs(c[2] - zz) < 1e-6] or [C[np.argmax(C[:, 2]) if top else np.argmin(C[:, 2])]]
+            return np.asarray(out)
+        bottoms, tops = extreme(False), self._to_stack_top(extreme(True))
+        tops = tops[tops[:, 2] >= tops[:, 2].max() - 1e-6]
         T0 = self._odom()
         q0 = self._q()
         yaw = yaw_of(T0)
         R_yaw = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
         K = np.asarray(self.info["head_K"], float)
-        H, W = self.info["head_size"]
-        mfrac = self.cfg["perception"]["fov_margin_frac"]
 
-        def score(lv):
-            q_lv = q0 if lv is body.levels[0] else body.q_at(q0, lv)
-            sh = np.zeros(2) if lv is body.levels[0] else R_yaw @ body.foot_shift(lv, body.levels[0], q0)
-            Tr = body.T_root(T0[0, 3] + sh[0], T0[1, 3] + sh[1], yaw, lv)
-            Tc = Tr @ self.kin.pose(q_lv, self.cfg["robot"]["head_cam_frame"])
-            uv, z = geo.project(K, inv_T(Tc), bottoms)
-            if not np.all(geo.in_image(uv, z, W, H, mfrac)):
-                return None
-            return float(K[0, 0] / z.max())             # px per metre at the worst (farthest) bottom corner
+        def finer(Tc, pts):
+            inside, z = self._in_view(Tc, pts)
+            return float(K[0, 0] / z.max()) if np.all(inside) else None   # px per metre at the farthest point
 
-        # every calibrated squat level that sees the faces' bottom corners more finely than standing, highest first.
-        # One "best" level is not enough: the open-vocabulary label detector's recall is view-dependent and not monotonic
-        # in the height (2026-11-07 cardbox stack, 11 levels x 2 sides: the deepest squat, finest on the bottom, found
-        # none of the 4 lower labels, the 0.40-0.60 levels found all 4, 0.35 only 1); the union over the levels found
-        # every label of both sides (offline measurement).
-        s_stand = score(body.levels[0])
-        looks = [(sc, lv) for lv in body.levels[1:] if (sc := score(lv)) is not None and (s_stand is None or sc > s_stand)]
-        if not looks:
-            return {"height_cmd": None, "reason": "no squat sees the faces' bottom better than standing", "added": []}
+        def squat_cam(lv):
+            q_lv = body.q_at(q0, lv)
+            sh = R_yaw @ body.foot_shift(lv, body.levels[0], q0)
+            return body.T_root(T0[0, 3] + sh[0], T0[1, 3] + sh[1], yaw, lv) @ self.kin.pose(q_lv, self.cfg["robot"]["head_cam_frame"])
+
+        h_plan = self.head                                   # the frame the plan was made from
+        T_plan = h_plan["T_odom_root"] @ h_plan["T_root_cam"]
+        s_bot, s_top = finer(T_plan, bottoms), finer(T_plan, tops)
+        # every level that sees the part more finely than the plan view. One "best" level is not enough: the
+        # open-vocabulary label detector's recall is view-dependent and not monotonic in the height (2026-11-07 cardbox
+        # stack, 11 levels x 2 sides: the deepest squat, finest on the bottom, found none of the 4 lower labels, the
+        # 0.40-0.60 levels found all 4, 0.35 only 1); the union over the levels found every label of both sides.
+        plan_pitch = self.view_pitch
+        leans = [(sc, lv) for lv in self._lean_levels() if abs(lv["pitch_cmd"] - plan_pitch) > 1e-9
+                 and (sc := finer(self._cam_T_at(T0[0, 3], T0[1, 3], yaw, lv), tops)) is not None
+                 and (s_top is None or sc > s_top)]
+        squats = [(sc, lv) for lv in body.levels[1:] if (sc := finer(squat_cam(lv), bottoms)) is not None
+                  and (s_bot is None or sc > s_bot)]
         done, added = [], []
-        for sc, lv in looks:
-            r = self.set_base_height(lv["height_cmd"])
-            if r["status"] != "ok":
-                done.append({"height_cmd": lv["height_cmd"], "status": f"squat failed: {r['reason']}"})
+        for kind, looks in (("lean", leans), ("squat", squats)):
+            if kind == "squat" and looks and self._upright() is not None:      # squats start from upright standing
+                done.append({"squat": None, "status": "failed: upright before squatting"})
                 break
-            u = self.plan_scans(_update=True)
-            new = [a["id"] for a in (u["data"].get("added") or [])] if u["status"] == "ok" else []
-            added += new
-            done.append({"height_cmd": lv["height_cmd"], "px_per_m_bottom": round(sc, 1), "added": new})
-        st = self.set_base_height(None)
-        if st["status"] != "ok":
-            raise RuntimeError(f"standing up after the low look failed: {st['reason']}")
-        return {"height_cmd": [d["height_cmd"] for d in done], "looks": done,
-                "px_per_m_bottom_standing": None if s_stand is None else round(s_stand, 1), "added": added}
+            for sc, lv in looks:
+                r = self._set_view(lv) if kind == "lean" else self.set_base_height(lv["height_cmd"])
+                if r["status"] != "ok":
+                    done.append({kind: lv.get("pitch_cmd", lv.get("height_cmd")), "status": f"failed: {r['reason']}"})
+                    break
+                u = self.plan_scans(_update=True)
+                new = [a["id"] for a in (u["data"].get("added") or [])] if u["status"] == "ok" else []
+                added += new
+                done.append({kind: lv["pitch_cmd"] if kind == "lean" else lv["height_cmd"], "px_per_m": round(sc, 1), "added": new})
+        if done:
+            st = self._upright() if self._standing() else None
+            if not self._standing():
+                r = self.set_base_height(None)
+                st = None if r["status"] == "ok" else r
+            if st is not None:
+                raise RuntimeError(f"standing upright after the extra looks failed: {st['reason']}")
+        return {"looks": done, "px_per_m_plan": {"bottom": None if s_bot is None else round(s_bot, 1),
+                                                  "top": None if s_top is None else round(s_top, 1)},
+                "height_cmd": [d["squat"] for d in done if "squat" in d] or None, "added": added}
 
     def _merge_into_plan(self, cands, h, boxes, skipped):
         """plan_scans update (see there). A detection is a label already in the plan when its centre lies within half
@@ -1183,6 +1417,8 @@ class Toolbox:
         n_c = self._face_dirs()[(nf - 1) % len(self.TOUR)]
         refine = []
         for k in range(2):                                 # from the side's near edge, then once more from the observation pose
+            if k == 0:                                     # the new side is unknown: the head view is searched
+                self._obs_faces, self.ws.target_box_id = None, None
             r = self.detect_boxes()
             if r["status"] != "ok":
                 return fail(f"no box detected from the {self.TOUR[nf]} side", {"log": log})
@@ -1610,6 +1846,10 @@ class Toolbox:
             r = self.robot.set_arm_joints(side, self._home_q(js), A["duration_s"])
             self.arm_at_home = True
             return ok(r | {"pose": "home"})
+        if abs(self.view_pitch) > 1e-9:               # stances and IK are planned with the torso upright
+            r = self._upright()
+            if r is not None:
+                return fail(f"upright before moving the arm: {r['reason']}")
         if self.task == 3 and self.ws.current_barcode_id is not None:
             # the arm poses are only reachable from the stance planned for them (2026-11-07: the agent_full LLM raised
             # the arm right after plan_stance without walking there: 10 cm short, the barcode was given up)
@@ -1738,7 +1978,7 @@ class Toolbox:
         refit = None
         if np.all(z > 0):
             x0, y0 = np.clip(uv.min(axis=0), 0, None); x1, y1 = uv.max(axis=0)
-            r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], [x0, y0, x1, y1])
+            r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], [x0, y0, x1, y1], sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px())
             if r["status"] == "ok":
                 T = h["T_odom_root"]
                 refit = {"center": apply(T, r["center"]), "normal": rotate(T, r["normal"])}

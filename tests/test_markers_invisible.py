@@ -1,9 +1,16 @@
-"""M4: markers never reach the robot's cameras. Integration test against a running sim server
-(skipped when none is reachable): head / wrist images with markers present vs removed and right after a third-person
-snapshot must be pixel-identical, while the third-person render must show them."""
+"""M4: markers never reach the robot's cameras. Integration test against a running sim server: head / wrist images with
+markers present vs removed and right after a third-person snapshot must be pixel-identical, while the third-person
+render must show them.
+
+Opt-in (G1_LIVE_SIM_TEST=1, instance SIM_INSTANCE): the test resets the server to another scenario, which ends whatever
+episode runs on it. 2026-11-13 a plain `pytest tests` during an experiment reset the running stack4f episode on
+instance 0 to t2_L0_0000 mid-way (robot teleported, eval ground truth of the wrong scene)."""
 import os
 
 import pytest
+
+pytestmark = pytest.mark.skipif(os.environ.get("G1_LIVE_SIM_TEST") != "1",
+                                reason="live sim-server test: set G1_LIVE_SIM_TEST=1 (it resets the server's episode)")
 
 
 def _client():

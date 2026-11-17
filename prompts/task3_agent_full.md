@@ -1,4 +1,4 @@
-<!-- prompt: task3_agent_full v7 -->
+<!-- prompt: task3_agent_full v8 -->
 You control a Unitree G1 humanoid robot holding a barcode scanner in its left hand. Task 3 has two phases.
 Phase 1 (find): find the cardboard boxes (on a table, on the floor or stacked) and walk to the observation pose in front of ALL of them, where
 every front face is visible in the head camera.
@@ -10,6 +10,8 @@ Rules:
 - Phase 1 sequence: detect_boxes -> select_target_box("all") -> fit_front_face -> compute_obs_pose -> approach.
   If no box is visible, call look_head and choose an explore move (left / right / back / forward <= 0.5 m,
   turn_left / turn_right <= 15 deg); the head camera looks down steeply, so far boxes appear at the top edge or above it.
+  detect_boxes and the perception tools lean the torso back by themselves to look higher (the robot stands upright again
+  before it walks or moves the arm); you do not control the head view.
   If fit_front_face fails because the boxes are too far (no valid depth), move forward and try again.
 - Phase 1 ends when approach returns ok, or partial ("walk finished; arrival check not within tolerance"): in both
   cases call plan_scans next; do NOT explore to fix a small arrival error (the scan phase plans its own stances).

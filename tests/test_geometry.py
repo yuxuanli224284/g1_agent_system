@@ -46,7 +46,39 @@ def test_plane_fit_synthetic_face():
     table = ray_z > 0.3                                       # rays hitting the "table" (z = 0.7) before the face
     d[table] = (0.3 / ray_z[table]).astype(np.float32)
     r = fit_front_face(d, K, T, [100, 50, 540, 450], cfg={"depth_valid": [0.2, 3.0], "stride": 4, "ransac_iters": 300,
-                                                         "inlier_dist": 0.01, "max_normal_tilt_deg": 20.0, "min_inliers": 100, "seed": 0})
+                                                         "inlier_dist": 0.01, "inlier_sigmas": 2.0, "max_normal_tilt_deg": 20.0, "min_inliers": 100, "seed": 0})
     assert r["status"] == "ok"
     assert np.allclose(r["normal"], [-1, 0, 0], atol=1e-3)
     assert abs(r["center"][0] - 1.0) < 1e-3
+
+
+def test_plane_fit_noisy_depth_keeps_the_face_extent():
+    """Stereo-like depth (noise sigma = c z^2) of a 0.8 m wide vertical face standing on a floor: with the noise model
+    the support plane is removed and the extent comes from the largest region; the base line's floor outliers must not
+    stretch the face (2026-11-13: 0.80 m fitted 1.17 m wide)."""
+    import numpy as np
+    from g1agent.common import config
+    from g1agent.perception.plane_fit import fit_front_face
+    W, H, f = 848, 480, 617.0
+    K = np.array([[f, 0, W / 2], [0, f, H / 2], [0, 0, 1.0]])
+    # camera 1.2 m above the floor looking down 40 deg along +x; face plane x = 1.2, |y| <= 0.4, 0 <= z <= 0.8
+    a = np.radians(40.0)
+    R = np.array([[0, -np.sin(a), np.cos(a)], [-1, 0, 0], [0, -np.cos(a), -np.sin(a)]])   # optical -> root
+    T = np.eye(4); T[:3, :3] = R; T[:3, 3] = [0, 0, 1.2]
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    d = np.stack([(u - W / 2) / f, (v - H / 2) / f, np.ones_like(u, float)], -1) @ R.T
+    t_face = (1.2 - 0.0) / d[..., 0]
+    hit = t_face[..., None] * d
+    on_face = (d[..., 0] > 0) & (np.abs(hit[..., 1]) <= 0.4) & (hit[..., 2] + 1.2 >= 0) & (hit[..., 2] + 1.2 <= 0.8)
+    t_floor = np.where(d[..., 2] < 0, -1.2 / np.minimum(d[..., 2], -1e-9), np.inf)
+    t = np.where(on_face & (t_face < t_floor), t_face, t_floor)
+    z = t                                              # the ray has optical z = 1, so t is the optical depth
+    z = np.where(np.isfinite(z) & (z < 3.0), z, 0.0)
+    c = 0.0089
+    rng = np.random.default_rng(0)
+    zn = np.where(z > 0, z + rng.normal(0, 1, z.shape) * c * z ** 2, 0.0)
+    cfg = config.load("perception")["plane_fit"]
+    r = fit_front_face(zn, K, T, [0, 0, W, H], cfg, sigma_coeff=c, min_structure_px=7)
+    assert r["status"] == "ok"
+    width = float(np.ptp(r["corners"][:, 1]))
+    assert abs(width - 0.8) < 0.1, width

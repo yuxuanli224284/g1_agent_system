@@ -3,6 +3,8 @@
 <robot name="g1_29dof_dex1_scanner">
   <link name="d435_link"/>
   <link name="head_cam_optical"/>
+  <link name="head_ir_left_optical"/>
+  <link name="head_ir_right_optical"/>
   <link name="head_link"/>
   <link name="imu_in_pelvis"/>
   <link name="imu_in_torso"/>
@@ -106,7 +108,9 @@
   <joint name="right_hand_Joint2_1" type="prismatic"><parent link="right_hand_base_link"/><child link="right_hand_Link2_1"/><origin xyz="-0.0405500 0.0593000 -0.0152000" rpy="0.000000000 -0.000000000 0.000000000"/><axis xyz="1.0000000 0.0000000 0.0000000"/><limit lower="-0.0200000" upper="0.0500000" effort="100" velocity="10"/></joint>
   <joint name="right_hand_Joint2_2" type="fixed"><parent link="right_hand_Link2_1"/><child link="right_hand_Link2_2"/><origin xyz="0.0130000 0.0130000 0.0000000" rpy="0.000000000 -0.000000000 0.000000000"/></joint>
   <joint name="right_hand_Joint2_3" type="fixed"><parent link="right_hand_Link2_2"/><child link="right_hand_Link2_3"/><origin xyz="0.0025165 0.0250430 0.0294000" rpy="0.000000000 -0.000000000 0.000000000"/></joint>
-  <joint name="head_cam_optical_joint" type="fixed"><parent link="d435_link"/><child link="head_cam_optical"/><origin xyz="0.0000000 0.0000000 0.0000000" rpy="-1.570796327 -0.000000000 -1.570796327"/></joint>
+  <joint name="head_cam_optical_joint" type="fixed"><parent link="d435_link"/><child link="head_cam_optical"/><origin xyz="0.0000000 0.0150000 0.0000000" rpy="-1.570796327 -0.000000000 -1.570796327"/></joint>
+  <joint name="head_ir_left_optical_joint" type="fixed"><parent link="d435_link"/><child link="head_ir_left_optical"/><origin xyz="0.0000000 0.0000000 0.0000000" rpy="-1.570796327 -0.000000000 -1.570796327"/></joint>
+  <joint name="head_ir_right_optical_joint" type="fixed"><parent link="d435_link"/><child link="head_ir_right_optical"/><origin xyz="0.0000000 -0.0500000 0.0000000" rpy="-1.570796327 -0.000000000 -1.570796327"/></joint>
   <joint name="scanner_mount_joint" type="fixed"><parent link="left_hand_base_link"/><child link="scanner_mount"/><origin xyz="0.0000000 0.1100000 0.0000000" rpy="0.000000000 -0.000000000 1.570796327"/></joint>
   <joint name="scanner_tip_joint" type="fixed"><parent link="left_hand_base_link"/><child link="scanner_tip"/><origin xyz="-0.0000000 0.1810000 0.0600000" rpy="0.000000000 -0.000000000 1.570796327"/></joint>
   <joint name="wrist_cam_optical_joint" type="fixed"><parent link="left_hand_base_link"/><child link="wrist_cam_optical"/><origin xyz="-0.0000000 0.1815000 0.0600000" rpy="-1.570796327 -0.000000000 0.000000000"/></joint>

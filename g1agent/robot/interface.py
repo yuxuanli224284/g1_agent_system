@@ -9,7 +9,9 @@ class RobotInterface(ABC):
     @abstractmethod
     def get_robot_info(self) -> dict: ...                       # joint names, camera intrinsics, limits
     @abstractmethod
-    def get_head_obs(self) -> dict: ...                         # rgb, depth (m), K, T_root_headcam, timestamp
+    def get_head_obs(self, depth: bool = False) -> dict: ...    # rgb, K, T_root_headcam, timestamp; stereo head (D435i):
+                                                                # ir_left, ir_right, K_ir, T_root_ir_left, T_irleft_irright;
+                                                                # depth (m, colour frame): the camera's own depth, if asked
     @abstractmethod
     def get_wrist_obs(self, side: str = "left") -> dict: ...    # rgb, depth, K, T_root_wristcam, timestamp
     @abstractmethod

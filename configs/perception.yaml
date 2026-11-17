@@ -7,11 +7,30 @@ box_detector:
   nms_iou: 0.5                       # drop near-duplicate detections
   container_min_children: 2          # drop a detection that contains >= 2 other detections (a box around the group)
   container_overlap: 0.8             # "contains" = >= 80 % of the child's area inside
+head_depth:                          # where the head depth image comes from (perception/stereo_depth.py)
+  source: stereo                     # stereo: own matching on the D435i infrared pair (default since 2026-11-13);
+                                     # render: the camera's depth as delivered (simulator render, ideal) - baseline only
+  valid_range_m: [0.3, 3.0]          # D435i: min-Z ~0.3 m at 848 x 480 (G1 depth camera spec 0.4 m), ideal range to 3 m
+  disparity_sigma_px: 0.20           # measured: robust std of the disparity error vs the render depth, 0.18-0.22 px over
+                                     # 10 frames at 0.6-2.5 m (2026-11-13, g1_barcode_sim scripts/d435i_check.py); depth noise
+                                     # sigma_z = 0.20 px x z^2 / (f B) -> 0.9 cm at 1 m, 3.5 cm at 2 m
+  sgbm:                              # OpenCV StereoSGBM. Hand-chosen from OpenCV's documented defaults / usual values:
+    num_disparities: 80              # >= f x B / near limit = 447 px x 0.05 m / 0.3 m = 74.5 px, multiple of 16
+    block_size: 7                    # matching window (odd); several projector dots fall inside one window
+    p1_per_px: 8                     # P1 = 8 x block^2, P2 = 32 x block^2 (OpenCV sample values for 1-channel images)
+    p2_per_px: 32
+    uniqueness_ratio: 10             # OpenCV: "5-15 is good enough"
+    speckle_window: 100              # OpenCV: "50-200"
+    speckle_range: 2                 # OpenCV: "1 or 2 is good enough"
+    disp12_max_diff: 1               # left-right consistency check, px
+    prefilter_cap: 63
+    mode: 3way
 plane_fit:
   depth_valid: [0.2, 3.0]            # head depth valid range (camera spec, same as the simulator)
   stride: 2                          # pixel subsampling inside the detection box
   ransac_iters: 400
-  inlier_dist: 0.01                  # m
+  inlier_dist: 0.01                  # m (noise-free depth; stereo: max(this, inlier_sigmas x sigma_z), plane_fit.py)
+  inlier_sigmas: 2.0                 # stereo depth: point-to-plane tolerance in depth-noise sigmas (~95 % of a normal error)
   max_normal_tilt_deg: 20.0          # front face: normal within 20 deg of horizontal
   min_inliers: 150
   seed: 0

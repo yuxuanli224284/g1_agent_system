@@ -1,7 +1,8 @@
 # Harness-side robot parameters
 urdf: assets/g1_dex1_scanner.urdf      # exported from the simulated USD (scripts/export_urdf.py)
 root_frame: pelvis
-head_cam_frame: head_cam_optical
+head_cam_frame: head_cam_optical       # D435i: the colour camera (15 mm left of the left infrared imager)
+head_ir_left_frame: head_ir_left_optical   # D435i left infrared imager (depth origin)
 arm_side: left
 wrist_point_frame: scanner_tip         # "以后装上扫码枪，就改成枪口位置" -> the scanner tip (exit window centre)
 wrist_cam_frame: wrist_cam_optical     # the camera at the scanner head (DS2208-like imager, 640x480, 32.8 deg hFOV)
@@ -34,6 +35,10 @@ limits:                                # guards
   max_turn_deg: 15.0
   max_approach_segment_m: 1.0
   workspace_radius_m: 8.0              # the robot may not leave this radius around its episode start (odom)
+view:                                  # head views by leaning the torso back (GR00T torso pitch command), toolbox _lean_levels
+  calibration: assets/gear_lean_calibration.json   # measured in Isaac (g1_barcode_sim scripts/d435i_check.py, source inside)
+  ramp_s: 1.0                          # = the calibration ramp
+  settle_s: 2.0                        # = the calibration hold (the calibrated values are taken there)
 body:                                  # squat / stand (GR00T body command), stance planning with squats (tools/body.py)
   calibration: assets/gear_body_calibration.json   # measured in Isaac (source inside): planned squat levels = these only
   ramp_s: 1.0                          # set_base_height ramp = the calibration ramp (every level stable with it)

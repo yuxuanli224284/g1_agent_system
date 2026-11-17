@@ -16,7 +16,7 @@ class SimRobot(RobotInterface):
         self.rpc = RpcClient(s["host"], s["robot_port"] + i * s["instance_port_stride"], s["rpc_timeout_s"])
 
     def get_robot_info(self): return self.rpc.call("get_robot_info")
-    def get_head_obs(self): return self.rpc.call("get_head_obs")
+    def get_head_obs(self, depth=False): return self.rpc.call("get_head_obs", depth=bool(depth))
     def get_wrist_obs(self, side="left"): return self.rpc.call("get_wrist_obs", side=side)
     def get_joint_state(self): return self.rpc.call("get_joint_state")
     def get_odom(self): return self.rpc.call("get_odom")

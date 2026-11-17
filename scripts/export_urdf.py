@@ -3,7 +3,8 @@ pinocchio model is exactly the simulated robot. Runs in unitree_sim_env.
 
 Every UsdPhysics joint becomes a URDF joint: origin = (localPos0, localRot0) * inv(localRot1) (localPos1 must be 0),
 axis = localRot1 * physics:axis (so the motion is the same). Extra fixed frames (from the simulator configs):
-head_cam_optical (d435_link * camera_head.yaml offset), scanner_mount, scanner_tip, wrist_cam_optical
+head_cam_optical (d435_link * camera_head.yaml offset; D435i: the colour camera), head_ir_left/right_optical
+(D435i infrared pair), scanner_mount, scanner_tip, wrist_cam_optical
 (left_hand_base_link * scanner transforms). Optical frames use the ROS convention (x right, y down, z forward).
 
 python scripts/export_urdf.py   -> assets/g1_dex1_scanner.urdf
@@ -77,6 +78,9 @@ try:
              ("scanner_mount", env.cfg["robot"]["scanner_mount"]["parent_link"], env._T_body_mount),
              ("scanner_tip", env.cfg["robot"]["scanner_mount"]["parent_link"], env._T_body_tip),
              ("wrist_cam_optical", env.cfg["robot"]["scanner_mount"]["parent_link"], env._T_body_wcam)]
+    if cc.get("stereo") is not None:          # D435i infrared pair (camera_head.yaml model d435i)
+        extra += [(f"head_ir_{s}_optical", cc["prim_parent_link"], make_T(cc["stereo"][f"{s}_pos"], cc["offset_rot_wxyz"]))
+                  for s in ("left", "right")]
     for name, parent, T in extra:
         links.add(name)
         joints.append(f'  <joint name="{name}_joint" type="fixed"><parent link="{parent}"/><child link="{name}"/>{origin(T)}</joint>')
