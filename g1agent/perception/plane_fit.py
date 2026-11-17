@@ -33,6 +33,10 @@ def fit_front_face(depth, K, T_root_cam, bbox, cfg: dict | None = None, sigma_co
     h, w = depth.shape
     x0, y0, x1, y1 = (int(round(v)) for v in bbox)
     x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        # the box lies outside the image (e.g. a face projected from its known corners while the head looks elsewhere;
+        # 2026-11-16 wall6x5: refine_with_wrist at a close stance with the 69 deg D435i view raised a ValueError here)
+        return {"status": "fail", "reason": "the box is outside the depth image", "n_valid": 0}
     vs, us = np.mgrid[y0:y1:c["stride"], x0:x1:c["stride"]]
     z = depth[vs, us]
     lo, hi = c["depth_valid"]

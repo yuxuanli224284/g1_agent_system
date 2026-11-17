@@ -82,3 +82,12 @@ def test_plane_fit_noisy_depth_keeps_the_face_extent():
     assert r["status"] == "ok"
     width = float(np.ptp(r["corners"][:, 1]))
     assert abs(width - 0.8) < 0.1, width
+
+
+def test_plane_fit_box_outside_the_image_is_a_failure_not_an_error():
+    """A box entirely outside the image (after clipping: empty) returns status fail (refine_with_wrist then keeps the
+    stored face plane) instead of raising."""
+    d = np.full((480, 640), 1.0, np.float32)
+    for bbox in ([700, 100, 900, 300], [100, 500, 300, 700], [-300, -200, -10, -5]):
+        r = fit_front_face(d, K, np.eye(4), bbox)
+        assert r["status"] == "fail" and "outside" in r["reason"]
