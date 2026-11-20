@@ -55,6 +55,20 @@ def test_refined_target_uses_the_wrist_width():
     bc.width_m, bc.width_source = 0.08, "wrist"                   # what refine_with_wrist stores
     tb.compute_wrist_target(refined=True)
     S = config.load("task3")["standoff"]
-    want = so.adaptive_standoff(0.08, tb.wrist_hfov, S["fill_frac"], S["min_m"], S["max_m"])
+    want = so.adaptive_standoff(0.08, tb.scanner_hfov, S["fill_frac"], S["min_m"], S["max_m"])
     assert tb.ws.wrist_target_refined["offset"] == pytest.approx(want) and want < head
     assert want == pytest.approx(0.20, abs=0.002)
+
+
+@pytest.mark.parametrize("side,dist", [(0.04, 0.30), (0.05, 0.35)])
+def test_symbol_width_on_the_d405_needs_the_variant_upscale(side, dist):
+    """g1_v2 hand camera (D405 colour, 848 x 480, fx 446.8 px): symbols that zbar does not decode at 1x (here ~3 px per
+    QR module, synthetic) are decoded at the variant's wrist_upscale (2), and the width is still measured in the plane
+    (polygons mapped back to the original pixels). The stand-off it sets is still the scanner's (32.8 deg)."""
+    frame, plane = _frame(side, dist, 0.0, fx=446.8, W=848, H=480)
+    tb = bare_toolbox(FakeRobot(), variant="g1_v2")
+    assert tb.cfg["perception"]["barcode"]["wrist_upscale"] == 2
+    w = tb._wrist_symbol_width(frame, {"center": [424.0, 240.0]}, plane)
+    assert w["width_m"] == pytest.approx(side, rel=0.03), w
+    tb.cfg["perception"]["barcode"]["wrist_upscale"] = 1
+    assert tb._wrist_symbol_width(frame, {"center": [424.0, 240.0]}, plane)["width_m"] is None

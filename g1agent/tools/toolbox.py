@@ -5,10 +5,20 @@ Frames: perception happens in the root frame at capture time and is stored in th
 camera poses come from the joint state through pinocchio FK (head <-> wrist via kinematics, not odometry).
 No ground truth is used anywhere in this module (tests/test_no_gt_leak.py).
 
+Robot variant (robot info robot_variant -> config.apply_robot_variant): the kinematic model, the scanner frames and the
+hand camera. Two roles that coincide on g1_v1 and are separate devices on g1_v2:
+- the SCANNER (decoding in scan(), its imager's field of view = scanner_hfov: stand-off, view cone; IK target scanner_tip,
+  roll reference = its image axis);
+- the HAND CAMERA (robot.yaml variants.<v>.hand_camera): every image the tools take on the scanner hand (look_wrist,
+  refine_with_wrist detection / rays / symbol width, stereo_check_wrist). g1_v1: the scanner imager itself; g1_v2: the
+  Intel D405 on the left-wrist bracket ("the original left-hand (wrist) camera now corresponds to the D405").
+
 Task 3 (scan every barcode): plan_scans localises every label on every fitted face and fixes the order (scan_order.py:
-columns left to right, top to bottom inside a column); next_barcode walks the plan and clears the per-barcode slots;
-every barcode tool defaults to ws.current_barcode_id and to the face copy stored with the barcode; scan dedupes by
-decoded content into the ws.scanned ledger.
+columns left to right, top to bottom inside a column; or rows top to bottom, left to right inside a row when the task's
+target spec says so); next_barcode walks the plan and clears the per-barcode slots; every barcode tool defaults to
+ws.current_barcode_id and to the face copy stored with the barcode; scan dedupes by decoded content into the ws.scanned
+ledger. A target spec in robot terms (set_scan_targets: columns / rows of the box wall counted from an edge) is resolved
+on the label grid of the first plan of a side; the labels outside the requested cells stay in the plan as not_targeted.
 """
 from __future__ import annotations
 
@@ -25,7 +35,10 @@ from ..kinematics.ik import ArmIK
 from ..perception import geometry as geo
 from ..perception.barcode_detector import decode_symbol_polygons, detect_barcodes, detect_label_dino
 from ..perception.plane_fit import fit_front_face
-from .scan_order import adaptive_standoff, column_order, hfov_from_intrinsics, order_items_in_frame, point_in_quad, quad_width
+from .scan_order import (adaptive_standoff, cell_targeted, describe_targets, grid_cell, grid_conflict, hfov_from_intrinsics,
+                         order_items,
+                         order_items_in_frame, order_rule_text as scan_order_text, parse_targets, point_in_quad, quad_width,
+                         resolve_grid)
 
 
 def R3(x):
@@ -75,12 +88,16 @@ class Toolbox:
     def __init__(self, robot, box_detector=None, device: str | None = None):
         from ..perception.box_detector import BoxDetector
         self.robot = robot
-        self.cfg = config.load_all()
-        self.kin = Kinematics()
-        self.ik = ArmIK(self.kin)
-        self.det = box_detector or BoxDetector(device)
+        # the model follows what the robot reports (never system.yaml): robot variant first (URDF, scanner / hand-camera
+        # frames, calibrations, allowed head models), then the head camera
         self.info = robot.get_robot_info()
+        self.cfg = config.load_all()
+        config.apply_robot_variant(self.cfg, self.info.get("robot_variant"))
         config.apply_head_camera(self.cfg, self.info.get("head_camera_model"))   # frames, depth source, lean views
+        self._check_robot_info(self.info)
+        self.kin = Kinematics(self.cfg["robot"]["urdf"])
+        self.ik = ArmIK(self.kin, self.cfg["robot"])
+        self.det = box_detector or BoxDetector(device)
         self.side = self.cfg["robot"]["arm_side"]
         self.ws = WorldState()
         self.head = None
@@ -93,9 +110,10 @@ class Toolbox:
         self._last_label = None           # head label detection of detect_barcode_head (task-2 path)
         self._wrist_detection = None      # last wrist detection of refine_with_wrist
         K, size = self.info.get("wrist_K"), self.info.get("wrist_size")
-        # scanner horizontal field of view from the wrist intrinsics (32.8 deg for the DS2208-like imager); None
-        # when the robot has no scanner camera (the adaptive stand-off then fails loudly)
-        self.wrist_hfov = None if K is None or size is None else hfov_from_intrinsics(float(np.asarray(K, float)[0, 0]), float(size[1]))
+        # SCANNER horizontal field of view from the scanner imager's intrinsics (robot info wrist_K / wrist_size: 32.8 deg
+        # for the DS2208-like imager, on every variant); None when the robot reports no scanner imager (the adaptive
+        # stand-off then fails loudly). Never the hand camera's (the D405's 87 deg would put every label at min_m)
+        self.scanner_hfov = None if K is None or size is None else hfov_from_intrinsics(float(np.asarray(K, float)[0, 0]), float(size[1]))
         # body (squat) command: None = the walker has none (stance planning stays at the standing height)
         bc = self.info.get("body_command")
         self.body_cmd = bc
@@ -106,6 +124,27 @@ class Toolbox:
         # task parameter: scan every vertical face of the stack (front, right, back, left) instead of the front only
         # (set by the runner from the task instruction; the default keeps the single-face behaviour)
         self.multi_face = False
+        # task parameter: which labels to scan, in robot terms (set_scan_targets; None = every label, column order)
+        self.scan_targets = None
+
+    def _check_robot_info(self, info):
+        """The robot must have its scanner on the configured arm and the variant's hand camera."""
+        rc = self.cfg["robot"]
+        if info.get("wrist_side") != rc["arm_side"]:
+            raise ValueError(f"robot reports the scanner on side {info.get('wrist_side')!r}, robot.yaml arm_side is {rc['arm_side']!r}")
+        hc = rc["hand_camera"]
+        if hc["source"] == "hand_camera":
+            cams = info.get("hand_cameras") or {}
+            if hc["name"] not in cams:
+                raise ValueError(f"robot variant {rc['robot_variant']}: hand camera {hc['name']!r} not reported by the robot "
+                                 f"(hand_cameras: {sorted(cams)})")
+            if cams[hc["name"]]["side"] != rc["arm_side"]:
+                raise ValueError(f"hand camera {hc['name']!r} is on the {cams[hc['name']]['side']} hand, the scanner arm is {rc['arm_side']}")
+
+    def set_scan_targets(self, spec):
+        """Task instruction: which labels to scan, in robot terms (scan_order.parse_targets: columns / rows counted from
+        an edge of the box wall, and the scan order rule). None = every label, columns left to right."""
+        self.scan_targets = parse_targets(spec)
 
     # ================================================================== body (squat / stand)
     def _body(self):
@@ -118,7 +157,8 @@ class Toolbox:
             from .body import BodyModel
             B = self.cfg["robot"]["body"]
             cal = json.load(open(os.path.join(config.ROOT, B["calibration"])))["levels"]
-            self._body_model = BodyModel(self.kin, self.robot.get_robot_geometry(), cal, self.side)
+            self._body_model = BodyModel(self.kin, self.robot.get_robot_geometry(), cal, self.side,
+                                         self.cfg["robot"]["wrist_point_frame"])
         return self._body_model
 
     def _standing(self):
@@ -145,8 +185,9 @@ class Toolbox:
                    "tilt_deg": r.get("tilt_deg")}, r["reason"])
 
     # ================================================================== head views (torso lean)
-    # The D435i head camera looks ~52 deg down with a 42 deg vertical field of view (colour): standing upright it sees
-    # the floor 0.5-2 m ahead and the lower ~0.8 m of a stack at 0.6 m, nothing above. Leaning the torso back
+    # The D435i head camera looks ~52 deg down on g1_v1 (~30 deg on g1_v2's raised mount) with a 42 deg vertical field of
+    # view (colour): standing upright on g1_v1 it sees the floor 0.5-2 m ahead and the lower ~0.8 m of a stack at 0.6 m,
+    # nothing above (g1_v2 at 0.6 m from a wall: z ~0.7-1.2 m, estimated). Leaning the torso back
     # (GR00T torso pitch command, waist joint) raises the view. A head view = (body height, torso pitch); the tools
     # choose it from what they have to see: the calibrated lean levels (robot.yaml view.calibration, measured in Isaac)
     # and FK give the camera pose of every view at any root pose. Walking, squatting and arm motions are upright.
@@ -324,12 +365,21 @@ class Toolbox:
         return self._stereo_depth
 
     def _capture_wrist(self):
-        o = self.robot.get_wrist_obs(self.side)
+        """Hand-camera frame (robot.yaml variants.<v>.hand_camera): its image and K from the robot, its pose from FK of
+        the SAME camera's frame (pixels of one camera posed with another camera's frame would corrupt every ray).
+        g1_v1: the scanner imager (get_wrist_obs); g1_v2: the D405 (get_hand_camera_obs)."""
+        hc = self.cfg["robot"]["hand_camera"]
+        if hc["source"] == "scanner":
+            o = self.robot.get_wrist_obs(self.side)
+        elif hc["source"] == "hand_camera":
+            o = self.robot.get_hand_camera_obs(hc["name"])
+        else:
+            raise ValueError(f"hand_camera.source {hc['source']!r}")
         if o.get("status") == "error":
             raise RuntimeError(o["reason"])
         q = self._q()
-        self.wrist = {"rgb": o["rgb"], "K": np.asarray(o["K"], float), "T_root_cam": self.kin.pose(q, self.cfg["robot"]["wrist_cam_frame"]),
-                      "T_odom_root": self._odom(), "t": o["timestamp"], "q": q}
+        self.wrist = {"rgb": o["rgb"], "K": np.asarray(o["K"], float), "T_root_cam": self.kin.pose(q, hc["frame"]),
+                      "T_odom_root": self._odom(), "t": o["timestamp"], "q": q, "camera": hc["name"] or "scanner"}
         return self.wrist
 
     def _publish_markers(self):
@@ -355,7 +405,7 @@ class Toolbox:
 
     def look_wrist(self):
         w = self._capture_wrist()
-        return ok({"timestamp": w["t"]}, "wrist (scanner) camera image attached"), w["rgb"]
+        return ok({"timestamp": w["t"]}, self.cfg["robot"]["texts"]["look_wrist_result"]), w["rgb"]
 
     def detect_boxes(self, prompt: str = "cardboard box", view: str = "auto"):
         """Detect boxes in the head image. view "auto" (standing, arm at home): with a target known (faces planned by
@@ -1006,6 +1056,10 @@ class Toolbox:
             self._stack_add_faces(cur, list(faces.values()))
         face_entries = [b for b in ws.scan_plan if ws.barcodes[b].face_id == cur]
         updating = _update if _update is not None else bool(face_entries)
+        if self.scan_targets is not None:
+            if ws.target_grid is None:
+                ws.target_grid = {"targets": self.scan_targets, "edges_seen": [], "face_centres": [], "faces": {}}
+            self._note_face_edges(h, list(faces.values()))
         per_face, dropped = [], []
         cam = (h["T_odom_root"] @ h["T_root_cam"])[:3, 3]
         for bid, face in faces.items():
@@ -1036,7 +1090,7 @@ class Toolbox:
         # the tour goes on with next_barcode
         items = order_items_in_frame([{"key": i, "corners": c["est"]["corners"], "center": c["est"]["center"]}
                                       for i, c in enumerate(cands)], h["T_odom_root"])
-        order = column_order(items)
+        order = order_items(items, self._order_rule())
         for i in order:                                    # appended after the plans of earlier faces (face-major)
             c, est = cands[i], cands[i]["est"]
             k = len(ws.barcodes)
@@ -1059,19 +1113,148 @@ class Toolbox:
         ws.current_barcode_id = None
         self._clear_barcode_slots()
         low = self._low_view_update()
+        targets = self._resolve_targets(cur) if self.scan_targets is not None else None
         out = [{"id": b, "box_id": ws.barcodes[b].box_id, "order_index": ws.barcodes[b].order_index,
                 "corners_px": ws.barcodes[b].corners_px, "center_odom": ws.barcodes[b].center,
-                "width_m": ws.barcodes[b].width_m, "standoff_m": self._standoff(ws.barcodes[b]), "status": "pending",
-                "face_id": cur}
+                "width_m": ws.barcodes[b].width_m, "standoff_m": self._standoff(ws.barcodes[b]), "status": ws.barcodes[b].status,
+                "face_id": cur, **({"cell": ws.barcodes[b].grid_cell} if targets is not None else {})}
                for b in ws.scan_plan if ws.barcodes[b].face_id == cur]
-        return ok({"n": len(out), "barcodes": out, "boxes": boxes, "skipped": skipped, "dropped_labels": dropped,
-                   "low_view": low, "face_id": cur, "face": self.TOUR[cur], "first_for_face": True,
-                   "order_rule": "columns of overlapping lateral label extents, left to right as seen facing this side; "
-                                 "top to bottom inside a column"},
-                  f"{len(out)} barcode(s) planned on the {self.TOUR[cur]} side; call next_barcode" if out else
+        n = sum(o["status"] == "pending" for o in out)
+        data = {"n": n, "barcodes": out, "boxes": boxes, "skipped": skipped, "dropped_labels": dropped,
+                "low_view": low, "face_id": cur, "face": self.TOUR[cur], "first_for_face": True,
+                "order_rule": scan_order_text(self._order_rule())}
+        if targets is not None:
+            data["targets"] = targets
+            return ok(data, f"{n} barcode(s) planned on the {self.TOUR[cur]} side for {targets['description']}"
+                            f"{targets['note']}; call next_barcode")
+        return ok(data,
+                  f"{n} barcode(s) planned on the {self.TOUR[cur]} side; call next_barcode" if out else
                   f"no barcode label on the {self.TOUR[cur]} side ({len(faces)} face(s) fitted"
                   f"{', also looked from a squat' if low and low.get('height_cmd') is not None else ''}): this side "
                   f"has nothing to scan; call next_barcode to move on")
+
+    # ------------------------------------------------------------------ task 3: target grid (robot-terms target spec)
+    def _order_rule(self) -> str:
+        return "columns" if self.scan_targets is None else self.scan_targets["order"]
+
+    def _note_face_edges(self, h, faces):
+        """Box-face evidence of this head image for the target grid (scan_order.resolve_grid): for each fitted face of
+        the current side, which of its edges were seen (the two corners with the largest z = top, smallest z = bottom,
+        leftmost / rightmost along the face, both projecting inside the image with the perception margin,
+        perception.yaml fov_margin_frac, the margin every in-view test uses: a face cut by the image border was fitted up
+        to that border, not up to its edge), stored on the face (face["edges_seen"], copied with every label found on it),
+        whether a seen edge is clear (no detected box of this view has its centre beyond the edge's image line), and the
+        face centre (a box beyond a candidate wall edge, seen in any view)."""
+        g = self.ws.target_grid
+        if g is None:
+            return
+        H, W = h["rgb"].shape[:2]
+        cur = 0 if self.ws.stack is None else self.ws.stack["current"]
+        dets = [np.array([(b.bbox[0] + b.bbox[2]) / 2, (b.bbox[1] + b.bbox[3]) / 2]) for b in self.ws.boxes.values()]
+        for f in faces:
+            C = np.asarray(f["corners"], float)
+            uv, z = self._project_odom(h, C)
+            inside = geo.in_image(uv, z, W, H, self.cfg["perception"]["fov_margin_frac"])
+            pc = self._project_odom(h, np.asarray(f["center"], float)[None])[0][0]
+            lat = C @ np.asarray(f["right"], float)        # face right as seen from the camera side
+            seen = {}
+            for edge, idx in (("top", np.argsort(-C[:, 2])[:2]), ("bottom", np.argsort(C[:, 2])[:2]),
+                              ("left", np.argsort(lat)[:2]), ("right", np.argsort(-lat)[:2])):
+                seen[edge] = bool(np.all(inside[idx]))
+                if not seen[edge]:
+                    continue
+                p1, p2 = uv[idx[0]], uv[idx[1]]
+                side = lambda q: float((p2[0] - p1[0]) * (q[1] - p1[1]) - (p2[1] - p1[1]) * (q[0] - p1[0]))
+                s_in = side(pc)
+                clear = not any(side(q) * s_in < 0 for q in dets)       # a detection centre on the far side of the edge
+                g["edges_seen"].append({"face_id": cur, "edge": edge, "pts": C[idx].copy(), "clear": clear})
+            f["edges_seen"] = seen
+            g["face_centres"].append({"face_id": cur, "center": np.asarray(f["center"], float).copy()})
+
+    def _grid_evidence(self, fid, T_odom_frame):
+        """Edge observations and fitted-face centres of side fid in the planning frame (resolve_grid inputs). An edge's
+        coordinate is the conservative end of its two corners (top: the lower one, left: the one further right, ...)."""
+        T_fo = inv_T(np.asarray(T_odom_frame, float))
+        tf = lambda P: (T_fo[:3, :3] @ np.atleast_2d(np.asarray(P, float)).T).T + T_fo[:3, 3]
+        edges = []
+        for e in self.ws.target_grid["edges_seen"]:
+            if e["face_id"] != fid:
+                continue
+            P = tf(e["pts"])
+            v = {"top": P[:, 2].min(), "bottom": P[:, 2].max(), "left": P[:, 1].min(), "right": P[:, 1].max()}[e["edge"]]
+            edges.append({"edge": e["edge"], "coord": float(v), "clear": e["clear"]})
+        cs = [tf(c["center"])[0] for c in self.ws.target_grid["face_centres"] if c["face_id"] == fid]
+        return edges, {"columns": [float(c[1]) for c in cs], "rows": [float(c[2]) for c in cs]}
+
+    def _plan_items(self, bids, fid, with_faces: bool = False):
+        """Order / grid items of plan entries in their side's planning frame (the planned label rectangles, never moved,
+        and the current centres). with_faces: also the box face each label was found on (its extent in the planning
+        frame and which of its edges were seen, _note_face_edges), for the target grid."""
+        ws = self.ws
+        T = ws.scan_ref_Ts.get(fid, ws.scan_ref_T)
+        items = order_items_in_frame([{"key": b, "corners": ws.barcodes[b].corners_odom, "center": ws.barcodes[b].center}
+                                      for b in bids], T)
+        if with_faces:
+            T_fo = inv_T(np.asarray(T, float))
+            for it, b in zip(items, bids):
+                f = ws.barcodes[b].face
+                if f is None or "edges_seen" not in f:
+                    it["face"] = None
+                    continue
+                C = (T_fo[:3, :3] @ np.asarray(f["corners"], float).T).T + T_fo[:3, 3]
+                it["face"] = {"key": (float(f["t"]), tuple(np.round(np.asarray(f["corners"], float), 6).ravel())),
+                              "y_lo": float(C[:, 1].min()), "y_hi": float(C[:, 1].max()),
+                              "z_lo": float(C[:, 2].min()), "z_hi": float(C[:, 2].max()), "seen": f["edges_seen"]}
+        return items
+
+    def _reorder_pending(self, fid):
+        """Pending entries of side fid (the current barcode excluded) re-ordered by the plan's rule in that side's
+        planning frame; every other entry keeps its place."""
+        ws = self.ws
+        pend = [b for b in ws.scan_plan if ws.barcodes[b].status == "pending" and b != ws.current_barcode_id
+                and ws.barcodes[b].face_id == fid]
+        done = [b for b in ws.scan_plan if b not in pend]
+        ws.scan_plan = done + list(order_items(self._plan_items(pend, fid), self._order_rule()))
+        for i, b in enumerate(ws.scan_plan):
+            ws.barcodes[b].order_index = i
+
+    def _resolve_targets(self, fid) -> dict:
+        """First plan of a side with a target spec, after every extra look: the box grid of the side (scan_order.
+        resolve_grid: label groups, rows / columns of boxes without a localised label inserted from the box faces, the
+        wall edge only with nothing beyond it), the labels outside the requested cells marked not_targeted, the targeted
+        ones ordered by the spec's rule. Every requested cell not found and every count that rests on the labels alone
+        is reported (warnings; the Harness refuses a success claim with them): never silently fewer or shifted."""
+        ws = self.ws
+        ents = [b for b in ws.scan_plan if ws.barcodes[b].face_id == fid and ws.barcodes[b].status == "pending"]
+        edges, centres = self._grid_evidence(fid, ws.scan_ref_Ts.get(fid, ws.scan_ref_T))
+        grid = resolve_grid(self._plan_items(ents, fid, with_faces=True), self.scan_targets, edges, centres)
+        for b in ents:
+            bc = ws.barcodes[b]
+            bc.grid_cell = grid["cell_of"][b]
+            if b not in grid["selected"]:
+                bc.status = "not_targeted"
+                bc.fail_reason = f"not a target (column {bc.grid_cell['column']}, row {bc.grid_cell['row']})"
+        self._reorder_pending(fid)
+        ws.target_grid["faces"][fid] = {k: grid[k] for k in ("columns", "rows", "requested", "missing", "anchored",
+                                                             "warnings", "notes", "evidence")}
+        return self._targets_report(fid)
+
+    def _targets_report(self, fid) -> dict:
+        g = self.ws.target_grid["faces"][fid]
+        t = self.scan_targets
+        cell = lambda c: ", ".join(f"{a} {c[a]}" for a in ("column", "row") if c[a] is not None)
+        note = ""
+        if g["missing"]:
+            note += (f". WARNING: only {len(g['requested']) - len(g['missing'])} of {len(g['requested'])} requested cells "
+                     f"were found; NOT FOUND: {'; '.join(cell(c) for c in g['missing'])} (no label localised there)")
+        for w in g["warnings"]:
+            note += f". WARNING: {w}"
+        for n in g["notes"]:
+            note += f". Note: {n}"
+        return {"description": describe_targets(t), "spec": t["spec"], "order": t["order"],
+                "n_columns": len(g["columns"]), "n_rows": len(g["rows"]),
+                "requested_cells": g["requested"], "missing_cells": g["missing"], "edges_seen": g["anchored"],
+                "evidence": g["evidence"], "warnings": g["warnings"], "notes": g["notes"], "note": note}
 
     def _low_view_update(self):
         """Extra looks right after the first plan of a side (task 3, robot standing, arm home): the plan view does not
@@ -1122,9 +1305,17 @@ class Toolbox:
         # stack, 11 levels x 2 sides: the deepest squat, finest on the bottom, found none of the 4 lower labels, the
         # 0.40-0.60 levels found all 4, 0.35 only 1); the union over the levels found every label of both sides.
         plan_pitch = self.view_pitch
-        leans = [(sc, lv) for lv in self._lean_levels() if abs(lv["pitch_cmd"] - plan_pitch) > 1e-9
-                 and (sc := finer(self._cam_T_at(T0[0, 3], T0[1, 3], yaw, lv), tops)) is not None
-                 and (s_top is None or sc > s_top)]
+        cur = 0 if self.ws.stack is None else self.ws.stack["current"]
+        if self.scan_targets is not None and cur not in (self.ws.target_grid or {"faces": {}})["faces"]:
+            # a target spec counts columns / rows from an edge of the wall: before the grid of this side is resolved,
+            # look from EVERY standing head view (coverage, not resolution: the top row may lie above the plan view,
+            # 2026-11-19 g1_v2 at 0.6 m from the scanroom wall sees z ~0.68-1.19 m upright, the top row is at 1.2 m)
+            leans = [(finer(self._cam_T_at(T0[0, 3], T0[1, 3], yaw, lv), tops), lv) for lv in self._lean_levels()
+                     if abs(lv["pitch_cmd"] - plan_pitch) > 1e-9]
+        else:
+            leans = [(sc, lv) for lv in self._lean_levels() if abs(lv["pitch_cmd"] - plan_pitch) > 1e-9
+                     and (sc := finer(self._cam_T_at(T0[0, 3], T0[1, 3], yaw, lv), tops)) is not None
+                     and (s_top is None or sc > s_top)]
         squats = [(sc, lv) for lv in body.levels[1:] if (sc := finer(squat_cam(lv), bottoms)) is not None
                   and (s_bot is None or sc > s_bot)]
         done, added = [], []
@@ -1140,7 +1331,8 @@ class Toolbox:
                 u = self.plan_scans(_update=True)
                 new = [a["id"] for a in (u["data"].get("added") or [])] if u["status"] == "ok" else []
                 added += new
-                done.append({kind: lv["pitch_cmd"] if kind == "lean" else lv["height_cmd"], "px_per_m": round(sc, 1), "added": new})
+                done.append({kind: lv["pitch_cmd"] if kind == "lean" else lv["height_cmd"],
+                             "px_per_m": None if sc is None else round(sc, 1), "added": new})
         if done:
             st = self._upright() if self._standing() else None
             if not self._standing():
@@ -1157,6 +1349,7 @@ class Toolbox:
         a label width (the larger of the two estimates) of a planned label's centre on the same face plane."""
         ws = self.ws
         cur = 0 if ws.stack is None else ws.stack["current"]
+        grid = None if ws.target_grid is None else ws.target_grid["faces"].get(cur)
         added = []
         for c in cands:
             est = c["est"]
@@ -1174,23 +1367,36 @@ class Toolbox:
                                                status="pending", plan_center=np.asarray(est["center"], float).copy(), face_id=cur)
             ws.scan_plan.append(bid)
             added.append(bid)
+            if grid is not None:
+                # the side's grid is resolved: the new label belongs to the slot (box column / row, or the label group
+                # where the boxes were not resolved) that holds it; one that no slot holds on the counted side of the
+                # requested cells means the count missed something: reported, and no success claim (Harness)
+                bc = ws.barcodes[bid]
+                item = self._plan_items([bid], cur)[0]
+                bc.grid_cell = grid_cell(item, grid)
+                conflict = grid_conflict(item, bc.grid_cell, grid, self.scan_targets)
+                if conflict is not None:
+                    grid["warnings"].append(f"{bid}: {conflict} (found after the grid was resolved; the counts may be off)")
+                if cell_targeted(bc.grid_cell, self.scan_targets):
+                    grid["missing"] = [m for m in grid["missing"]
+                                       if not all(m[a] is None or m[a] == bc.grid_cell[a] for a in ("column", "row"))]
+                else:
+                    bc.status = "not_targeted"
+                    bc.fail_reason = (f"not a target (column {bc.grid_cell['column']}, row {bc.grid_cell['row']}; None = "
+                                      "outside the grid resolved at the first plan)")
         if added:
             # pending entries of the current side (old and new) re-ordered by the plan's rule in that side's planning
             # frame; the rest keep their places
-            pend = [b for b in ws.scan_plan if ws.barcodes[b].status == "pending" and b != ws.current_barcode_id
-                    and ws.barcodes[b].face_id == cur]
-            done = [b for b in ws.scan_plan if b not in pend]
-            items = order_items_in_frame([{"key": b, "corners": ws.barcodes[b].corners_odom, "center": ws.barcodes[b].center}
-                                          for b in pend], ws.scan_ref_Ts.get(cur, ws.scan_ref_T))
-            ws.scan_plan = done + list(column_order(items))
-            for i, b in enumerate(ws.scan_plan):
-                ws.barcodes[b].order_index = i
+            self._reorder_pending(cur)
         out = [{"id": b, "box_id": ws.barcodes[b].box_id, "order_index": ws.barcodes[b].order_index,
                 "corners_px": ws.barcodes[b].corners_px, "center_odom": ws.barcodes[b].center,
-                "width_m": ws.barcodes[b].width_m, "status": "pending"} for b in added]
+                "width_m": ws.barcodes[b].width_m, "status": ws.barcodes[b].status,
+                **({"cell": ws.barcodes[b].grid_cell} if grid is not None else {})} for b in added]
+        n_new = sum(o["status"] == "pending" for o in out)
         return ok({"updated": True, "added": out, "n_seen": len(cands), "n_planned": len(ws.scan_plan), "boxes": boxes,
                    "skipped": skipped, "scan_plan": ws.scan_plan_export()},
-                  f"plan update: {len(added)} new label(s) added" if added else "plan update: no new label")
+                  (f"plan update: {len(added)} new label(s) added" + (f" ({n_new} of them targets)" if grid is not None else ""))
+                  if added else "plan update: no new label")
 
     def _labels_on_rectified_face(self, h, face):
         """Labels on a fitted face, detected on the face rectified to a fronto-parallel view: the plane maps the head
@@ -1483,9 +1689,9 @@ class Toolbox:
             raise ValueError(f"unknown standoff mode {S['mode']!r}")
         if bc.width_m is None:
             raise RuntimeError(f"label width of {bc.id} unknown: no adaptive stand-off")
-        if self.wrist_hfov is None:
-            raise RuntimeError("wrist camera intrinsics unknown (robot info wrist_K / wrist_size): no adaptive stand-off")
-        d = adaptive_standoff(bc.width_m, self.wrist_hfov, S["fill_frac"], S["min_m"], S["max_m"])
+        if self.scanner_hfov is None:
+            raise RuntimeError("scanner imager intrinsics unknown (robot info wrist_K / wrist_size): no adaptive stand-off")
+        d = adaptive_standoff(bc.width_m, self.scanner_hfov, S["fill_frac"], S["min_m"], S["max_m"])
         if bc.width_source != "wrist":
             # a head width may push the scanner farther than the validated stand-off (task2.yaml offset_m), never
             # closer: head label boxes come out both too large (DINO box, +20 %) and too small (a partial box on the
@@ -1784,8 +1990,10 @@ class Toolbox:
             saved = {k: os.environ.get(k) for k in keys}
             os.environ.update({k: "1" for k in keys})
             try:
+                # the workers build the same model as this process: the variant's URDF and resolved robot config
                 self._plan_pool = ProcessPoolExecutor(max_workers=nw, mp_context=mp.get_context("spawn"),
-                                                      initializer=SE.init_worker, initargs=(shoulder, reach))
+                                                      initializer=SE.init_worker,
+                                                      initargs=(self.kin.urdf, self.cfg["robot"], self.ik.side, shoulder, reach))
                 list(self._plan_pool.map(int, range(nw)))   # start every worker now, while the env is set
             finally:
                 for k, v in saved.items():
@@ -1923,18 +2131,18 @@ class Toolbox:
         return ok(data)
 
     def _label_view(self, t, off, label_width: float | None = None) -> dict:
-        """Where the wrist target's label centre lies relative to the wrist camera's view cone from the current arm pose
+        """Where the wrist target's label centre lies relative to the SCANNER's view cone from the current arm pose
         (wrist point frame, x = scanner axis): lateral distance from the axis vs the view half-width at that range.
         With label_width, "label_in_view" also requires the whole label (centre offset + half width) inside the view."""
-        if self.wrist_hfov is None:
-            raise RuntimeError("wrist camera intrinsics unknown (robot info wrist_K / wrist_size): no view check")
+        if self.scanner_hfov is None:
+            raise RuntimeError("scanner imager intrinsics unknown (robot info wrist_K / wrist_size): no view check")
         T = self.kin.pose(self._q(), self.cfg["robot"]["wrist_point_frame"])
         p_goal, d_goal = self._target_in_root(t, offset=off)
         v = (p_goal + d_goal * off) - T[:3, 3]                  # wrist point -> label centre
         fwd = T[:3, 0] / np.linalg.norm(T[:3, 0])
         along = float(v @ fwd)
         lat = float(np.linalg.norm(v - along * fwd))
-        half = along * math.tan(self.wrist_hfov / 2)
+        half = along * math.tan(self.scanner_hfov / 2)
         out = {"label_lateral_m": round(lat, 3), "label_along_m": round(along, 3), "view_half_width_m": round(half, 3),
                "in_view": bool(along > 0 and lat < half)}
         if label_width is not None:
@@ -1952,21 +2160,31 @@ class Toolbox:
         self._q_home = q[self.ik.qi].copy()
         self.arm_at_home = True
 
-    def _detect_wrist(self):
+    def _detect_wrist(self, expect_odom=None):
+        """Label detection in a hand-camera frame (cv2 at the hand camera's upscale, perception.yaml barcode
+        wrist_upscale per robot variant; GroundingDINO when cv2 finds nothing). The detection kept is the one nearest
+        to where the label is expected: expect_odom (the current label estimate) projected into this frame, else the
+        image centre. The scanner axis projects near the image centre on both variants, but the D405's 87 deg view
+        holds 2-3 neighbouring labels at the pre-pose, and the label estimate, not the image centre, says which one is
+        the planned label (the consistency gate in refine_with_wrist only rejects, it cannot recover)."""
         w = self._capture_wrist()
         recs = detect_barcodes(w["rgb"], None, cfg=dict(self.cfg["perception"]["barcode"], upscale=self.cfg["perception"]["barcode"]["wrist_upscale"]))
+        H, W = w["rgb"].shape[:2]
         if not recs:
-            H, W = w["rgb"].shape[:2]
             recs = detect_label_dino(w["rgb"], [0, 0, W, H], self.det)
         if not recs:
             return w, None
-        H, W = w["rgb"].shape[:2]
-        recs.sort(key=lambda r: np.hypot(r["center"][0] - W / 2, r["center"][1] - H / 2))
+        ref = np.array([W / 2, H / 2])
+        if expect_odom is not None:
+            uv, z = self._project_odom(w, np.asarray(expect_odom, float)[None])
+            if z[0] > 0:
+                ref = uv[0]
+        recs.sort(key=lambda r: np.hypot(r["center"][0] - ref[0], r["center"][1] - ref[1]))
         return w, recs[0]
 
     def refine_with_wrist(self, barcode_id: str | None = None):
-        """re-fit the face plane from the head, transform it to the wrist camera through FK, detect the
-        barcode in the wrist image, intersect its centre ray with the plane, update the wrist target."""
+        """re-fit the face plane from the head, transform it to the hand camera through FK, detect the
+        barcode in the hand-camera image, intersect its centre ray with the plane, update the wrist target."""
         if (nc := self._not_current(barcode_id)) is not None:
             return fail(nc)
         bc = self._current(barcode_id)
@@ -1985,25 +2203,27 @@ class Toolbox:
                 T = h["T_odom_root"]
                 refit = {"center": apply(T, r["center"]), "normal": rotate(T, r["normal"])}
         plane = refit or {"center": face["center"], "normal": face["normal"]}
-        w, rec = self._detect_wrist()
+        w, rec = self._detect_wrist(bc.center)
         tried = []
+        S = self._c2()["refine"]
         if rec is None:
-            S = self._c2()["refine"]
             for du, dv in S["search_offsets_m"]:
                 t0 = self.ws.wrist_target
                 shifted = dict(t0, pos=np.asarray(t0["pos"]) + du * np.asarray(face["right"]) + dv * np.asarray(face["up"]))
                 saved, self.ws.wrist_target = self.ws.wrist_target, shifted
                 self.move_arm("pre")
                 self.ws.wrist_target = saved
-                w, rec = self._detect_wrist()
+                w, rec = self._detect_wrist(bc.center)
                 tried.append([du, dv])
                 if rec is not None:
                     break
         if rec is None:
-            return partial("barcode not found in the wrist image (searched +-5 cm); keeping the head estimate", {"searched": tried})
+            reach = max(abs(v) for o in S["search_offsets_m"] for v in o)
+            return partial(f"barcode not found in the hand-camera image (searched +-{reach * 100:.0f} cm); keeping the head "
+                           "estimate", {"searched": tried})
         c = self._pixel_on_face(w, rec["center"], plane)
         if c is None:
-            return fail("wrist ray parallel to the face plane")
+            return fail("hand-camera ray parallel to the face plane")
         # consistency gate: the wrist detection must be the planned label, i.e. lie within one label width of the
         # current estimate (head-vs-wrist differences so far: a few cm). 2026-11-06 stack scene: with the arm 36 cm
         # off, the wrist camera detected something else and moved the label from 1.10 m to 1.70 m.
@@ -2019,9 +2239,10 @@ class Toolbox:
             if c2 is not None and np.linalg.norm(c2 - c) > 1e-6:
                 bc.bar_dir = (c2 - c) / np.linalg.norm(c2 - c)
         self._wrist_detection = {"rec": rec, "frame": w, "barcode_id": bc.id}
-        width = self._wrist_symbol_width(w, rec, plane)
+        width = self._wrist_symbol_width(w, rec, plane, c, w_lab if w_lab > 0 else None)
         if width.get("content"):
-            # this label is readable from the current arm pose (the wrist camera is the scanner's camera)
+            # the hand camera decoded this label: the code itself is decodable (evidence against "unreadable" in scan).
+            # Only where the hand camera IS the scanner imager (g1_v1) does it also mean the scanner reads from this pose
             bc.wrist_read = width["content"]
         if width["width_m"] is not None:
             # a wrist width replaces the estimate only if it is a real extent and has at least the support (decoded
@@ -2037,19 +2258,39 @@ class Toolbox:
         return ok({"barcode_id": bc.id, "center_odom": c, "plane_refit": refit is not None, "kind": rec["kind"], "searched": tried,
                    "symbol_width": width, "width_m": bc.width_m, "width_source": bc.width_source, "offset": tr["data"]["offset"]})
 
-    def _wrist_symbol_width(self, w, rec, plane) -> dict:
-        """Width of the symbol the wrist detection points at, on the face plane: zbar outlines (one per decoding
-        rotation, cut ones excluded) of the decoded symbol nearest the detection centre, each pixel ray intersected
-        with the plane, the longer side of the minimum-area rectangle in the plane; median over the outlines. Offline
-        check on the simulator's label textures (code128 0.05-0.10 m, 0.20-0.40 m, 0-80 deg, backed / unbacked):
-        median error +0.5 %, 96 of 97 within 3 % (offline measurement). width_m None = nothing decoded
-        in full view (the head estimate is kept)."""
+    def _wrist_symbol_width(self, w, rec, plane, anchor=None, max_dist: float | None = None) -> dict:
+        """Width of the symbol the hand-camera detection points at, on the face plane: zbar outlines (one per decoding
+        rotation, cut ones excluded; the image upsampled by the hand camera's wrist_upscale, as for detection) of the
+        decoded symbol nearest the detection centre, each pixel ray intersected with the plane, the longer side of the
+        minimum-area rectangle in the plane; median over the outlines. Offline check on the simulator's label textures
+        with the scanner imager (code128 0.05-0.10 m, 0.20-0.40 m, 0-80 deg, backed / unbacked): median error +0.5 %,
+        96 of 97 within 3 % (offline measurement). width_m None = nothing decoded in full view (the head estimate is
+        kept: the stand-off stays at least task2.yaml offset_m, see _standoff).
+        Only a symbol of the kept detection counts (a wide hand camera holds neighbouring labels, which zbar may decode
+        while the planned one is too small): one of its outlines contains the detection centre, or its centre on the
+        plane lies within max_dist (the label width, as refine_with_wrist's consistency gate) of anchor (the detection's
+        point on the plane). Otherwise width_m None and no content: neither a neighbour's width nor its read is taken."""
         import cv2
-        polys = decode_symbol_polygons(w["rgb"], self.cfg["perception"]["barcode"]["wrist_decode_rotation_step_deg"])
+        B = self.cfg["perception"]["barcode"]
+        polys = decode_symbol_polygons(w["rgb"], B["wrist_decode_rotation_step_deg"], upscale=B["wrist_upscale"])
         if not polys:
-            return {"width_m": None, "reason": "no symbol decoded in full view of the wrist camera"}
+            return {"width_m": None, "reason": "no symbol decoded in full view of the hand camera"}
         ctr = np.asarray(rec["center"], float)
-        content = min(polys, key=lambda k: min(np.linalg.norm(p.mean(axis=0) - ctr) for p in polys[k]))
+
+        def belongs(poly):
+            hull = cv2.convexHull(np.asarray(poly, np.float32))
+            if cv2.pointPolygonTest(hull, (float(ctr[0]), float(ctr[1])), False) >= 0:
+                return True
+            if anchor is None or max_dist is None:
+                return False
+            p = self._pixel_on_face(w, np.asarray(poly, float).mean(axis=0), plane)
+            return p is not None and float(np.linalg.norm(np.asarray(p) - np.asarray(anchor, float))) <= max_dist
+
+        own = [k for k in polys if any(belongs(p) for p in polys[k])]
+        if not own:
+            return {"width_m": None, "reason": "no decoded symbol belongs to the detected label (only neighbours decoded)",
+                    "decoded_other": sorted(polys)}
+        content = min(own, key=lambda k: min(np.linalg.norm(p.mean(axis=0) - ctr) for p in polys[k]))
         n = np.asarray(plane["normal"], float)
         u = np.cross([0.0, 0.0, 1.0], n)
         u /= np.linalg.norm(u)
@@ -2068,7 +2309,7 @@ class Toolbox:
                 "spread_m": float(max(widths) - min(widths))}
 
     def stereo_check_wrist(self, barcode_id: str | None = None):
-        """shift the wrist ~4 cm along the face, triangulate the barcode centre from the two wrist
+        """shift the wrist ~4 cm along the face, triangulate the barcode centre from the two hand-camera
         views (FK poses), compare with refine_with_wrist."""
         bc = self._current(barcode_id)
         if bc is None or bc.source != "wrist" or self._wrist_detection is None or self._wrist_detection["barcode_id"] != bc.id:
@@ -2081,9 +2322,9 @@ class Toolbox:
         saved, self.ws.wrist_target = self.ws.wrist_target, shifted
         r = self.move_arm("pre")
         self.ws.wrist_target = saved
-        w2, rec2 = self._detect_wrist()
+        w2, rec2 = self._detect_wrist(bc.center)
         if rec2 is None:
-            return partial("barcode not visible in the second wrist view")
+            return partial("barcode not visible in the second hand-camera view")
         rays = []
         for fr, rc in ((v1["frame"], v1["rec"]), (w2, rec2)):
             T = fr["T_odom_root"] @ fr["T_root_cam"]
@@ -2176,10 +2417,13 @@ class Toolbox:
             r["data"]["retries"] = tries
             r["reason"] = f"{r['reason']} (after {len(tries)} retry: refine_with_wrist + move_arm final)"
         bc = self._current()
-        if r["status"] != "ok" and bc is not None and bc.wrist_read and self.ws.wrist_target is not None:
-            # the wrist camera decoded this label during refine_with_wrist from the pre-pose distance: the code is
-            # readable from there, so scan from that pose (2026-11-07 stack4c_L0_0001: read at 0.40 m during refine,
-            # not at 0.20 m where the 8 cm label was 2.8 cm off the axis, half outside the 6 cm half-view)
+        if r["status"] != "ok" and bc is not None and bc.wrist_read and self.ws.wrist_target is not None \
+                and self.cfg["robot"]["hand_camera"]["is_scanner"]:
+            # the hand camera (here the scanner's own imager) decoded this label during refine_with_wrist from the
+            # pre-pose distance: the code is readable from there, so scan from that pose (2026-11-07 stack4c_L0_0001:
+            # read at 0.40 m during refine, not at 0.20 m where the 8 cm label was 2.8 cm off the axis, half outside the
+            # 6 cm half-view). A separate hand camera (g1_v2 D405: 5 cm behind / 4.5 cm above the window, 87 deg) that
+            # decodes from the pre-pose says nothing about what the scanner reads there
             mv = self.move_arm("pre")
             tries.append({"move_arm_pre_where_read": {"status": mv["status"], "reason": mv["reason"], "read_before": bc.wrist_read}})
             if mv["status"] != "fail":
@@ -2203,7 +2447,7 @@ class Toolbox:
                 bc.status = "unreadable"
                 bc.fail_reason = (f"no readable code: the whole label was in the scanner view ({view['label_lateral_m']:.3f} m off "
                                   f"the axis at {view['label_along_m']:.2f} m) and nothing decoded after {len(tries)} retry, "
-                                  "nor in any earlier wrist view")
+                                  "nor in any earlier hand-camera view")
                 r["data"]["barcode_status"] = "unreadable"
                 r["reason"] = f"{r['reason']}; label recorded as unreadable (no readable code at close range): move_arm('home'), then call next_barcode"
         return r

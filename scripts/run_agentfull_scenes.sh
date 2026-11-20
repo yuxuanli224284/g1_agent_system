@@ -2,7 +2,7 @@
 # agent_full on several scenarios at once, one shared vLLM, on GPU=k (copy of run_agentfull_scenes_gpu7.sh with the card as a parameter)
 # other tenants must not be affected: run_batch_gpu7.sh pre-flight / watchdog / post-check). Switchyard progress =
 # finished episodes / scenarios.
-# usage: SCENS="a b" OUT=runs/x INST_BASE=4 setsid nohup bash scripts/run_agentfull_scenes_gpu7.sh > runs/x.out 2>&1 &
+# usage: SCENS="a b" OUT=runs/x INST_BASE=4 [EXTRA_CLIENTS='scripts/check_m1_m2.py --out ...'] setsid nohup bash scripts/run_agentfull_scenes_gpu7.sh > runs/x.out 2>&1 &
 cd "$(dirname "$0")/.."
 SCENS=${SCENS:?scenarios}; OUT=${OUT:?out dir}; TASK=${TASK:-3}
 GPU=${GPU:?set GPU (physical index)}
@@ -24,6 +24,7 @@ echo "VLLM_READY $(date +%T) gpu${GPU}_used=$(nvidia-smi -i $GPU --query-gpu=mem
 ( while sleep 30; do $SP --id $RUN --status "Running episodes" --done $(ls $OUT/agent_full/*/result.json 2>/dev/null | wc -l) --total $N; done ) &
 WATCH=$!
 CL=""; for s in $SCENS; do CL="${CL:+$CL;}scripts/run_task.py --scenario $s --mode agent_full --task $TASK --run_dir $OUT/agent_full"; done
+[ -n "$EXTRA_CLIENTS" ] && CL="$CL;$EXTRA_CLIENTS"   # optional extra clients (';'-separated), each on its own sim instance
 echo "CLIENTS $CL"
 TAG=agentfull_$(basename $OUT) CLIENTS="$CL" GPU=$GPU bash scripts/run_batch.sh
 kill $WATCH 2>/dev/null

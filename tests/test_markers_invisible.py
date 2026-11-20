@@ -1,4 +1,5 @@
-"""M4: markers never reach the robot's cameras. Integration test against a running sim server: head / wrist images with
+"""M4: markers never reach the robot's cameras. Integration test against a running sim server: head / wrist (scanner) /
+hand-camera images with
 markers present vs removed and right after a third-person snapshot must be pixel-identical, while the third-person
 render must show them.
 
@@ -34,8 +35,11 @@ def test_markers_invisible_to_robot_cameras():
     # 55 grey levels on a few pixels, while a marker changes pixels by > 100 levels. A pixel counts as changed when it
     # differs by more than STRONG levels.
     STRONG = 60
-    for cam in ("head", "wrist"):
+    # every robot camera the server reports (head, scanner imager and, on g1_v2, the left D405)
+    cams = r["cameras"]
+    assert {"head", "wrist"} <= set(cams)
+    for cam in cams:
         assert r[f"{cam}_shown_vs_removed"][f"n_gt{STRONG}"] > 0, f"control failed: probe not visible to the {cam} camera when shown: {r}"
         for pair in r[f"{cam}_hidden_vs_removed"]:
             assert pair[f"n_gt{STRONG}"] == 0, f"markers leak into the {cam} camera: {r}"
-    assert r["head_after_snapshot"]["max"] == 0 and r["wrist_after_snapshot"]["max"] == 0, r
+        assert r[f"{cam}_after_snapshot"]["max"] == 0, r

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 from ..harness.registry import TASK_TOOLS, openai_tools
+from ..tools.scan_order import describe_targets
 from .common import clean, image_message, load_prompt, log_llm, tool_result_text
 
 KEEP_IMAGES = 2          # images kept in the context (older ones -> text placeholder); vLLM limit-mm-per-prompt is 8
@@ -29,11 +30,18 @@ def _prune_images(msgs):
                     m["content"] = [p for p in m["content"] if p.get("type") != "image_url"] + [{"type": "text", "text": "[older image removed]"}]
 
 
-def _start_text(task, selector, multi_face=False):
+def _start_text(task, selector, multi_face=False, targets=None):
+    """targets: the parsed target spec (scan_order.parse_targets) or None (every label)."""
     if task == 3:
         sides = (" This task covers EVERY side of the box stack (front, right, back, left): after a side is finished, "
                  "next_barcode returns face_done and you call go_to_next_face, then plan_scans." if multi_face else
                  " This task covers the side of the boxes facing you only.")
+        if targets is not None:
+            return (f"Start task 3: scan only {describe_targets(targets)}, "
+                    f"{'row by row from the top, left to right within a row' if targets['order'] == 'rows' else 'column by column from the left, top to bottom within a column'}"
+                    " (the tools fix this order). Work from near your start pose: do not walk back to observe the whole "
+                    "wall. plan_scans looks from every standing head view from here (upright and leaned back) to see the "
+                    "top row and the edges of the wall, and counts the rows and columns from there." + sides)
         return "Start task 3 (phase 1: find all boxes and approach them)." + sides
     return f"Start task {task}. Target: the {selector} box."
 
@@ -69,24 +77,73 @@ def barcode_boundary_text(h, nb_result: dict, later: list) -> str:
 LEAN_VIEW_NOTE = ("\n  detect_boxes and the perception tools lean the torso back by themselves to look higher (the robot "
                   "stands upright again\n  before it walks or moves the arm); you do not control the head view.")
 
+# task-3 phase-1 texts (prompt placeholders): every label (the v8 text) | a target spec (columns / rows of the wall given
+# in robot terms; the robot works from near its start pose, user decision 2026-11-19)
+PHASE1_ALL_GOAL = ("Phase 1 (find): find the cardboard boxes (on a table, on the floor or stacked) and walk to the observation "
+                   "pose in front of ALL of them, where\nevery front face is visible in the head camera.")
+PHASE1_ALL_RULES = """- Phase 1 sequence: detect_boxes -> select_target_box("all") -> fit_front_face -> compute_obs_pose -> approach.
+  If no box is visible, call look_head and choose an explore move (left / right / back / forward <= 0.5 m,
+  turn_left / turn_right <= 15 deg); {head_view}.{head_view_note}
+  If fit_front_face fails because the boxes are too far (no valid depth), move forward and try again.
+- Phase 1 ends when approach returns ok, or partial ("walk finished; arrival check not within tolerance"): in both
+  cases call plan_scans next; do NOT explore to fix a small arrival error (the scan phase plans its own stances).
+  plan_scans localises every label and fixes the scan order (columns left to right, top to bottom). Only if it finds
+  no label, explore and redo phase 1. Explore moves that would end closer than the minimum distance to a box face are
+  refused by the tool."""
+PHASE1_TARGET_GOAL = ("Phase 1 (find): from near the start pose, find the box wall in front of you and localise its barcode "
+                      "labels.\nThe task names the labels to scan by their place on the wall ({targets}).")
+PHASE1_TARGET_RULES = """- Phase 1 sequence: detect_boxes -> select_target_box("all") -> plan_scans. Work from near the start pose: do NOT
+  call compute_obs_pose / approach and do not walk back to observe the whole wall. plan_scans looks from every
+  standing head view from here (upright and leaned back) to see the top row and the edges of the wall, counts the
+  columns and rows of the labels from the edges the task names, plans ONLY the labels in the requested cells (the others
+  are listed as not_targeted and are never scanned) and fixes the scan order ({order}).
+  It reports a requested cell without a label, an edge of the wall it could not see, or a count it could not verify
+  from the box faces, as a WARNING in its reason (finish(success=true) is then refused).
+  If no box is visible, call look_head and choose an explore move (left / right / back / forward <= 0.5 m,
+  turn_left / turn_right <= 15 deg); {head_view}.{head_view_note}
+  Only if plan_scans finds no label at all, explore a little sideways and call detect_boxes and plan_scans
+  again. Explore moves that would end closer than the minimum distance to a box face are refused by the tool."""
+
+
+def task3_prompt_kw(tb, lean: bool) -> dict:
+    """Variant and target texts of the task-3 prompt (robot.yaml variants.<v>.texts, Toolbox.scan_targets)."""
+    tx = tb.cfg["robot"]["texts"]
+    t = getattr(tb, "scan_targets", None)
+    note = LEAN_VIEW_NOTE if lean else ""
+    if t is None:
+        return {"robot_text": tx["robot"], "phase1_goal": PHASE1_ALL_GOAL, "scan_what": "every barcode label on the boxes",
+                "phase1_rules": PHASE1_ALL_RULES.format(head_view=tx["head_view"], head_view_note=note), "success_note": "",
+                "final_refine_note": tx["final_refine_note"]}
+    order = ("rows top to bottom, left to right inside a row" if t["order"] == "rows"
+             else "columns left to right, top to bottom inside a column")
+    return {"robot_text": tx["robot"], "phase1_goal": PHASE1_TARGET_GOAL.format(targets=describe_targets(t)),
+            "scan_what": describe_targets(t),
+            "phase1_rules": PHASE1_TARGET_RULES.format(order=order, head_view=tx["head_view"], head_view_note=note),
+            "success_note": " and every requested cell found and verified (labels outside the requested cells do not count)",
+            "final_refine_note": tx["final_refine_note"]}
+
 
 def run_agent_full(h, tcfg, selector, llm, log):
     b = tcfg["budget"]
     lean = h.task == 3 and h.tb.cfg["robot"]["lean_views"]      # only the task-3 prompt has the lean-view note
     kw = {"selector": selector, "max_tool_calls": b["max_tool_calls"], "max_explore_steps": b["max_explore_steps"],
-          "head_view_note": LEAN_VIEW_NOTE if lean else ""}
+          "robot_text": h.tb.cfg["robot"]["texts"]["robot"], "head_view": h.tb.cfg["robot"]["texts"]["head_view"]}
     if h.task == 3:
         kw["per_barcode_calls"] = b["per_barcode"]["max_tool_calls"]
+        kw.update(task3_prompt_kw(h.tb, lean))
     system, version = load_prompt(f"task{h.task}_agent_full", **kw)
+    version += f" ({h.tb.cfg['robot']['robot_variant']})"
     if h.task == 3 and not lean:
         version += " (head camera without lean views: no lean-view note)"
-    tools = openai_tools(TASK_TOOLS[h.task])
+    if getattr(h.tb, "scan_targets", None) is not None:
+        version += " (target spec)"
+    tools = openai_tools(TASK_TOOLS[h.task], h.tb.cfg["robot"]["tool_texts"])
     if "move_arm" in TASK_TOOLS[h.task]:
         # move_arm("home") needs the episode's initial arm pose (the rule orchestrators record it the same way); without
         # it every home move fails with "home pose unknown", and the task-3 prompt asks for home before each walk
         h.tb.remember_home()
     _, img = h.tb.look_head()
-    task_text = _start_text(h.task, selector, getattr(h.tb, "multi_face", False))
+    task_text = _start_text(h.task, selector, getattr(h.tb, "multi_face", False), getattr(h.tb, "scan_targets", None))
     msgs = [{"role": "system", "content": system}, image_message(llm, log, img, task_text + " Current head camera image attached.", "start")]
     nudges = 0
     compacted = False

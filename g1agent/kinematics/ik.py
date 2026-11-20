@@ -3,14 +3,17 @@
 damped least squares on the pinocchio model (the same task the simulator's aim controller uses, solved offline).
 
 xr_teleoperate's IK was the obvious candidate; that solver targets the Dex3/Inspire hand frames of its own
-URDF, while this robot carries a Dex1 gripper holding a scanner, so the task frame (scanner tip) only exists in our
-exported URDF. A small DLS solver on that model is used instead.
+URDF, while this robot carries a scanner (g1_v1: held by a Dex1 gripper; g1_v2: bolted to a left-wrist bracket), so the
+task frame (scanner tip) only exists in our agent URDF. A small DLS solver on that model is used instead.
+
+Frames come from the resolved robot config (config.apply_robot_variant): wrist_point_frame (the scanner tip) and
+scanner_cam_frame (the scanner's own imager, whose image x axis is the roll reference). The roll reference is the
+decoder's image axis, never a separate hand camera (g1_v2's D405), even where both happen to give the same axis.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from ..common import config
 from .fk import Kinematics
 
 ARM = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw"]
@@ -29,10 +32,13 @@ def rotation_vector(a, b):
 
 
 class ArmIK:
-    def __init__(self, kin: Kinematics | None = None, side: str | None = None):
-        rc = config.load("robot")
-        self.cfg = rc["ik"]
-        self.kin = kin or Kinematics()
+    def __init__(self, kin: Kinematics, robot_cfg: dict, side: str | None = None):
+        """robot_cfg: cfg["robot"] after config.apply_robot_variant (frames of the variant)."""
+        rc = robot_cfg
+        if "scanner_cam_frame" not in rc:
+            raise ValueError("ArmIK needs the robot config resolved for the robot variant (config.apply_robot_variant)")
+        self.cfg = dict(rc["ik"])
+        self.kin = kin
         self.side = side or rc["arm_side"]
         self.frame = rc["wrist_point_frame"]
         self.joints = [f"{self.side}_{j}_joint" for j in ARM]
@@ -41,11 +47,11 @@ class ArmIK:
         m = self.cfg["joint_limit_margin"]
         self.lo, self.hi = self.kin.lower[self.qi] + m, self.kin.upper[self.qi] - m
         self.rng = np.random.default_rng(self.cfg["seed"])
-        # the scanner image's horizontal axis (wrist camera optical x) in the scanner-tip frame: a fixed transform of the
-        # model ([0, -1, 0] for this URDF); the roll constraint aligns it with the barcode's long axis
+        # the scanner image's horizontal axis (scanner imager optical x) in the scanner-tip frame: a fixed transform of the
+        # model ([0, -1, 0] for both agent URDFs); the roll constraint aligns it with the barcode's long axis
         import pinocchio as pin
         q_n = pin.neutral(self.kin.model)
-        R_tc = np.linalg.inv(self.kin.pose(q_n, self.frame))[:3, :3] @ self.kin.pose(q_n, rc["wrist_cam_frame"])[:3, :3]
+        R_tc = np.linalg.inv(self.kin.pose(q_n, self.frame))[:3, :3] @ self.kin.pose(q_n, rc["scanner_cam_frame"])[:3, :3]
         self.img_x_in_tip = R_tc[:, 0] / np.linalg.norm(R_tc[:, 0])
 
     def roll_target(self, R, d_t, roll_axis):

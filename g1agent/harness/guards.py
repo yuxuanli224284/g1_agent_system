@@ -1,13 +1,15 @@
 """Harness: validation, limits, budgets, logging around every tool call.
 
 Task 3 bookkeeping lives here so that the rule and the LLM orchestrators behave the same:
-- plan_scans ok -> the budget becomes base + per_barcode x n_planned (configs/task3.yaml budget.per_barcode), and the
-  end of the task-1 phase is signalled once (log.stage("task1_end"));
+- plan_scans ok -> the budget becomes base + per_barcode x n_planned (configs/task3.yaml budget.per_barcode; labels
+  outside a target spec's cells, status not_targeted, are not counted), and the end of the task-1 phase is signalled
+  once (log.stage("task1_end"));
 - next_barcode ok -> the per-tool failure streaks are reset (retries are per barcode), barcode_end of an unfinished
   barcode (failed), barcode_start of the next one, scan_done when the plan is exhausted;
 - scan resolving the current barcode -> barcode_end;
 - finish -> the scan ledger and plan statuses are attached and success is computed from the ledger (and the
-  stack tour); finish(success=true) is refused while the plan or the tour still has work.
+  stack tour, every requested target cell found and the target count verified, ws.grid_warnings); finish(success=true)
+  is refused while the plan or the tour still has work.
 """
 from __future__ import annotations
 
@@ -126,6 +128,12 @@ class Harness:
         nf = self.tb._next_face()
         if nf is not None:
             return f"the {self.tb.TOUR[nf]} side of the stack has not been visited"
+        missing = ws.missing_cells()
+        if missing:
+            return f"requested target cell(s) without a localised label: {missing}"
+        warn = ws.grid_warnings()
+        if warn:
+            return f"the target cells could not be verified: {'; '.join(warn)}"
         return None
 
     def _execute(self, name, a):
@@ -193,7 +201,7 @@ class Harness:
         ws = self.tb.ws
         d = res["data"]
         if name == "plan_scans":
-            n = len(ws.scan_plan)
+            n = sum(ws.targeted(b) for b in ws.scan_plan)
             per = self.base_budget.get("per_barcode")
             if per is not None:
                 for k, v in per.items():
@@ -238,14 +246,20 @@ class Harness:
                 self._end_barcode(cur, "failed")
             self._scan_done()
             statuses = {b: ws.barcodes[b].status for b in ws.scan_plan}
-            # success comes from the ledger, not from the caller: every planned barcode read once, as itself, and on a
-            # multi-side task every side of the tour visited (a plan only holds the sides seen so far)
+            task = [s for s in statuses.values() if s != "not_targeted"]
+            # success comes from the ledger, not from the caller: every planned (targeted) barcode read once, as itself,
+            # on a multi-side task every side of the tour visited (a plan only holds the sides seen so far), and with a
+            # target spec every requested cell found (a cell without a label is never silently dropped)
             fin.update(claimed_success=a["success"],
                        # a label verified unreadable at close range (no code decodable in full view) is a result, not a
                        # failure of the robot; failed / unreachable / pending are not
-                       success=any(s == "scanned" for s in statuses.values())
-                       and all(s in ("scanned", "unreadable") for s in statuses.values()) and self.tb._next_face() is None,
+                       success=any(s == "scanned" for s in task)
+                       and all(s in ("scanned", "unreadable") for s in task) and self.tb._next_face() is None
+                       and not ws.missing_cells() and not ws.grid_warnings(),
                        scanned=[dict(e) for e in ws.scanned], plan_status=statuses)
+            if ws.target_grid is not None:
+                fin["missing_cells"] = ws.missing_cells()
+                fin["grid_warnings"] = ws.grid_warnings()
         self.finished = fin
         return {"status": "ok", "data": fin, "reason": "episode finished"}
 

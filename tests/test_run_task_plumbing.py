@@ -24,6 +24,12 @@ class FakeWS:
 class FakeTB:
     def __init__(self, robot, box_detector=None):
         self.ws = FakeWS()
+        self.info = {"robot_variant": "g1_v2", "head_camera_model": "d435i"}
+        self.scan_targets = None
+        FakeTB.last = self
+
+    def set_scan_targets(self, spec):
+        self.scan_targets = spec
 
     def set_task(self, task):
         self.task = task
@@ -52,7 +58,11 @@ class FakeEval:
     def __init__(self):
         self.rpc = FakeRPC(FakeEval.calls)
 
-    def reset(self, sc): return {"status": "ok"}
+    resets = []
+
+    def reset(self, sc):
+        FakeEval.resets.append(sc)
+        return {"status": "ok"}
     def set_gt_markers(self, on): return {"status": "ok"}
     def record_start(self, path, fps=None): return {"status": "ok"}
     def record_stop(self): return {"status": "ok"}
@@ -85,8 +95,8 @@ def test_run_task3_plumbing(tmp_path, monkeypatch):
     import g1agent.tools.toolbox as TB
     seen = {}
 
-    def fake_eval(task, gt, actual, ws, stages=None, scan_log=None):
-        seen.update(task=task, ws=ws, stages=stages, scan_log=scan_log)
+    def fake_eval(task, gt, actual, ws, stages=None, scan_log=None, **kw):
+        seen.update(task=task, ws=ws, stages=stages, scan_log=scan_log, kw=kw)
         return {"success": False, "failure": "fake"}
 
     FakeEval.calls = []
@@ -112,6 +122,17 @@ def test_run_task3_plumbing(tmp_path, monkeypatch):
         assert os.path.exists(os.path.join(ep, f)), f
     res_json = json.load(open(os.path.join(ep, "result.json")))
     assert res_json["stages"]["task1_end"]["t_sim"] == 1.0 and [e["name"] for e in res_json["stage_log"]] == ["task1_end"]
+    assert res_json["robot_variant"] == "g1_v2" and res_json["target_boxes"] is None
+    assert seen["kw"] == {"target_boxes": None, "order_rule": "columns"}
+    # a subset scenario: the dict (with its start pose) reaches the simulator unchanged, the robot-terms targets reach
+    # the toolbox, the GT box ids and the order rule reach only the evaluator
+    sub = dict(sc, id="sub_fake", robot_init={"dist_to_table": 0.6, "lateral_offset": 0.4, "yaw_deg": 0.0},
+               target_boxes=["C1R4", "C2R4"], scan_targets={"columns_from_left": [1, 2], "rows_from_top": [2], "order": "rows"})
+    res = run(sub, "rule", str(tmp_path / "sub"), video=False, task=3)
+    assert FakeEval.resets[-1] is sub and FakeEval.resets[-1]["robot_init"]["lateral_offset"] == 0.4
+    assert FakeTB.last.scan_targets == sub["scan_targets"]
+    assert seen["kw"] == {"target_boxes": ["C1R4", "C2R4"], "order_rule": "rows"}
+    assert res["target_boxes"] == ["C1R4", "C2R4"] and res["robot_init"] == sub["robot_init"]
 
 
 def test_eval_rpc_raises_on_error_reply():

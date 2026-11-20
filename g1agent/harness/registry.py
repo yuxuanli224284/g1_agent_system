@@ -1,5 +1,9 @@
 """Tool registry: pydantic argument models -> OpenAI function-calling schemas. The rule
-orchestrators and the LLM orchestrators call tools through the same Harness.call()."""
+orchestrators and the LLM orchestrators call tools through the same Harness.call().
+
+The descriptions below are those of the robot variant g1_v1 (the scanner imager is the wrist camera); a variant whose
+hand camera is a separate device (g1_v2: the D405 on the left-wrist bracket) replaces some of them with its own texts
+(robot.yaml variants.<v>.tool_texts, passed to openai_tools by the LLM orchestrator)."""
 from __future__ import annotations
 
 from typing import Literal, Optional
@@ -60,7 +64,7 @@ TOOLS = {
     "detect_boxes": (DetectBoxesArgs, "Detect boxes in the head image; ids are ordered left to right (robot's left first)."),
     "select_target_box": (SelectArgs, "Choose the target box by 'left'/'right'/'all' or by id ('all' = every detected box, task 3)."),
     "fit_front_face": (BoxArgs, "Fit the front face plane of a box from the depth image (centre, normal, corners in the odometry frame)."),
-    "compute_obs_pose": (BoxArgs, "Compute the observation distance d_obs (0.6-1.0 m, whole face in view with a margin) and the root target."),
+    "compute_obs_pose": (BoxArgs, "Compute the observation distance d_obs (the nearest distance of the task's search range with the whole face(s) in view with a margin) and the root target."),
     "approach": (ApproachArgs, "Walk to the root target in segments, re-perceiving after each segment; ends with an arrival check (distance along the face normal, yaw, faces in view). With stance_target: walk to the stance (standing up first if squatting; the arm must be at home), then squat to the stance's planned body height; no arrival check."),
     "check_face_in_view": (BoxArgs, "Check that the estimated face corners project inside the head image with a margin."),
     "explore": (ExploreArgs, "Constrained exploration move (<= 0.5 m or <= 15 deg)."),
@@ -74,7 +78,7 @@ TOOLS = {
     "refine_with_wrist": (BarcodeArgs, "Re-detect the barcode in the wrist image and intersect with the re-fitted face plane; updates the refined wrist target."),
     "stereo_check_wrist": (BarcodeArgs, "Shift the wrist 4 cm, triangulate the barcode centre from two wrist views and compare with the refined estimate."),
     "check_wrist_placement": (NoArgs, "Check the wrist point: at the wrist target's stand-off +- 0.02 m from the barcode plane, barcode centre within 2 cm of the axis, angle < 10 deg."),
-    "plan_scans": (NoArgs, "Task 3, after reaching the observation pose: localise every barcode label on every visible box face in the head image and order them (columns left to right, top to bottom inside a column). The order is fixed; next_barcode follows it. Called again while the plan runs (e.g. after a barcode, arm at home, before standing up), it only ADDS labels seen for the first time from the current view."),
+    "plan_scans": (NoArgs, "Task 3, after reaching the observation pose (or, when the task names the labels by their place on the wall, from near the start pose): localise every barcode label on every visible box face in the head image and order them (columns left to right, top to bottom inside a column; or rows top to bottom, left to right inside a row when the task says so). With a target spec only the labels in the requested cells are planned (the others are listed as not_targeted). The order is fixed; next_barcode follows it. Called again while the plan runs (e.g. after a barcode, arm at home, before standing up), it only ADDS labels seen for the first time from the current view."),
     "go_to_next_face": (NoArgs, "Task 3 with every side of the stack: walk around the stack to the next side of the tour (front -> right -> back -> left) and stand at its observation pose (arm home, stand up, back off, sidestep past the corner, turn, fit the side, step to its observation pose). Call it when next_barcode returns face_done=true, then plan_scans."),
     "next_barcode": (NoArgs, "Task 3: switch to the next barcode of the scan plan (an unfinished current barcode is marked failed); clears the per-barcode wrist / stance targets. Works on the current side of the stack: when that side is finished and the task covers every side, it returns face_done=true (call go_to_next_face, then plan_scans); done=true when everything has been handled."),
     "scan": (NoArgs, "Trigger the scanner and decode what it sees. The code nearest the image centre counts for the current barcode; a content read before is a duplicate and is not counted again. On no read the tool itself retries once (refine_with_wrist + move_arm final + scan); data.retries records it."),
@@ -92,11 +96,16 @@ TASK2_TOOLS = [n for n in TOOLS if n not in TASK3_ONLY]
 TASK_TOOLS = {1: TASK1_TOOLS, 2: TASK2_TOOLS, 3: list(TOOLS)}
 
 
-def openai_tools(names=None) -> list[dict]:
+def openai_tools(names=None, texts: dict | None = None) -> list[dict]:
+    """texts: {tool name: description} replacing the registry text (robot.yaml variants.<v>.tool_texts)."""
+    unknown = set(texts or {}) - set(TOOLS)
+    if unknown:
+        raise ValueError(f"tool texts for unknown tools {sorted(unknown)}")
     out = []
     for name, (model, desc) in TOOLS.items():
         if names is not None and name not in names:
             continue
+        desc = (texts or {}).get(name, desc)
         schema = model.model_json_schema()
         schema.pop("title", None)
         for p in schema.get("properties", {}).values():

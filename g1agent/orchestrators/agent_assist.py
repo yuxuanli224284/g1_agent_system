@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from ..harness.registry import ExploreArgs, openai_tools
+from ..tools.scan_order import describe_targets
 from .common import clean, image_message, load_prompt, log_llm
 from .rule import task_class
 
@@ -25,15 +26,29 @@ def _decide(h, llm, log, prompt_name, image_rgb, tag, **kw):
     return "give_up", {"reason": "no valid decision from the LLM"}
 
 
+def explore_prompt_kw(task, selector, tb) -> dict:
+    """Goal and head-view text of the explore prompt. Without a target spec the goals are those of the v2 prompt
+    ("... on a table"), and g1_v1's head-view text is its sentence, so a g1_v1 run sends the same prompt as before the
+    port; a target spec (Toolbox.set_scan_targets) names the wall cells in robot terms."""
+    targets = getattr(tb, "scan_targets", None)
+    if task != 3:
+        goal = f"the {selector} cardboard box on a table"
+    elif targets is None:
+        goal = "every cardboard box on a table"
+    else:
+        goal = f"the wall of cardboard boxes holding {describe_targets(targets)}"
+    return {"goal": goal, "head_view": tb.cfg["robot"]["texts"]["explore_head_view"]}
+
+
 def run_agent_assist(h, tcfg, selector, llm, log):
     history = []
     T = task_class(h.task)                         # raises on an unknown task id
-    goal = "every cardboard box" if h.task == 3 else f"the {selector} cardboard box"
+    ekw = explore_prompt_kw(h.task, selector, h.tb)
 
     def explore_policy(h, situation):
         _, img = h.tb.look_head()
-        name, args = _decide(h, llm, log, "task1_agent_assist_explore", img, "explore", goal=goal,
-                             situation=situation, history=history or "none")
+        name, args = _decide(h, llm, log, "task1_agent_assist_explore", img, "explore",
+                             situation=situation, history=history or "none", **ekw)
         if name != "explore":
             return None
         try:

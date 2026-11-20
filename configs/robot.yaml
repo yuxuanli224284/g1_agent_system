@@ -1,5 +1,7 @@
-# Harness-side robot parameters
-urdf: assets/g1_dex1_scanner.urdf      # exported from the simulated USD (scripts/export_urdf.py)
+# Harness-side robot parameters. The kinematic model, the scanner / hand-camera frames, the calibrations and the robot
+# texts of the prompts depend on the robot the server reports (robot info robot_variant; config.apply_robot_variant, block
+# `variants` below), the head-camera frames on the head camera it reports (head_camera_model; block `head_camera`). The
+# agent never takes either from system.yaml (that file only tells the simulator what to build).
 root_frame: pelvis
 head_camera:                           # per head-camera model; the agent follows the model the robot reports (robot info
                                        # head_camera_model, config.apply_head_camera; simulator: system.yaml head_camera)
@@ -13,10 +15,73 @@ head_camera:                           # per head-camera model; the agent follow
     ir_left_frame: null
     depth_source: render               # the camera's delivered depth (simulator render)
     lean_views: false                  # that version had no lean views
-arm_side: left
-wrist_point_frame: scanner_tip         # "以后装上扫码枪，就改成枪口位置" -> the scanner tip (exit window centre)
-wrist_cam_frame: wrist_cam_optical     # the camera at the scanner head (DS2208-like imager, 640x480, 32.8 deg hFOV)
-wrist_forward_axis: [1, 0, 0]          # scan direction = x axis of scanner_tip
+arm_side: left                         # the scanner arm (robot info wrist_side must agree; Toolbox checks it)
+variants:                              # per robot variant (g1_barcode_sim configs/robot_variants.yaml), config.apply_robot_variant
+  # Roles of the frames (the same names on every variant):
+  # - wrist_point_frame: the scanner tip (exit-window centre, +x = scan direction): IK target, stance planning, placement
+  #   check, the scanner view cone ("以后装上扫码枪，就改成枪口位置")
+  # - scanner_cam_frame: the scanner's own imager (DS2208-like, 640x480, 32.8 deg hFOV): its image x axis is the IK roll
+  #   reference (aligned with the barcode's long axis), its field of view sets the adaptive stand-off (robot info wrist_K)
+  # - hand_camera: the camera on the scanner hand whose IMAGES the tools use (look_wrist, refine_with_wrist detection /
+  #   rays / symbol width, stereo_check_wrist). source scanner = the scanner imager itself (robot get_wrist_obs);
+  #   source hand_camera = a separate camera (robot get_hand_camera_obs(name)). is_scanner: a decode in its image means
+  #   the scanner reads from that pose (only when it IS the scanner's imager)
+  g1_v1:                               # unitree G1 29 DoF + Dex1 grippers, the scanner held by the left gripper
+    urdf: assets/g1_dex1_scanner.urdf  # exported from the simulated USD (scripts/export_urdf.py --variant g1_v1)
+    wrist_point_frame: scanner_tip
+    scanner_cam_frame: wrist_cam_optical
+    hand_camera: {source: scanner, name: null, frame: wrist_cam_optical, is_scanner: true}
+    view_calibration: assets/gear_lean_calibration.json   # measured in Isaac on g1_v1 (g1_barcode_sim scripts/d435i_check.py)
+    body_calibration: assets/gear_body_calibration.json   # measured in Isaac on g1_v1 (source inside)
+    head_models: [d435i, upstream]     # head cameras this robot can carry (robot info head_camera_model)
+    perception: {}                     # overrides of perception.yaml for this robot
+    tool_texts: {}                     # tool descriptions that differ from harness/registry.py (none: v1 is the default)
+    texts:
+      robot: "holding a barcode scanner in its left hand"
+      look_wrist_result: "wrist (scanner) camera image attached"
+      head_view: "the head camera looks down steeply, so far boxes appear at the top edge or above it"   # 47.6 deg mount
+      explore_head_view: "it looks down steeply; far objects appear at the top edge or above it"   # agent_assist explore
+      final_refine_note: ""            # the hand camera is the scanner imager: refine_with_wrist at the pre-pose measures the width
+  g1_v2:                               # the lab's modified G1 (2026-11-19): scanner bolted to a left-wrist bracket with an
+                                       # Intel D405 on top of the bracket mast, no left gripper; right Dex1 (unused here)
+    urdf: assets/g1_v2_scanner.urdf    # offline export from the description URDF + the simulator's frame configs
+                                       # (scripts/export_urdf.py --variant g1_v2; source and sha256 in the file header)
+    wrist_point_frame: scanner_tip
+    scanner_cam_frame: wrist_cam_optical
+    # user 2026-11-19: "the original left-hand (wrist) camera now corresponds to the D405 on the left bracket". Decoding
+    # stays on the scanner (scan()); every use of the wrist camera AS A CAMERA goes to the D405
+    hand_camera: {source: hand_camera, name: left_d405, frame: hand_cam_left_d405_optical, is_scanner: false}
+    view_calibration: assets/g1_v2/gear_lean_calibration.json   # measured on g1_v2 (lead, 2026-11-19; source inside)
+    # squat levels: the g1_v1 measurement, a stated APPROXIMATION until re-measured on g1_v2: the leg / waist joint chain is
+    # identical (29 body joints of both URDFs agree to 2e-8 m), only the left-hand mass differs (bracket + scanner + D405,
+    # no gripper); the 4-box scanroom targets (rows 2-3 from the top, z 0.73-0.98 m) are expected to need no squat (unverified)
+    body_calibration: assets/gear_body_calibration.json
+    head_models: [d435i]               # the upstream camera would sit at the d435_joint origin inside the D435 body on
+                                       # this mount (g1_barcode_sim robot_variants.yaml g1_v2 camera.d435i comment)
+    perception:
+      barcode:
+        # D405 colour image (fx 446.8 px = 424 / tan 43.5 deg): one preview frame (outputs/g1_v2_preview/cam_left_d405.png,
+        # scanner tip 0.20 m from a 8.6 cm code128, the D405 ~0.25 m from it, ~1.1 px per module): cv2 detection worked at
+        # 1x and 2x, zbar decoded nothing at 1x and the target at 2x and 3x -> 2 (the smallest factor that decoded). Lead's
+        # default for the symbol width (decode on the D405, Q3). Valid range: the D405 at most ~0.25 m from the label (~1.1
+        # px per module or more), i.e. the final pose (scanner stand-off <= 0.20 m). Not at the pre-pose (D405 ~0.35-0.40
+        # m, ~0.8 px per module): the same frame shrunk to that range (review, CPU) decoded nothing at 1x / 2x / 3x, so on
+        # this robot the width is measured by refine_with_wrist at the final pose (texts.final_refine_note; rule.py
+        # refines there already); detection (cv2) still worked at every tested range
+        wrist_upscale: 2
+    tool_texts:
+      look_wrist: "Capture the hand camera image (attached to the reply): the Intel D405 on the left-wrist bracket, about 5 cm behind and 4.5 cm above the scanner window, looking along the scanner axis tilted about 10 deg down; wide 87 deg view; the scanner body fills the bottom of the image. It is not the scanner's own view."
+      refine_with_wrist: "Re-detect the barcode in the hand-camera (D405) image and intersect its ray with the re-fitted face plane; updates the refined wrist target, and the label width from a decode on the hand camera. The D405 sits about 5 cm behind the scanner window and resolves the bars only from close to the final pose: from the pre-pose it localises the label but usually measures no width, so call it again after move_arm('final') (then move_arm('final') once more for the measured stand-off)."
+      stereo_check_wrist: "Shift the scanner 4 cm, triangulate the barcode centre from two hand-camera views and compare with the refined estimate."
+      scan: "Trigger the scanner and decode what it sees (the scanner's own view, not the hand-camera image). The code nearest the centre of the scanner's view counts for the current barcode; a content read before is a duplicate and is not counted again. On no read the tool itself retries once (refine_with_wrist + move_arm final + scan); data.retries records it."
+    texts:
+      robot: "with a barcode scanner bolted to a bracket on its left wrist (no left gripper; an Intel D405 camera sits on the bracket above the scanner; the right hand's gripper is not used)"
+      look_wrist_result: "hand camera image attached (left-wrist D405 above the scanner; not the scanner's own view)"
+      # 26.15 deg mount: the optical axis 30 deg below horizontal standing (robot_variants.yaml g1_v2 camera comment)
+      head_view: "the head camera looks about 30 deg down, so far or tall boxes may appear at the top edge or above it"
+      explore_head_view: "it looks about 30 deg down; far or tall objects may appear at the top edge or above it"
+      # the D405 resolves the bars only from the final pose (perception.wrist_upscale comment above)
+      final_refine_note: "\n  On this robot the hand camera (D405) resolves the bars only from close to the final pose: after\n  move_arm(\"final\") call refine_with_wrist again (it measures the label width there), then move_arm(\"final\") once more,\n  then check_wrist_placement."
 ik:
   dls_lambda: 0.05
   step_gain: 0.5                       # fraction of the error corrected per iteration (offline, no dynamics)
@@ -46,11 +111,11 @@ limits:                                # guards
   max_approach_segment_m: 1.0
   workspace_radius_m: 8.0              # the robot may not leave this radius around its episode start (odom)
 view:                                  # head views by leaning the torso back (GR00T torso pitch command), toolbox _lean_levels
-  calibration: assets/gear_lean_calibration.json   # measured in Isaac (g1_barcode_sim scripts/d435i_check.py, source inside)
+  # calibration: robot variant view_calibration (config.apply_robot_variant)
   ramp_s: 1.0                          # = the calibration ramp
   settle_s: 2.0                        # = the calibration hold (the calibrated values are taken there)
 body:                                  # squat / stand (GR00T body command), stance planning with squats (tools/body.py)
-  calibration: assets/gear_body_calibration.json   # measured in Isaac (source inside): planned squat levels = these only
+  # calibration: robot variant body_calibration (config.apply_robot_variant): planned squat levels = these only
   ramp_s: 1.0                          # set_base_height ramp = the calibration ramp (every level stable with it)
   settle_s: 2.0                        # hold after the ramp = the calibration hold (the calibrated values are taken there)
   clearance_margin_m: 0.03             # min clearance robot-to-face and arm-to-leg in a planned pose: the largest arm

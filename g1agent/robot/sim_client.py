@@ -18,6 +18,7 @@ class SimRobot(RobotInterface):
     def get_robot_info(self): return self.rpc.call("get_robot_info")
     def get_head_obs(self, depth=False): return self.rpc.call("get_head_obs", depth=bool(depth))
     def get_wrist_obs(self, side="left"): return self.rpc.call("get_wrist_obs", side=side)
+    def get_hand_camera_obs(self, name, depth=False): return self.rpc.call("get_hand_camera_obs", name=str(name), depth=bool(depth))
     def get_joint_state(self): return self.rpc.call("get_joint_state")
     def get_odom(self): return self.rpc.call("get_odom")
     def walk(self, vx, vy, wz, duration): return self.rpc.call("walk", vx=float(vx), vy=float(vy), wz=float(wz), duration=float(duration))

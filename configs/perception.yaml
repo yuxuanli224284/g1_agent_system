@@ -46,7 +46,9 @@ barcode:
                                      # stacks): labels 0.25-0.72 (printed boxes 0.25-0.51: 0.35 lost 3 of 5), non-labels
                                      # (whole box faces) <= 0.20; enclosing boxes are dropped in detect_label_dino
   label_max_area_frac: 0.5           # a "label" covering > 50 % of the box crop is the face itself
-  wrist_upscale: 1                   # scanner camera (fx 1087 px) resolves the bars directly
-  wrist_decode_rotation_step_deg: 15 # symbol width from the wrist image (refine_with_wrist): zbar decodes 1-D codes only
+  wrist_upscale: 1                   # hand-camera image (detection and symbol-width decode): g1_v1's hand camera is the
+                                     # scanner imager (fx 1087 px), which resolves the bars directly; a robot variant
+                                     # overrides it (robot.yaml variants.<v>.perception: g1_v2 D405 -> 2)
+  wrist_decode_rotation_step_deg: 15 # symbol width from the hand-camera image (refine_with_wrist): zbar decodes 1-D codes only
                                      # within ~+-17 deg of an image axis -> rotations 0..75; same value and evidence as the
                                      # simulator's scanner (g1_barcode_sim configs/scanner.yaml scan.rotation_step_deg)

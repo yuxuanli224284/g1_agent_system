@@ -10,9 +10,12 @@ Two REP sockets on one thread (Isaac Sim must be driven from its main thread):
 Composite video: two fixed recording cameras (MAIN behind-left of
 the robot start, SIDE at the robot's left of the boxes) posed once per episode from the scenario layout (and, on a
 multi-face stack, re-posed at every face_start stage on that face of the tour: compositor.face_framing), plus the head
-and scanner cameras, read straight from their render buffers in a step hook every round(1 / (fps * policy_dt)) policy
-steps (no extra renders, no USD marker toggling, no get_obs); markers and detections are drawn as 2-D overlays.
+and scanner cameras (and the hand camera on the scanner hand, g1_v2: the left D405), read straight from their render
+buffers in a step hook every round(1 / (fps * policy_dt)) policy steps (no extra renders, no USD marker toggling, no
+get_obs); markers and detections are drawn as 2-D overlays.
 The video runs in simulated time; LLM replies, scans and head detections add frozen-state "hold" frames.
+A scenario with "target_boxes" (GT box ids of a subset task, evaluation only) restricts the green targets / METRICS
+to those boxes and shows no whole-wall GT observation pose (marker and METRICS root line: n/a, as the evaluator).
 
 python -m g1agent.robot.sim_server            (see scripts/start_sim_server.sh)
 """
@@ -42,7 +45,8 @@ def main():
     token = os.environ.get(SYS["eval_token_env"])
     if not token:
         raise SystemExit(f"set ${SYS['eval_token_env']} (evaluation token) before starting the server")
-    overrides = {"robot": {"mode_policies": SYS["mode_policies"]}, "camera": {"model": SYS["head_camera"]}}
+    overrides = {"robot": {"variant": SYS["robot_variant"], "mode_policies": SYS["mode_policies"]},
+                 "camera": {"model": SYS["head_camera"]}}
     if REC["cameras_enabled"]:
         overrides["camera"]["recording"] = {"enabled": True}
     env = G1BarcodeEnv("scenario", headless=True, seed=0, config_overrides=overrides)
@@ -88,8 +92,9 @@ def main():
         a = actual_state()
         Tr, Tt = a["T_world_root"], a["T_world_wrist_point"]
         # task 3 over every box ("all") has no single GT wrist target (sim get_ground_truth)
-        markers.set([
-            {"id": "gt_root", "color": "green", "kind": "root", "pos": ob["pos"], "yaw": ob["yaw"]}]
+        subset = env.scenario.get("target_boxes") is not None      # no whole-wall GT obs pose on a subset task
+        markers.set(
+            ([] if subset else [{"id": "gt_root", "color": "green", "kind": "root", "pos": ob["pos"], "yaw": ob["yaw"]}])
             + ([{"id": "gt_wrist", "color": "green", "kind": "pose", "pos": wt["pos"], "dir": wt["forward"]}] if wt is not None else [])
             + [{"id": "act_root", "color": "yellow", "kind": "root", "pos": Tr[:3, 3].tolist(), "yaw": math.atan2(Tr[1, 0], Tr[0, 0])},
                {"id": "act_wrist", "color": "yellow", "kind": "pose", "pos": Tt[:3, 3].tolist(), "dir": Tt[:3, 0].tolist()}],
@@ -118,6 +123,7 @@ def main():
         "get_robot_info": lambda: robot_info(env),
         "get_head_obs": lambda depth=False: head_obs(env, depth),
         "get_wrist_obs": lambda side="left": wrist_obs(env, side),
+        "get_hand_camera_obs": lambda name, depth=False: hand_cam_obs(env, name, depth),
         "get_joint_state": lambda: {"names": list(env.robot.data.joint_names), "q": env.robot.data.joint_pos[0].cpu().numpy(),
                                     "timestamp": env.get_obs()["timestamp"]},
         "get_odom": lambda: {"T_odom_root": env.get_obs()["T_world_root_odom"], "timestamp": env.get_obs()["timestamp"]},
@@ -158,13 +164,16 @@ def main():
         A markers in the stage but hidden (the normal state), B markers removed, B2 = B rendered again (renderer noise
         baseline), C markers shown (control: proves the probes are in view of both cameras). Pass: A == B up to the
         baseline, C != B. Also the frames handed out right after a third-person snapshot equal those before it."""
+        hand = list(env.hand_cams)                               # every robot camera the agent may see (g1_v2: D405)
+        names = ["head", "wrist"] + hand
+
         def cams():
             for _ in range(VIZ["invisibility_render_passes"]):
                 env.env.sim.render()
-            env.head_cam.update(0.0, force_recompute=True)
-            env.wrist_cam.update(0.0, force_recompute=True)
-            return (env.head_cam.data.output["rgb"][0].cpu().numpy()[..., :3].copy(),
-                    env.wrist_cam.data.output["rgb"][0].cpu().numpy()[..., :3].copy())
+            sensors = [env.head_cam, env.wrist_cam] + [env.hand_cams[n] for n in hand]
+            for c in sensors:
+                c.update(0.0, force_recompute=True)
+            return tuple(c.data.output["rgb"][0].cpu().numpy()[..., :3].copy() for c in sensors)
         def diff(a, b):
             d = np.abs(a.astype(np.int16) - b.astype(np.int16)).max(axis=-1)
             return {"max": int(d.max()), "p999": float(np.percentile(d, 99.9)),
@@ -172,6 +181,11 @@ def main():
         o0 = env.get_obs()
         probes = [{"id": "probe_head", "color": "red", "kind": "point", "pos": (o0["T_world_root_gt"] @ o0["T_root_cam"] @ np.array([0, 0, 0.6, 1.0]))[:3].tolist()},
                   {"id": "probe_wrist", "color": "purple", "kind": "point", "pos": (o0["T_world_root_gt"] @ o0["T_root_wrist_cam"] @ np.array([0, 0, 0.15, 1.0]))[:3].tolist()}]
+        # a hand camera gets its probe on its optical axis at the wrist probe's distance (in front of the scanner nose
+        # for the D405 on the bracket)
+        probes += [{"id": f"probe_{n}", "color": "purple", "kind": "point",
+                    "pos": (o0["T_world_root_gt"] @ env.hand_camera_obs(n)["T_root_cam"] @ np.array([0, 0, 0.15, 1.0]))[:3].tolist()}
+                   for n in hand]
         # consecutive renders at one state, toggling only the markers, so every compared pair has the same render history
         cams()                                                   # warm-up
         seq = []
@@ -183,14 +197,18 @@ def main():
         C = cams()                                               # control: markers shown
         markers.show(False); markers.clear("probe")
         B = cams()
-        out = {}
-        for k, i in (("head", 0), ("wrist", 1)):
+        out = {"cameras": names}
+        for i, k in enumerate(names):
             out[f"{k}_hidden_vs_removed"] = [diff(seq[j][i], seq[j + 1][i]) for j in range(3)]
             out[f"{k}_baseline"] = diff(seq[3][i], same[i])
             out[f"{k}_shown_vs_removed"] = diff(C[i], B[i])
-        before = env.get_obs(); snapshot(); after = env.get_obs()
+        before = env.get_obs(); hb = {n: env.camera_rgb(n) for n in hand}
+        snapshot()
+        after = env.get_obs(); ha = {n: env.camera_rgb(n) for n in hand}
         out["head_after_snapshot"] = diff(before["rgb"], after["rgb"])
         out["wrist_after_snapshot"] = diff(before["wrist_rgb"], after["wrist_rgb"])
+        for n in hand:
+            out[f"{n}_after_snapshot"] = diff(hb[n], ha[n])
         return out
 
     E = {
@@ -289,7 +307,7 @@ class Episode:
             self.harness_t[m["id"]] = prev if prev is not None and prev[0] == m else (dict(m), t)
 
     def harness_wrist_targets(self):
-        """Harness wrist targets in world (viz.yaml colors: purple = refined with the wrist camera, blue = from the head
+        """Harness wrist targets in world (viz.yaml colors: purple = refined with the hand camera, blue = from the head
         camera), most refined first: [{"pos", "t_set"}]."""
         out = []
         for color in ("purple", "blue"):
@@ -348,13 +366,14 @@ class Episode:
         gt = env.get_ground_truth()                         # static during the episode: cached
         fs = env.frame_state()
         task = int(env.scenario["task"] if task is None else task)
-        targets = C.gt_targets(gt, gt_standoff_fn(task))
+        targets = subset_targets(C.gt_targets(gt, gt_standoff_fn(task)), env.scenario.get("target_boxes"))
         Twr = fs["T_world_root"]
         body = (env.collision_model.world_points() - Twr[:3, 3]) @ Twr[:3, :3]      # robot body points, root frame
         cams = self._pose_cams(C.framing(gt, targets, body, float(Twr[2, 3]), REC["framing"]))
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         writer = C.H264Writer(path, *REC["canvas"], fps_eff, imageio_ffmpeg.get_ffmpeg_exe())
         self.rec = {"path": path, "writer": writer, "every": every, "fps": fps_eff, "count": 0, "gt": gt, "task": task,
+                    "subset": env.scenario.get("target_boxes") is not None,
                     "targets": targets, "cams": cams, "body": body, "root_z": float(Twr[2, 3]),
                     "multi_face": len(C.labelled_tour(gt, targets)) > 1,
                     "frames": open(os.path.splitext(path)[0] + ".frames.jsonl", "w")}
@@ -413,13 +432,14 @@ class Episode:
         t = fs["t_sim"]
         gt, targets = rec["gt"], rec["targets"]
         current = ov.current_target(targets, self.harness_wrist_targets())
-        met = C.frame_metrics(gt, fs, targets, current, ov.scans, self.stages.get("task1_end"))
+        met = C.frame_metrics(gt, fs, targets, current, ov.scans, self.stages.get("task1_end"), subset=rec["subset"])
         ob = gt["task1_gt_obs_pose"]
         Tr, Tt = fs["T_world_root"], fs["T_world_tip"]
         # multi-face tour: also the GT obs pose of the face being worked on (face 0 = the front = task1_gt_obs_pose)
         fob = [f["gt_obs_pose"] for f in gt.get("faces") or []
                if rec["multi_face"] and ov.face is not None and ov.face["idx"] > 0 and f["face"] == C.FACE_TOUR[ov.face["idx"]]]
-        mk = ([{"color": "green", "kind": "root", "pos": o["pos"], "yaw": o["yaw"]} for o in [ob] + fob]
+        # a subset task works from near its start: no whole-wall GT observation pose to show (evaluator: n/a)
+        mk = ([{"color": "green", "kind": "root", "pos": o["pos"], "yaw": o["yaw"]} for o in ([] if rec["subset"] else [ob] + fob)]
               + [{"color": "green", "kind": "pose", "pos": g["pos"], "dir": -g["normal"]} for g in targets]
               + [m for m in self.markers.specs.values() if m["group"] == "harness"]
               + [{"color": "yellow", "kind": "root", "pos": Tr[:3, 3], "yaw": math.atan2(Tr[1, 0], Tr[0, 0]),
@@ -435,10 +455,14 @@ class Episode:
         else:
             scan_txt = f"scanned: no ({last['status']})"
         scan_txt += f"   {sc['k']}/{sc['n']}"
+        images = {"main": env.camera_rgb("main"), "side": env.camera_rgb("side"), "ego": env.camera_rgb("head"),
+                  "wrist": env.camera_rgb("wrist")}
+        hand = scanner_hand_camera(env)
+        if hand is not None:            # the D405 takes the WRIST panel, the scanner image becomes its inset (compositor)
+            images["hand"] = env.camera_rgb(hand)
         frame = self.comp.compose({
             "t_sim": t, "hold": hold,
-            "images": {"main": env.camera_rgb("main"), "side": env.camera_rgb("side"), "ego": env.camera_rgb("head"),
-                       "wrist": env.camera_rgb("wrist")},
+            "images": images,
             "cams": rec["cams"], "markers": mk,
             "head_det": ov.head_detections_at(t), "target_box": ov.target_box,
             "ego_text": f"boxes seen: {'-' if ov.n_boxes is None else ov.n_boxes}; localised target: {ov.target_text()}",
@@ -455,6 +479,39 @@ class Episode:
 
 def strip_obs(r):
     return {k: v for k, v in r.items() if k != "obs"}
+
+
+def subset_targets(targets, target_boxes):
+    """GT targets of a subset task (scenario "target_boxes", evaluation only); every target box must carry a label."""
+    if target_boxes is None:
+        return targets
+    tb = set(target_boxes)
+    missing = tb - {t["box_id"] for t in targets}
+    if missing:
+        raise ValueError(f"scenario target_boxes without a GT barcode: {sorted(missing)}")
+    return [t for t in targets if t["box_id"] in tb]
+
+
+def scanner_hand_camera(env):
+    """Name of the hand camera on the scanner's hand (robot.yaml hand_cameras parent link on that side), or None."""
+    names = [n for n, h in (env.cfg["robot"].get("hand_cameras") or {}).items()
+             if h["parent_link"].split("_")[0] == env.scanner_side and n in env.hand_cams]
+    if len(names) > 1:
+        raise ValueError(f"several hand cameras on the scanner hand: {names}")
+    return names[0] if names else None
+
+
+def hand_cam_obs(env, name, depth: bool = False):
+    """A hand camera frame (g1_barcode_sim hand_camera_obs): rgb, K, T_root_cam, timestamp (simulated time; frame_state
+    does not touch the depth-noise stream) and, when asked for, its render depth (m, distance to the image plane)."""
+    if name not in env.hand_cams:
+        return {"status": "error", "reason": f"no hand camera {name!r} (robot has {sorted(env.hand_cams)})"}
+    o = env.hand_camera_obs(name)
+    out = {"status": "ok", "name": name, "rgb": o["rgb"], "K": o["K"], "T_root_cam": o["T_root_cam"],
+           "timestamp": env.frame_state()["t_sim"]}
+    if depth:
+        out["depth"] = o.get("depth")
+    return out
 
 
 def wrist_obs(env, side):
@@ -489,10 +546,22 @@ def head_obs(env, depth: bool = False) -> dict:
 
 
 def robot_info(env):
+    """What the robot is (its kinematics, cameras, hands): the agent chooses its model from it (robot_variant)."""
     from g1_barcode_sim.arm import ARM_JOINTS
     o = env.get_obs()
+    rc = env.cfg["robot"]
+    held = env.cfg["scanner"]["held_by"]
     return {"joint_names": list(env.robot.data.joint_names), "arm_joints": ARM_JOINTS,
+            "robot_variant": rc["variant"],                       # g1_v1 | g1_v2 (system.yaml robot_variant)
             "head_camera_model": env.cfg["camera"]["model"],      # d435i | upstream (system.yaml head_camera)
+            # cameras on the hands (g1_v2: left_d405 on the scanner bracket); {} when there is none
+            "hand_cameras": {n: {"side": h["parent_link"].split("_")[0], "parent_link": h["parent_link"],
+                                 "K": env.hand_cams[n].data.intrinsic_matrices[0].cpu().numpy().astype(float),
+                                 "size": [h["height"], h["width"]], "hfov_deg": float(h["hfov_deg"]),
+                                 "depth": "distance_to_image_plane" in h["data_types"]}
+                             for n, h in (rc.get("hand_cameras") or {}).items()},
+            "grippers": {s: bool(rc["gripper"]["joints"][s]) for s in ("left", "right")},
+            "scanner": {"parent_link": rc["scanner_mount"]["parent_link"], "held_by": held},
             "head_K": o["K"], "head_size": list(o["rgb"].shape[:2]),
             # D435i infrared pair (None for the single upstream camera): intrinsics, size, baseline
             "head_stereo": (None if env.ir_cams is None else
@@ -500,10 +569,13 @@ def robot_info(env):
                              "size": [env.cfg["camera"]["stereo"]["height"], env.cfg["camera"]["stereo"]["width"]],
                              "baseline_m": env.cfg["camera"]["stereo"]["baseline_m"]}),
             "wrist_side": env.scanner_side if env.scanner_on else None,
+            # the SCANNER imager (its field of view sets the adaptive stand-off), on every variant
             "wrist_K": o.get("wrist_K"), "wrist_size": list(o["wrist_rgb"].shape[:2]) if "wrist_rgb" in o else None,
             "policy_dt": env.policy_dt, "velocity_limits": env.cfg["robot"]["velocity_limits"],
             "arm_soft_limits": {s: env.arm.limits[s] for s in ARM_JOINTS},
-            "wrist_point": "scanner tip (exit-window centre) of the scanner held by the left gripper",
+            "wrist_point": (f"scanner tip (exit-window centre) of the scanner held by the {env.scanner_side} gripper"
+                            if held == "gripper" else
+                            f"scanner tip (exit-window centre) of the scanner bolted to the {env.scanner_side} wrist (bracket)"),
             # body (squat / torso) command of the GR00T walker; None for a walker without one
             "body_command": ({"height_default": env.walker.height_default, "height_range": list(env.walker.height_range),
                               "rpy_limit_rad": [float(v) for v in env.walker.rpy_limit],

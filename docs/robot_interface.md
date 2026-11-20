@@ -94,9 +94,10 @@ RPC 消息的编码和解码，只依赖 `msgpack` 和 `numpy`。
 
 | 方法 | 参数 | 返回（据行内注释） |
 |---|---|---|
-| `get_robot_info()` | 无 | 关节名、相机内参、各类限制 |
+| `get_robot_info()` | 无 | 机器人型号 `robot_variant`（g1_v1 / g1_v2，agent 据此选运动学模型）、关节名、相机内参（`wrist_K` 始终是扫码器成像头）、手上相机 `hand_cameras`、夹爪 `grippers`、扫码器安装 `scanner`、各类限制 |
 | `get_head_obs()` | 无 | `rgb`、`depth`（米）、`K`、`T_root_headcam`、`timestamp` |
-| `get_wrist_obs(side="left")` | 手的侧别 | `rgb`、`depth`、`K`、`T_root_wristcam`、`timestamp` |
+| `get_wrist_obs(side="left")` | 手的侧别 | 扫码器成像头的画面：`rgb`、`depth`、`K`、`T_root_wristcam`、`timestamp`（仅仿真；真 DS2208 不出图） |
+| `get_hand_camera_obs(name, depth=False)` | 手上相机名（如 `left_d405`） | `rgb`、`K`、`T_root_cam`、`timestamp`，`depth=True` 时加深度（米）。g1_v2 上 look_wrist / refine_with_wrist / stereo_check_wrist 用的就是它 |
 | `get_joint_state()` | 无 | `names`、`q` |
 | `get_odom()` | 无 | `T_odom_root` |
 | `walk(vx, vy, wz, duration)` | 速度指令和时长 | dict |
@@ -169,6 +170,7 @@ harness 只能调用这些方法。
 | `get_robot_info` | 模块函数 `robot_info(env)`（见 5.7） |
 | `get_head_obs` | 从 `env.get_obs()` 取 `rgb, depth, K`，`T_root_cam` 改名为 `T_root_headcam`，加 `timestamp` |
 | `get_wrist_obs` | 模块函数 `wrist_obs(env, side)` |
+| `get_hand_camera_obs` | 模块函数 `hand_cam_obs(env, name, depth)`：`env.hand_camera_obs(name)` 加 `timestamp`（`frame_state()["t_sim"]`）；未知相机返回 error |
 | `get_joint_state` | `env.robot.data.joint_names`、`joint_pos[0]`（转成 numpy）、`timestamp` |
 | `get_odom` | `T_odom_root` 取自 `get_obs()["T_world_root_odom"]`，这是仿真里模拟出来的里程计估计，不是真实位姿 |
 | `walk` | `env.step(vx, vy, wz, duration)`，经 `strip_obs` 去掉返回中的 `obs` 字段 |

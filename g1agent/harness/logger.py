@@ -45,7 +45,7 @@ def tool_overlay(name: str, result: dict) -> dict:
     if isinstance(d.get("scan_plan"), list):
         ov["scan_plan"] = [{"id": b.get("id"), "status": b.get("status"), "content": b.get("content")} for b in d["scan_plan"]]
     if isinstance(d.get("polygons"), list):
-        ov["wrist_polygons"] = [{"content": p.get("content"), "polygon": p["polygon"]} for p in d["polygons"] if p.get("polygon") is not None]
+        ov["scanner_polygons"] = [{"content": p.get("content"), "polygon": p["polygon"]} for p in d["polygons"] if p.get("polygon") is not None]
     if isinstance(d.get("scanned"), list):
         ov["scanned"] = [s["content"] if isinstance(s, dict) else s for s in d["scanned"]]
     if name == "detect_barcode_head" and d.get("corners_px") is not None:     # task 2: one label, corners at the top level

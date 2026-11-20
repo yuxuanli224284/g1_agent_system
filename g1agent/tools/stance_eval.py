@@ -26,14 +26,16 @@ def _die_with_parent():
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
 
 
-def init_worker(shoulder_frame: str, arm_reach: float | None):
-    """Process-pool initializer: own kinematics + IK (planning: 1 restart, as plan_stance sets it)."""
+def init_worker(urdf: str, robot_cfg: dict, side: str, shoulder_frame: str, arm_reach: float | None):
+    """Process-pool initializer: own kinematics + IK of the parent's robot variant (planning: 1 restart, as plan_stance
+    sets it). The URDF and the resolved robot config come from the parent: a spawned worker re-reading the configs would
+    not know the variant the robot reported."""
     global _W
     _die_with_parent()
     from ..kinematics.fk import Kinematics
     from ..kinematics.ik import ArmIK
-    kin = Kinematics()
-    ik = ArmIK(kin)
+    kin = Kinematics(urdf)
+    ik = ArmIK(kin, robot_cfg, side)
     ik.cfg = dict(ik.cfg, restarts=1)
     _W = {"kin": kin, "ik": ik, "shoulder": shoulder_frame, "reach": arm_reach}
 

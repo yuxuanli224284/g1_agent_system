@@ -7,13 +7,18 @@ from abc import ABC, abstractmethod
 
 class RobotInterface(ABC):
     @abstractmethod
-    def get_robot_info(self) -> dict: ...                       # joint names, camera intrinsics, limits
+    def get_robot_info(self) -> dict: ...                       # robot variant, joint names, camera intrinsics, limits
     @abstractmethod
     def get_head_obs(self, depth: bool = False) -> dict: ...    # rgb, K, T_root_headcam, timestamp; stereo head (D435i):
                                                                 # ir_left, ir_right, K_ir, T_root_ir_left, T_irleft_irright;
                                                                 # depth (m, colour frame): the camera's own depth, if asked
     @abstractmethod
-    def get_wrist_obs(self, side: str = "left") -> dict: ...    # rgb, depth, K, T_root_wristcam, timestamp
+    def get_wrist_obs(self, side: str = "left") -> dict: ...    # the scanner imager's frame: rgb, depth, K, T_root_wristcam,
+                                                                # timestamp (simulator only: a real DS2208 gives no image)
+    @abstractmethod
+    def get_hand_camera_obs(self, name: str, depth: bool = False) -> dict: ...   # a camera on a hand (robot info
+                                                                # hand_cameras, e.g. left_d405): rgb, K, T_root_cam,
+                                                                # timestamp; depth (m), if asked
     @abstractmethod
     def get_joint_state(self) -> dict: ...                      # names, q
     @abstractmethod
@@ -33,9 +38,10 @@ class RobotInterface(ABC):
     @abstractmethod
     def set_arm_joints(self, side: str, q, duration: float) -> dict: ...
     @abstractmethod
-    def set_gripper(self, side: str, opening: float) -> dict: ...
+    def set_gripper(self, side: str, opening: float) -> dict: ...   # only on a hand with a gripper (robot info grippers)
     @abstractmethod
-    def scan(self) -> dict: ...                                 # trigger the handheld scanner
+    def scan(self) -> dict: ...                                 # trigger the scanner on the left hand (held by the gripper
+                                                                # or bolted to a wrist bracket, robot info scanner)
     @abstractmethod
     def draw_markers(self, markers: list, frame: str = "odom") -> dict: ...   # simulator only (no-op on hardware)
     @abstractmethod

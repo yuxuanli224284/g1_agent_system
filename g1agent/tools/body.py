@@ -26,7 +26,7 @@ def Ry(a):
 
 
 class BodyModel:
-    def __init__(self, kin, geometry: dict, calibration: list, arm_side: str):
+    def __init__(self, kin, geometry: dict, calibration: list, arm_side: str, wrist_point_frame: str):
         from scipy.spatial import ConvexHull, QhullError
         self.kin = kin
         names = list(geometry["body_names"])
@@ -60,12 +60,12 @@ class BodyModel:
                 except QhullError:
                     pass                                    # flat point set: fall back to its points as spheres
             self.leg_shapes[n] = ("spheres", b["pts"], b["rad"])
-        # reach bound of the scanner arm: the chain's consecutive frame origins are rigidly spaced, so the sum of their
-        # distances bounds |scanner tip - shoulder| for every joint configuration (a pure prefilter, never a decision)
-        chain = [f"{arm_side}_shoulder_pitch_link", f"{arm_side}_shoulder_roll_link", f"{arm_side}_shoulder_yaw_link",
-                 f"{arm_side}_elbow_link", f"{arm_side}_wrist_roll_link", f"{arm_side}_wrist_pitch_link",
-                 f"{arm_side}_wrist_yaw_link", f"{arm_side}_hand_base_link", "scanner_tip"]
+        # reach bound of the scanner arm: the chain's consecutive link origins are rigidly spaced, so the sum of their
+        # distances bounds |scanner tip - shoulder| for every joint configuration (a pure prefilter, never a decision).
+        # The chain is the model's own link chain from the scanner tip up to the shoulder (g1_v1: ... wrist_yaw ->
+        # hand_base -> scanner_tip; g1_v2: ... wrist_yaw -> scanner_tip on the bracket)
         import pinocchio as pin
+        chain = self._link_chain(kin, wrist_point_frame, f"{arm_side}_shoulder_pitch_link")
         q_n = pin.neutral(kin.model)
         org = [kin.pose(q_n, f)[:3, 3] for f in chain]
         self.shoulder_frame = chain[0]
@@ -73,6 +73,22 @@ class BodyModel:
         self.levels = sorted(calibration, key=lambda c: -c["height_cmd"])
         if not self.levels:
             raise ValueError("empty body calibration")
+
+    @staticmethod
+    def _link_chain(kin, tip: str, root_link: str) -> list:
+        """Link (body) frames from root_link down to the tip frame, following the model's frame tree upwards."""
+        import pinocchio as pin
+        m = kin.model
+        f, out = kin.frame_id(tip), []
+        while True:
+            fr = m.frames[f]
+            if fr.type == pin.FrameType.BODY:
+                out.append(fr.name)
+            if fr.name == root_link:
+                return out[::-1]
+            if f == 0:
+                raise ValueError(f"{root_link} is not an ancestor of {tip} in the kinematics URDF")
+            f = fr.parentFrame
 
     # ------------------------------------------------------------------ poses
     def q_at(self, q_base, level: dict):

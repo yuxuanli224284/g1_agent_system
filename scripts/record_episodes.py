@@ -4,6 +4,7 @@ python scripts/record_episodes.py --mode rule --task 3 --out runs/videos_task3 t
 import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_task import make_episode_runner
+from run_suite import check_variant
 
 ap = argparse.ArgumentParser()
 ap.add_argument("scenarios", nargs="+")
@@ -24,6 +25,7 @@ for sc in a.scenarios:
         want = a.task if a.task is not None else r.get("scenario_task", r["task"])
         if r["task"] != want:
             raise SystemExit(f"{ep} holds a task-{r['task']} episode, task {want} asked: use another --out")
+        check_variant(ep, r)
     else:
         r = run(sc, a.mode, ep, video=True, task=a.task)
         print("EPISODE", sc, a.mode, "success", r["metrics"].get("success"), f"{r['wall_s']}s", flush=True)

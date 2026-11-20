@@ -20,7 +20,8 @@ df["eval_success"] = df["eval_success"].astype(str).str.lower() == "true"
 df["harness_success"] = df["harness_success"].astype(str).str.lower() == "true"
 L = ["# 评测汇总", "", f"生成时间 {time.strftime('%F %T')}；runs: {', '.join(sorted(df['run'].unique()))}", ""]
 err_cols = {1: ["d_err_m", "perception_err_pos_m", "execution_err_pos_m", "yaw_err_deg"],
-            2: ["wrist_dist_to_plane_m", "wrist_axis_offset_m", "wrist_angle_err_deg", "head_perception_err_m", "wrist_perception_err_m", "execution_err_m"]}
+            2: ["wrist_dist_to_plane_m", "wrist_axis_offset_m", "wrist_angle_err_deg", "head_perception_err_m", "wrist_perception_err_m", "execution_err_m"],
+            3: ["t1_d_err_m", "t1_yaw_err_deg", "scan_recall", "tip_err_mean_m", "tip_err_max_m"]}
 for task in sorted(df["task"].unique()):
     d = df[df["task"] == task]
     L += [f"## 任务 {task}", ""]

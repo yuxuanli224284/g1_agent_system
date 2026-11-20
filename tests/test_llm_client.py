@@ -93,6 +93,10 @@ class FakeTB:
         explore_steps = 0
     ws = WS()
 
+    def __init__(self):
+        from g1agent.common import config
+        self.cfg = config.apply_robot_variant(config.load_all(), "g1_v1")      # the robot the fake stands for
+
     def look_head(self):
         return {"status": "ok", "data": {}, "reason": ""}, np.zeros((8, 8, 3), np.uint8)
 

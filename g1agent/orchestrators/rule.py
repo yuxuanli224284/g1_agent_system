@@ -276,21 +276,36 @@ def _stereo_disagrees(s) -> bool:
 class Task3:
     """Task 1 over all boxes (fast end), plan_scans, then every planned barcode in the plan's order (next_barcode decides,
     never this code) with Task2.place_and_scan; finish(task=3) with the success computed by the Harness from the ledger.
-    The scenario's left/right selector is not used: task 3 observes and scans every box."""
+    The scenario's left/right selector is not used: task 3 observes and scans every box. With a target spec in robot
+    terms (Toolbox.scan_targets) phase 1 stays near the start pose (_stay_stage) and only the targeted labels count."""
 
     def __init__(self, h, cfg, selector, explore_policy=None, recovery_policy=None):
         self.h, self.cfg = h, cfg
         self.t1 = Task1(h, cfg, "all", explore_policy, recovery_policy, fast_end=True)
         self.t2 = Task2(h, cfg, "all", explore_policy, recovery_policy)
 
+    def _stay_stage(self) -> dict:
+        """Phase 1 of a task with a target spec (labels of some boxes of the wall, given in robot terms): the robot works
+        from near its start pose (user decision 2026-11-19: do not walk back to observe the whole wall); plan_scans
+        looks with every standing head view from here. Detect + select every box only."""
+        h = self.h
+        r = h.call("detect_boxes", {})
+        if r["status"] != "ok":
+            return {"walked": False, "summary": r["reason"]}
+        r = h.call("select_target_box", {"selector": "all"})
+        return {"walked": r["status"] == "ok", "summary": r["reason"]}
+
     def run(self):
         h = self.h
         h.tb.remember_home()
+        stay = h.tb.scan_targets is not None
         while True:                                                   # phase 1 (task 1) until a scan plan exists
-            s = self.t1.stage()
+            s = self._stay_stage() if stay else self.t1.stage()
             if h.finished is not None:
                 return {"status": "ok"}
             if not s["walked"]:
+                if stay and not h.over_budget() and self.t1._explore(f"boxes not found from the start pose: {s['summary']}"):
+                    continue
                 return h.call("finish", {"task": h.task, "success": False, "summary": f"task-1 phase: {s['summary']}"})
             r = h.call("plan_scans", {})
             if r["status"] == "ok":
@@ -318,11 +333,15 @@ class Task3:
         if h.finished is not None:
             return {"status": "ok"}
         ws = h.tb.ws
-        n_ok = sum(ws.barcodes[b].status == "scanned" for b in ws.scan_plan)
-        n_unr = sum(ws.barcodes[b].status == "unreadable" for b in ws.scan_plan)
-        return h.call("finish", {"task": h.task, "success": n_ok > 0 and n_ok + n_unr == len(ws.scan_plan),
-                                 "summary": f"scanned {n_ok} of {len(ws.scan_plan)} planned barcodes"
+        plan = [b for b in ws.scan_plan if ws.targeted(b)]           # not_targeted labels are not part of the task
+        n_ok = sum(ws.barcodes[b].status == "scanned" for b in plan)
+        n_unr = sum(ws.barcodes[b].status == "unreadable" for b in plan)
+        missing, warn = ws.missing_cells(), ws.grid_warnings()
+        return h.call("finish", {"task": h.task, "success": n_ok > 0 and n_ok + n_unr == len(plan) and not missing and not warn,
+                                 "summary": f"scanned {n_ok} of {len(plan)} planned barcodes"
                                             + (f", {n_unr} label(s) without a readable code" if n_unr else "")
+                                            + (f", requested cells not found: {missing}" if missing else "")
+                                            + (f", target count not verified: {warn}" if warn else "")
                                             + ("" if not h.over_budget() else f" ({h.over_budget()})")})
 
 

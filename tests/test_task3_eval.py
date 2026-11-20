@@ -159,7 +159,7 @@ def test_logger_events_and_stage(tmp_path):
 def test_tool_overlay_fields():
     scan = {"status": "ok", "data": {"content": "A", "decoded": ["A"], "polygons": [{"content": "A", "polygon": [[0, 0], [1, 0], [1, 1]]}],
                                      "new": True, "duplicate_of": None, "scanned": ["A"]}}
-    assert tool_overlay("scan", scan) == {"wrist_polygons": [{"content": "A", "polygon": [[0, 0], [1, 0], [1, 1]]}], "scanned": ["A"]}
+    assert tool_overlay("scan", scan) == {"scanner_polygons": [{"content": "A", "polygon": [[0, 0], [1, 0], [1, 1]]}], "scanned": ["A"]}
     plan = {"status": "ok", "data": {"barcodes": [{"id": "bc0", "box_id": "box0", "corners_px": [[0, 0]] * 4, "status": "pending",
                                                    "order_index": 0}]}}
     ov = tool_overlay("plan_scans", plan)
@@ -298,3 +298,63 @@ def test_task3_single_labelled_face_metrics_unchanged(episode):
     lf = _log(["F0", "F1", "F2"])
     assert evaluator.evaluate(3, gf, _actual(1.0), wsf, stages=stf, scan_log=lf) == evaluator.evaluate(
         3, nofaces, _actual(1.0), wsf, stages=stf, scan_log=lf)
+
+
+# ------------------------------------------------------------------ subset task (scanroom6x5_sub4_L0)
+def _sub4():
+    """GT of the 4-box scanroom test from the simulator's own scenario -> layout code (CPU)."""
+    from g1agent.common import config
+    sys.path.insert(0, config.load("system")["sim_server"]["sim_root"])
+    from g1_barcode_sim.testsuite import load_factors, load_scenario
+    from g1_barcode_sim.testsuite.scenario import to_layout
+    sc = load_scenario("scanroom6x5_sub4_L0_0000")
+    lay = to_layout(sc, load_factors())
+    gt = {"barcodes": lay["barcodes"], "robot_init": lay["robot_init"], "target_face": None}
+    ri = lay["robot_init"]
+    T = np.eye(4); T[:3, 3] = [ri["pos"][0], ri["pos"][1], 0.78]
+    return sc, gt, {"task1_end": {"t_sim": 5.0, "actual": {"T_world_root": T}}}
+
+
+def test_subset_gt_order_follows_the_target_spec_rule():
+    """The pinned GT orders of the four targets: rows (the scenario's rule, user decision) and the default columns."""
+    sc, gt, stages = _sub4()
+    box = {b["content"]: b["box_id"] for b in gt["barcodes"]}
+    ws = {"scan_plan": [], "scanned": []}
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], target_boxes=sc["target_boxes"],
+                           order_rule=sc["scan_targets"]["order"])
+    assert [box[c] for c in m["gt_order"]] == ["C1R4", "C2R4", "C1R3", "C2R3"] and m["order_rule"] == "rows"
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], target_boxes=sc["target_boxes"])
+    assert [box[c] for c in m["gt_order"]] == ["C1R4", "C1R3", "C2R4", "C2R3"]
+    assert m["task1"]["success"] is None and "n/a" in m["task1"]["note"] and m["n_gt_barcodes"] == 4
+    with pytest.raises(ValueError):
+        evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], target_boxes=["C9R9"])
+    with pytest.raises(ValueError):
+        evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], order_rule="diagonal")
+
+
+def test_subset_success_and_non_target_reads_are_only_reported():
+    sc, gt, stages = _sub4()
+    by_box = {b["box_id"]: b for b in gt["barcodes"]}
+    S = evaluator.config.load("task3")["standoff"]
+
+    def read(bid, t):
+        b = by_box[bid]
+        d = evaluator.gt_standoff(b["pattern_size"], evaluator.scanner_hfov_gt())
+        return {"t_sim": t, "content": b["content"], "decoded": [b["content"]], "gt": {"hit": None},
+                "T_world_tip": _tip(np.asarray(b["center"]) + d * np.asarray(b["normal"]))}
+    kw = {"target_boxes": sc["target_boxes"], "order_rule": "rows"}
+    ws = {"scan_plan": [], "scanned": []}
+    order = ["C1R4", "C2R4", "C1R3", "C2R3"]
+    log = [read("C1R4", 1), read("C1R5", 2)] + [read(b, 3 + i) for i, b in enumerate(order[1:])]   # + a non-target
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=log, **kw)
+    assert m["success"], m.get("failure")
+    assert m["non_target_reads"] == [by_box["C1R5"]["content"]] and m["n_wrong_contents"] == 0 and m["scan_recall"] == 1.0
+    log = [read(b, i) for i, b in enumerate(["C1R4", "C1R3", "C2R4", "C2R3"])]          # column order: wrong here
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=log, **kw)
+    assert not m["success"] and "order" in m["failure"]
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=log[:3], **kw)
+    assert not m["success"] and "scanned 3/4" in m["failure"]
+    log = [read(b, i) for i, b in enumerate(order)] + [{"t_sim": 9, "content": "NOT-A-GT-CODE", "decoded": [], "gt": {"hit": None},
+                                                       "T_world_tip": np.eye(4)}]
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=log, **kw)
+    assert not m["success"] and m["wrong_contents"] == ["NOT-A-GT-CODE"]                # a misread is still a failure

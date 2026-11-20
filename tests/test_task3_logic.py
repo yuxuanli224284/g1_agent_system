@@ -110,23 +110,25 @@ class FakeRobot:
         return {"status": "no_read", "content": None, "decoded": [], "timestamp": 0.0}
 
 
-def bare_toolbox(robot, task=3):
-    """A Toolbox without models / kinematics: only the state the bookkeeping tools need."""
+def bare_toolbox(robot, task=3, variant="g1_v1"):
+    """A Toolbox without models / kinematics: only the state the bookkeeping tools need (config of robot variant
+    `variant`; the scanner field of view is the DS2208-like imager's on every variant)."""
     tb = tbmod.Toolbox.__new__(tbmod.Toolbox)
     tb.robot = robot
-    tb.cfg = config.apply_head_camera(config.load_all(), "d435i")
+    tb.cfg = config.apply_head_camera(config.apply_robot_variant(config.load_all(), variant), "d435i")
     tb.ws = WorldState()
     tb.markers = {}
     tb.task = task
     tb.arm_at_home = True
     tb._last_label = None
     tb._wrist_detection = None
-    tb.wrist_hfov = so.hfov_from_intrinsics(1087.0, 640.0)
+    tb.scanner_hfov = so.hfov_from_intrinsics(1087.0, 640.0)
     tb.head = None
     tb.body_cmd = None                  # walker without a body (squat) command unless a test sets one
     tb.base_height_cmd = None
     tb._body_model = None
     tb.multi_face = False
+    tb.scan_targets = None               # every label, column order (Toolbox.set_scan_targets)
     tb.view_pitch = 0.0                  # head view upright (torso lean, robot.yaml view)
     tb._leans = None
     tb._plan_update_from_here = lambda: None   # next_barcode's automatic look (needs the head camera); tested separately
@@ -181,7 +183,7 @@ def test_compute_wrist_target_adaptive_and_clears_refined():
     tb.ws.wrist_target_refined = {"stale": True}
     r = tb.compute_wrist_target()
     S = config.load("task3")["standoff"]
-    d = so.adaptive_standoff(0.15, tb.wrist_hfov, S["fill_frac"], S["min_m"], S["max_m"])
+    d = so.adaptive_standoff(0.15, tb.scanner_hfov, S["fill_frac"], S["min_m"], S["max_m"])
     assert r["data"]["offset"] == pytest.approx(d, abs=1e-3) and tb.ws.wrist_target_refined is None
     assert r["data"]["pre_offset"] == pytest.approx(d + 0.10, abs=1e-3)
     tb.compute_wrist_target(refined=True)                          # refined keeps the head target's stand-off
@@ -264,7 +266,7 @@ def test_plan_scans_orders_columns_and_dedupes(monkeypatch):
         assert b["width_m"] == pytest.approx(0.10, abs=1e-3)
         # head width = the label detection box (0.10 m here); the stand-off rule is defined on the symbol, so the head
         # plan is conservative (farther) until the wrist measures the symbol
-        assert b["standoff_m"] == pytest.approx(0.10 / (2 * math.tan(tb.wrist_hfov / 2)) / config.load("task3")["standoff"]["fill_frac"], abs=0.003)
+        assert b["standoff_m"] == pytest.approx(0.10 / (2 * math.tan(tb.scanner_hfov / 2)) / config.load("task3")["standoff"]["fill_frac"], abs=0.003)
     assert tb.ws.scan_plan == ["bc0", "bc1", "bc2"] and tb.ws.current_barcode_id is None
     tb.ws.barcodes["bc0"].status = "scanned"                       # once the plan runs, a call only updates it
     r2 = tb.plan_scans()
@@ -363,7 +365,7 @@ def test_move_arm_partial_only_while_the_label_stays_in_the_scanner_view(miss, e
     tb._roll_in_root = lambda t: None
     r = tb.move_arm("final")
     assert r["status"] == expect, r
-    half = 0.2 * math.tan(tb.wrist_hfov / 2)
+    half = 0.2 * math.tan(tb.scanner_hfov / 2)
     assert r["data"]["view"]["view_half_width_m"] == pytest.approx(half, abs=1e-3)
     if expect == "fail":
         assert r["reason"].startswith("IK")             # the callers' re-plan branch (prompt, rule orchestrator)
@@ -1067,38 +1069,62 @@ def test_stack_side_views_reach_the_known_stack_top():
     assert np.array_equal(tb._to_stack_top(C), C)
 
 
+def _v(variant):
+    return config.apply_robot_variant(config.load_all(), variant)
+
+
 def test_head_camera_profiles_follow_the_reported_model():
     """robot.yaml head_camera: the D435i gets stereo depth, its colour frame and lean views; the upstream single camera
-    gets render depth, its own frame (d435_link origin, 15 mm right of the D435i colour camera) and no lean views."""
+    gets render depth, its own frame (d435_link origin, 15 mm right of the D435i colour camera) and no lean views
+    (g1_v1, the only variant that can carry it)."""
     from g1agent.kinematics.fk import Kinematics
-    d = config.apply_head_camera(config.load_all(), "d435i")
-    u = config.apply_head_camera(config.load_all(), "upstream")
+    d = config.apply_head_camera(_v("g1_v1"), "d435i")
+    u = config.apply_head_camera(_v("g1_v1"), "upstream")
     assert (d["perception"]["head_depth"]["source"], d["robot"]["lean_views"]) == ("stereo", True)
     assert (u["perception"]["head_depth"]["source"], u["robot"]["lean_views"]) == ("render", False)
-    kin = Kinematics()
+    kin = Kinematics(d["robot"]["urdf"])
     q = kin.q_from_state([], [])
     Td, Tu = kin.pose(q, d["robot"]["head_cam_frame"]), kin.pose(q, u["robot"]["head_cam_frame"])
     assert np.allclose(Td[:3, :3], Tu[:3, :3]) and abs(np.linalg.norm(Td[:3, 3] - Tu[:3, 3]) - 0.015) < 1e-6
     for bad in (None, "t800"):
-        try:
-            config.apply_head_camera(config.load_all(), bad)
-        except ValueError:
-            continue
-        raise AssertionError(f"model {bad!r} accepted")
+        with pytest.raises(ValueError):
+            config.apply_head_camera(_v("g1_v1"), bad)
+    with pytest.raises(ValueError):                   # the upstream camera does not exist on g1_v2's mount
+        config.apply_head_camera(_v("g1_v2"), "upstream")
+
+
+def test_g1_v2_head_camera_is_the_variant_mount():
+    """g1_v2: head_cam_optical (torso_link) = the variant's camera mount (URDF d435_joint, 26.15 deg pitch) x
+    module_origin x the D435i colour position, ROS optical axes; at the neutral pose the axis is 26.15 deg below
+    horizontal (the standing torso lean of 3.85 deg makes it 30 deg, preview.json)."""
+    import math
+    from g1agent.kinematics.fk import Kinematics
+    cfg = config.apply_head_camera(_v("g1_v2"), "d435i")
+    kin = Kinematics(cfg["robot"]["urdf"])
+    q = kin.q_from_state([], [])
+    T = np.linalg.inv(kin.pose(q, "torso_link")) @ kin.pose(q, cfg["robot"]["head_cam_frame"])
+    from scipy.spatial.transform import Rotation
+    p = 0.4564035994
+    Rm = Rotation.from_euler("y", p).as_matrix()
+    want = np.array([0.0586235, 0.01753, 0.46987]) + Rm @ (np.array([0.0258, -0.0025, 0.02]) + [0.0, 0.015, 0.0])
+    assert np.allclose(T[:3, 3], want, atol=1e-6)
+    assert np.allclose(T[:3, :3], Rm @ np.array([[0, 0, 1.0], [-1.0, 0, 0], [0, -1.0, 0]]), atol=1e-6)
+    z = kin.pose(q, cfg["robot"]["head_cam_frame"])[:3, 2]
+    assert math.degrees(math.asin(-z[2])) == pytest.approx(26.15, abs=1e-3)
 
 
 def test_no_lean_views_without_them():
     """upstream camera: only the upright view is planned; the task-3 prompt has no lean-view sentence (v7 text)."""
     from g1agent.orchestrators import agent_full as af
     tb = bare_toolbox(FakeRobot())
-    tb.cfg = config.apply_head_camera(config.load_all(), "upstream")
+    tb.cfg = config.apply_head_camera(_v("g1_v1"), "upstream")
     tb.body_cmd = {"height_default": 0.74, "height_range": [0.3, 0.8], "rpy_default": [0, 0, 0]}
     lv = tb._lean_levels()
     assert len(lv) == 1 and abs(lv[0]["pitch_cmd"]) < 1e-9
-    tb.cfg = config.apply_head_camera(config.load_all(), "d435i"); tb._leans = None
+    tb.cfg = config.apply_head_camera(_v("g1_v1"), "d435i"); tb._leans = None
     assert len(tb._lean_levels()) > 1
     from g1agent.orchestrators.common import load_prompt
     kw = {"selector": "all", "max_tool_calls": 1, "max_explore_steps": 1, "per_barcode_calls": 1}
-    with_note, _ = load_prompt("task3_agent_full", head_view_note=af.LEAN_VIEW_NOTE, **kw)
-    without, _ = load_prompt("task3_agent_full", head_view_note="", **kw)
+    with_note, _ = load_prompt("task3_agent_full", **kw, **af.task3_prompt_kw(tb, True))
+    without, _ = load_prompt("task3_agent_full", **kw, **af.task3_prompt_kw(tb, False))
     assert "lean the torso back" in with_note and "lean the torso back" not in without

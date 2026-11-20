@@ -321,3 +321,50 @@ def test_overlay_face_text_and_compose():
                           "cams": cams, "markers": [], "ego_text": "", "wrist_text": "",
                           "agent": {"stage": ov.stage, "scan_text": "", "face": ov.face_text()}, "metrics": m})
     assert frame.shape == (1080, 1920, 3)
+
+
+@pytest.mark.parametrize("with_hand", [False, True])
+def test_wrist_panel_with_and_without_hand_camera(with_hand):
+    """g1_v1: the WRIST panel is the scanner image. g1_v2: the D405 fills the panel and the scanner image (with its
+    polygons, scanner pixels) is an inset in the panel's bottom-right corner."""
+    comp = C.Compositor(REC, VIZ["colors"], VIZ["sizes"])
+    gt = _gt()
+    tg = C.gt_targets(gt, STANDOFF)
+    cams = {k: C.fit_fixed_camera(pts, fwd, 60.0, *((1280, 720) if k == "main" else (640, 360)), 0.05)[::-1]
+            for k, (fwd, pts) in C.framing(gt, tg, BODY, 0.78, REC["framing"]).items()}
+    Tr = np.eye(4); Tr[:3, 3] = [-0.7, 0, 0.78]
+    m = C.frame_metrics(gt, {"t_sim": 1.0, "T_world_root": Tr, "T_world_tip": Tr}, tg, tg[0], [])
+    z = lambda h, w, c: np.full((h, w, 3), c, np.uint8)
+    images = {"main": z(720, 1280, 0), "side": z(360, 640, 0), "ego": z(480, 640, 0), "wrist": z(480, 640, (200, 0, 0))}
+    if with_hand:
+        images["hand"] = z(480, 848, (0, 0, 200))
+    frame = comp.compose({"t_sim": 1.0, "hold": None, "images": images, "cams": cams, "markers": [], "ego_text": "",
+                          "wrist_text": "", "wrist_polys": [[[100, 100], [500, 100], [500, 300], [100, 300]]],
+                          "agent": {"stage": None, "scan_text": ""}, "metrics": m})
+    x, y, w, h = REC["panels"]["wrist"]
+    centre = frame[y + h // 2, x + w // 2]
+    corner = frame[y + h - REC["overlay"]["pad_px"] - 5, x + w - REC["overlay"]["pad_px"] - 5]
+    if with_hand:
+        assert tuple(centre) == (0, 0, 200) and tuple(corner) == (200, 0, 0)
+    else:
+        assert tuple(centre) == (200, 0, 0)
+
+
+def test_subset_task_has_no_whole_wall_obs_pose_metrics():
+    """A subset task (scenario target_boxes): the robot works from near its start, so the METRICS root line is n/a (the
+    evaluator's rule), and the frame still composes."""
+    comp = C.Compositor(REC, VIZ["colors"], VIZ["sizes"])
+    gt = _gt()
+    tg = C.gt_targets(gt, STANDOFF)[:1]
+    Tr = np.eye(4); Tr[:3, 3] = [-0.7, 0, 0.78]
+    full = C.frame_metrics(gt, {"t_sim": 1.0, "T_world_root": Tr, "T_world_tip": Tr}, tg, tg[0], [])
+    sub = C.frame_metrics(gt, {"t_sim": 1.0, "T_world_root": Tr, "T_world_tip": Tr}, tg, tg[0], [], subset=True)
+    assert full["root"] is not None and sub["root"] is None and sub["tip"] == full["tip"] and sub["scanned"]["n"] == 1
+    cams = {k: C.fit_fixed_camera(pts, fwd, 60.0, *((1280, 720) if k == "main" else (640, 360)), 0.05)[::-1]
+            for k, (fwd, pts) in C.framing(gt, tg, BODY, 0.78, REC["framing"]).items()}
+    z = lambda h, w: np.zeros((h, w, 3), np.uint8)
+    frame = comp.compose({"t_sim": 1.0, "hold": None, "images": {"main": z(720, 1280), "side": z(360, 640), "ego": z(480, 640),
+                                                                 "wrist": z(480, 640)},
+                          "cams": cams, "markers": [], "ego_text": "", "wrist_text": "", "agent": {"stage": None, "scan_text": ""},
+                          "metrics": sub})
+    assert frame.shape == (1080, 1920, 3)

@@ -1,5 +1,5 @@
-<!-- prompt: task2_agent_full v2 -->
-You control a Unitree G1 humanoid robot holding a barcode scanner in its left hand. Task 2: the robot stands in front of
+<!-- prompt: task2_agent_full v3 -->
+You control a Unitree G1 humanoid robot {robot_text}. Task 2: the robot stands in front of
 the table. Locate the barcode on the {selector} box (as seen from the robot) and place the scanner tip 0.20 m in front of
 the barcode, pointing at it.
 

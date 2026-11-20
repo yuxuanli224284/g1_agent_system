@@ -2,7 +2,7 @@
 colors:                      # RGB 0-1
   red: [0.95, 0.10, 0.10]    # root target (harness)
   blue: [0.15, 0.35, 1.00]   # wrist target from the head camera (harness)
-  purple: [0.70, 0.20, 0.90] # wrist target refined with the wrist camera (harness)
+  purple: [0.70, 0.20, 0.90] # wrist target refined with the hand camera (harness; g1_v1: the scanner imager, g1_v2: D405)
   green: [0.10, 0.85, 0.20]  # ground truth target (simulator, evaluation mode)
   yellow: [1.00, 0.85, 0.05] # actually reached root / wrist pose (simulator, evaluation mode)
 sizes:
@@ -32,6 +32,8 @@ recording:                   # composite episode video
     wrist: [0, 720, 480, 360]
     agent: [480, 720, 800, 360]
     metrics: [1280, 720, 640, 360]
+  hand_panel:                # robot with a hand camera on the scanner hand (g1_v2 D405): it takes the WRIST panel and the
+    scanner_inset_frac: 0.4  # scanner image is an inset of this fraction of the panel width (display choice, hand-picked)
   font: {path: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc, face: Noto Sans CJK SC, size_px: 18, small_px: 15}
   overlay: {line_px: 2, min_dot_px: 4, pad_px: 8, dash_px: 6}   # projected markers keep sizes.* in metres, but at least min_dot_px
   framing:                   # fixed MAIN / SIDE cameras, posed once per episode at record_start (compositor.framing)

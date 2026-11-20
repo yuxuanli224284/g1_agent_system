@@ -3,14 +3,17 @@ they were made.
 
 Task 3 (scan every barcode) adds a scan plan: the ordered barcode ids made by Toolbox.plan_scans, the barcode being
 worked on (current_barcode_id) and the ledger of first reads (`scanned`, one entry per distinct content). The wrist /
-stance slots below always belong to the current barcode; Toolbox.next_barcode clears them when it switches."""
+stance slots below always belong to the current barcode; Toolbox.next_barcode clears them when it switches.
+A task with a target spec (Toolbox.set_scan_targets: e.g. columns 1-2 from the left, rows 2-3 from the top) keeps every
+label it localised in the plan, the ones outside the requested cells with status not_targeted (never scanned), and the
+resolved label grid in target_grid."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 import numpy as np
 
-BARCODE_STATUSES = ("pending", "scanned", "duplicate", "failed")
+BARCODE_STATUSES = ("pending", "scanned", "duplicate", "failed", "unreachable", "unreadable", "not_targeted")
 
 
 @dataclass
@@ -46,6 +49,7 @@ class BarcodeEstimate:
     content: str | None = None      # decoded content once scanned (or the duplicate content)
     order_index: int | None = None  # position in the scan plan
     face_id: int = 0                # stack face it lies on: 0 front, 1 right, 2 back, 3 left (StackModel tour order)
+    grid_cell: dict | None = None   # target grid cell {"column", "row"} (1-based from the spec's edges; None = outside)
 
 
 @dataclass
@@ -68,6 +72,26 @@ class WorldState:
                                              #  "visited": [fid], "multi_face": bool}; None before the first plan
     current_barcode_id: str | None = None
     scanned: list = field(default_factory=list)     # [{"content", "barcode_id", "order_index", "t"}], first read only
+    target_grid: dict | None = None          # with a target spec: {"targets" (scan_order.parse_targets), "edges_seen":
+                                             #  [{"face_id", "edge", "pts" (odom), "clear"}], "face_centres":
+                                             #  [{"face_id", "center" (odom)}], "faces": {fid: resolved grid}}
+
+    def targeted(self, bid) -> bool:
+        """A plan entry that is part of the task (everything but not_targeted)."""
+        return self.barcodes[bid].status != "not_targeted"
+
+    def missing_cells(self) -> list:
+        """Requested target cells not found on any planned side ([] without a target spec)."""
+        if self.target_grid is None:
+            return []
+        return [dict(c, face_id=fid) for fid, g in self.target_grid["faces"].items() for c in g["missing"]]
+
+    def grid_warnings(self) -> list:
+        """Target-grid counts that rest on the labels alone (wall edge not seen clear, a row / column of boxes without
+        labels not excluded) or a label found later that the grid does not hold ([] without a target spec)."""
+        if self.target_grid is None:
+            return []
+        return [f"side {fid}: {w}" for fid, g in self.target_grid["faces"].items() for w in g["warnings"]]
 
     def scan_plan_export(self) -> list:
         r = lambda v: None if v is None else np.round(np.asarray(v, float), 3).tolist()
@@ -77,7 +101,7 @@ class WorldState:
             out.append({"id": bid, "box_id": b.box_id, "order_index": b.order_index, "center_odom": r(b.center),
                         "width_m": None if b.width_m is None else round(float(b.width_m), 4),
                         "width_source": b.width_source, "status": b.status, "fail_reason": b.fail_reason,
-                        "content": b.content, "face_id": int(b.face_id)})
+                        "content": b.content, "face_id": int(b.face_id), "cell": b.grid_cell})
         return out
 
     def summary(self) -> dict:

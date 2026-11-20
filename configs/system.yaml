@@ -18,6 +18,11 @@ sim_server:
                                  # camera, the G1 version before the D435i change, tag g1-v1-upstream-cam).
                                  # $G1_HEAD_CAMERA overrides it per server, so both can run side by side. The agent follows
                                  # the model the robot reports (robot.yaml head_camera).
+  robot_variant: g1_v2           # robot the simulator builds (g1_barcode_sim robot_variants.yaml): g1_v2 (the lab's modified
+                                 # G1: scanner bracket + D405 on the left wrist; default since 2026-11-19, agent model
+                                 # assets/g1_v2_scanner.urdf) | g1_v1 (the original G1 + Dex1 with the handheld scanner).
+                                 # $G1_ROBOT_VARIANT overrides it per server, so both can run side by side. The agent never
+                                 # reads this key: it takes its model from the variant the robot reports (robot.yaml variants)
   rpc_timeout_s: 600             # client receive timeout (a long walk / episode reset can take minutes of wall time)
 vlm_server:
   conda_env: vllm_env            # used by scripts/start_vllm.sh

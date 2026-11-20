@@ -31,13 +31,14 @@ class R:
         return {"status": "ok"}
 
 
-def _tb(workers):
+def _tb(workers, variant="g1_v1"):
     tb = tbmod.Toolbox.__new__(tbmod.Toolbox)
-    tb.cfg = config.apply_head_camera(config.load_all(), "d435i"); tb.ws = WorldState(); tb.markers = {}; tb.task = 3
-    tb.kin = Kinematics(); tb.ik = ArmIK(tb.kin); tb.ik.cfg = dict(tb.ik.cfg, plan_workers=workers)
+    tb.cfg = config.apply_head_camera(config.apply_robot_variant(config.load_all(), variant), "d435i")
+    tb.ws = WorldState(); tb.markers = {}; tb.task = 3; tb.scan_targets = None
+    tb.kin = Kinematics(tb.cfg["robot"]["urdf"]); tb.ik = ArmIK(tb.kin, tb.cfg["robot"]); tb.ik.cfg = dict(tb.ik.cfg, plan_workers=workers)
     tb.robot = R(tb.kin); tb.side = "left"; tb.arm_at_home = True; tb.head = None
     tb._last_label = tb._wrist_detection = None
-    tb.wrist_hfov = so.hfov_from_intrinsics(1087.0, 640.0)
+    tb.scanner_hfov = so.hfov_from_intrinsics(1087.0, 640.0)
     tb.body_cmd = None; tb.base_height_cmd = None; tb._body_model = None; tb.multi_face = False; tb.view_pitch = 0.0; tb._leans = None
     face = {"center": np.array([1.3, 0.0, 0.9]), "normal": np.array([-1.0, 0, 0]), "right": np.array([0, -1.0, 0]),
             "up": np.array([0, 0, 1.0]), "corners": np.array([[1.3, y, z] for y in (-0.2, 0.2) for z in (0.75, 1.05)])}
@@ -48,9 +49,11 @@ def _tb(workers):
     return tb
 
 
-def test_pool_matches_serial():
-    a = _tb(0).plan_stance()
-    tb = _tb(2)
+@pytest.mark.parametrize("variant", ["g1_v1", "g1_v2"])
+def test_pool_matches_serial(variant):
+    """Also checks that the pool workers build the parent's variant (their own config read would be the v1 default)."""
+    a = _tb(0, variant).plan_stance()
+    tb = _tb(2, variant)
     try:
         b = tb.plan_stance()
     finally:

@@ -62,7 +62,8 @@ def _encloses(a, b) -> bool:
 
 
 def detect_label_dino(rgb, roi, box_detector, cfg: dict | None = None) -> list[dict]:
-    """Label localisation with the open-vocabulary detector on the upsampled ROI (head camera). Returns the same
+    """Label localisation with the open-vocabulary detector on the upsampled ROI (head camera; also the hand-camera
+    fallback of Toolbox._detect_wrist). Returns the same
     record format as detect_barcodes (corners = detection box), with cv2 refinement inside the label when possible."""
     c = cfg or config.load("perception")["barcode"]
     h, w = rgb.shape[:2]
@@ -102,27 +103,33 @@ def detect_label_dino(rgb, roi, box_detector, cfg: dict | None = None) -> list[d
     return out
 
 
-def decode_symbol_polygons(rgb, rotation_step_deg: float) -> dict:
+def decode_symbol_polygons(rgb, rotation_step_deg: float, upscale: float = 1) -> dict:
     """Decode every barcode / QR symbol in an image with zbar and return its outline polygons: {content: [polygon
     (Nx2 px, original image), ...]}, one polygon per image rotation that decoded it. zbar reads 1-D codes only within
     ~+-17 deg of an image axis, so the image is decoded at rotations 0, step, ... < 90 deg (canvas enlarged, nothing
     cropped) and the polygons are mapped back (same scheme as the simulator's scanner, g1_barcode_sim env.scan).
-    A polygon that touches the image border belongs to a symbol cut by the image edge: it is not a full outline and
-    is left out."""
+    upscale: the image is first upsampled by this factor (a wide hand camera resolves ~1 px per module, which zbar does
+    not decode at 1x; perception.yaml barcode.wrist_upscale per robot variant); polygons are mapped back to the
+    original pixels. A polygon that touches the image border belongs to a symbol cut by the image edge: it is not a
+    full outline and is left out."""
     from pyzbar import pyzbar
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     H, W = gray.shape
+    s = float(upscale)
+    if s != 1:
+        gray = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+    Hs, Ws = gray.shape
     out: dict = {}
     for ang in np.arange(0.0, 90.0, rotation_step_deg):
-        M = cv2.getRotationMatrix2D((W / 2, H / 2), float(ang), 1.0)
+        M = cv2.getRotationMatrix2D((Ws / 2, Hs / 2), float(ang), 1.0)
         cs, sn = abs(M[0, 0]), abs(M[0, 1])
-        nw, nh = int(np.ceil(H * sn + W * cs)), int(np.ceil(H * cs + W * sn))
-        M[0, 2] += nw / 2 - W / 2
-        M[1, 2] += nh / 2 - H / 2
+        nw, nh = int(np.ceil(Hs * sn + Ws * cs)), int(np.ceil(Hs * cs + Ws * sn))
+        M[0, 2] += nw / 2 - Ws / 2
+        M[1, 2] += nh / 2 - Hs / 2
         Minv = cv2.invertAffineTransform(M)
         for r in pyzbar.decode(cv2.warpAffine(gray, M, (nw, nh), borderValue=255)):
             pts = np.array([(p.x, p.y) for p in r.polygon], float)
-            poly = (Minv[:, :2] @ pts.T).T + Minv[:, 2]
+            poly = ((Minv[:, :2] @ pts.T).T + Minv[:, 2]) / s
             if poly[:, 0].min() < 1 or poly[:, 1].min() < 1 or poly[:, 0].max() > W - 2 or poly[:, 1].max() > H - 2:
                 continue
             out.setdefault(r.data.decode(), []).append(poly)

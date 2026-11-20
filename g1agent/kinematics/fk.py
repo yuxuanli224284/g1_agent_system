@@ -1,4 +1,6 @@
-"""Forward kinematics with pinocchio on the URDF exported from the simulated robot (fixed base = pelvis = root)."""
+"""Forward kinematics with pinocchio on the agent URDF of the robot variant (fixed base = pelvis = root). The URDF is
+always given explicitly: config.apply_robot_variant resolves it from the variant the robot reports (robot.yaml
+variants.<variant>.urdf); there is no default model, so a v1 model can never silently drive a v2 robot."""
 from __future__ import annotations
 
 import os
@@ -10,9 +12,11 @@ from ..common import config
 
 
 class Kinematics:
-    def __init__(self, urdf: str | None = None):
-        rc = config.load("robot")
-        path = urdf or os.path.join(config.ROOT, rc["urdf"])
+    def __init__(self, urdf: str):
+        if not urdf:
+            raise ValueError("Kinematics needs the robot variant's URDF (config.apply_robot_variant -> cfg['robot']['urdf'])")
+        path = urdf if os.path.isabs(urdf) else os.path.join(config.ROOT, urdf)
+        self.urdf = path
         self.model = pin.buildModelFromUrdf(path)
         self.data = self.model.createData()
         self.joint_q_index = {self.model.names[j]: self.model.joints[j].idx_q for j in range(1, self.model.njoints)}

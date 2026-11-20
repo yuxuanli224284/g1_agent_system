@@ -13,13 +13,14 @@ from g1agent.common import config  # noqa: E402
 sys.path.insert(0, config.load("system")["sim_server"]["sim_root"])
 from g1_barcode_sim.testsuite import list_suites, load_suite  # noqa: E402
 
-COLS = ["scenario", "suite", "level", "task", "mode", "factor_name", "factor_value", "harness_success", "eval_success",
+COLS = ["scenario", "suite", "level", "task", "mode", "robot_variant", "target_boxes", "factor_name", "factor_value", "harness_success", "eval_success",
         "d_err_m", "yaw_err_deg", "perception_err_pos_m", "perception_err_yaw_deg", "execution_err_pos_m", "execution_err_yaw_deg",
         "wrist_dist_to_plane_m", "wrist_axis_offset_m", "wrist_angle_err_deg", "head_perception_err_m", "wrist_perception_err_m",
         "execution_err_m",
         # task 3 (merged find + scan all): task-1 phase at the task1_end stage, then the scan phase
         "t1_success", "t1_d_err_m", "t1_yaw_err_deg", "t1_face_in_view_gt",
         "n_gt_barcodes", "n_planned", "n_scan_calls", "n_no_read", "n_scanned_distinct", "scan_recall", "n_wrong_contents",
+        "n_non_target_reads", "n_missing_cells", "n_grid_warnings",
         "n_duplicate_reads", "n_read_not_aimed", "order_ok", "order_ok_scanned", "tip_err_mean_m", "tip_err_max_m",
         "n_placement_ok", "ledger_matches_log",
         "tool_calls", "explore_steps", "llm_calls", "llm_prompt_tokens", "llm_completion_tokens",
@@ -32,6 +33,11 @@ def row(sc, res):
     hf = res.get("harness_finish") or {}
     llm = res.get("llm") or {}
     r = {"scenario": sc["id"], "suite": sc["suite"], "level": sc["level"], "task": res["task"], "mode": res["mode"],
+         "robot_variant": res.get("robot_variant"),
+         "target_boxes": None if res.get("target_boxes") is None else " ".join(res["target_boxes"]),
+         # subset task (harness finish): requested cells without a label / target counts the harness could not verify
+         "n_missing_cells": None if hf.get("missing_cells") is None else len(hf["missing_cells"]),
+         "n_grid_warnings": None if hf.get("grid_warnings") is None else len(hf["grid_warnings"]),
          "factor_name": f.get("name") if isinstance(f, dict) else None, "factor_value": json.dumps(fv) if isinstance(fv, dict) else fv,
          "harness_success": hf.get("success"), "eval_success": m.get("success"), "tool_calls": res["tool_calls"],
          "explore_steps": res["explore_steps"], "llm_calls": llm.get("calls"), "llm_prompt_tokens": llm.get("prompt_tokens"),
@@ -41,6 +47,22 @@ def row(sc, res):
         if k in m and k not in r:     # metric columns only: e.g. metrics["failure"] must not replace the episode-level
             r[k] = m[k]               # failure above (orchestrator error / harness summary come first)
     return r
+
+
+def check_variant(path, res):
+    """A stored result is reused only for the robot variant this run drives (the server's, via the robot info): a
+    g1_v1 result must never stand in for a g1_v2 run of the same --run_name (results written before the variant was
+    recorded have none: they were g1_v1 runs)."""
+    from g1agent.robot.sim_client import SimRobot
+    global _SERVER_VARIANT
+    if _SERVER_VARIANT is None:
+        _SERVER_VARIANT = SimRobot().get_robot_info()["robot_variant"]
+    have = res.get("robot_variant", "g1_v1")
+    if have != _SERVER_VARIANT:
+        raise SystemExit(f"{path} was run on robot variant {have}, the server is {_SERVER_VARIANT}: use another --run_name / --out")
+
+
+_SERVER_VARIANT = None
 
 
 def main():
@@ -89,6 +111,7 @@ def main():
             want = sc["task"] if a.task is None else a.task
             if res["task"] != want:
                 raise SystemExit(f"{rp} was run as task {res['task']}, this run asks for task {want}: use another --run_name")
+            check_variant(rp, res)
         else:
             if prog:
                 prog.progress(i, len(scs), unit="episodes", status=f"{sc['id']}")

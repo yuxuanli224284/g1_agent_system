@@ -10,7 +10,14 @@ export PROGRESS_CLIENT_DIR=$HOME/random/switchyard/clients
 INST_BASE=${INST_BASE:-0}   # first SIM_INSTANCE (ports + 10*i); use a free range when another batch is running
 TAG=${TAG:?set TAG}; IFS=';' read -ra CLIENTS <<< "${CLIENTS:?set CLIENTS}"; N=${#CLIENTS[@]}
 GPU=${GPU:?set GPU (physical index)}
-PER_JOB_MIB=5000      # measured: one G1BarcodeEnv instance holds 4767 MiB on this card (2026-11-06)
+# GPU memory of one sim server, by the robot variant the servers build ($G1_ROBOT_VARIANT, else system.yaml robot_variant,
+# as scripts/start_sim_server.sh / sim_server.py): measured on this card, rounded up to the next 1000 MiB
+VARIANT=${G1_ROBOT_VARIANT:-$(python3 -c "import yaml;print(yaml.safe_load(open('configs/system.yaml'))['sim_server']['robot_variant'])")}
+case "$VARIANT" in
+  g1_v1) PER_JOB_MIB=5000 ;;  # measured: one g1_v1 G1BarcodeEnv instance holds 4767 MiB (2026-11-06)
+  g1_v2) PER_JOB_MIB=6000 ;;  # measured: one g1_v2 sim server held 5680 MiB on GPU 7 (2026-11-19; + the D405 render)
+  *) echo "ABORT no measured GPU memory for robot variant '$VARIANT'"; exit 2 ;;
+esac
 HEADROOM_MIB=4096     # kept free for the other tenants of GPU 7 at all times (our choice, reported to the user)
 LOGD=runs/batch_$TAG; mkdir -p $LOGD
 q() { nvidia-smi -i $GPU --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | tr -d ' '; }
@@ -18,7 +25,7 @@ UUID=$(nvidia-smi -i $GPU --query-gpu=uuid --format=csv,noheader)
 holders() { nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader | grep "$UUID" | cut -d, -f1 | sort; }
 IFS=, read used total <<< "$(q)"; free=$((total - used)); need=$((N * PER_JOB_MIB + HEADROOM_MIB))
 holders > $LOGD/holders_before.txt
-echo "PREFLIGHT GPU$GPU free=${free} need=${need} instances=$N holders_before=$(tr '\n' ' ' < $LOGD/holders_before.txt)"
+echo "PREFLIGHT GPU$GPU variant=$VARIANT per_job=${PER_JOB_MIB} free=${free} need=${need} instances=$N holders_before=$(tr '\n' ' ' < $LOGD/holders_before.txt)"
 [ "$free" -lt "$need" ] && { echo "ABORT not enough free memory on GPU$GPU"; exit 2; }
 
 SERVERS=()

@@ -11,7 +11,10 @@ Pieces
 - frame_metrics(): root vs GT task-1 obs pose and scanner tip vs the GT target point of the current barcode, in the
   target-face frame (n = outward face normal, towards the robot; l = n x z = the robot's left; z = up), plus the
   scanned count (distinct decoded contents that are GT barcodes).
-- Compositor: draws the 1920x1080 layout (viz.yaml recording.panels) with 2-D projected markers and PIL (CJK) text.
+- Compositor: draws the 1920x1080 layout (viz.yaml recording.panels) with 2-D projected markers and PIL (CJK) text. A
+  robot with a hand camera on the scanner hand (g1_v2: the left D405) shows it in the WRIST panel, with the scanner
+  imager's view (and its pyzbar polygons, in scanner pixels) as an inset in that panel's corner; g1_v1 keeps the
+  scanner image as the panel (user decision 2026-11-19).
 - H264Writer: raw RGB piped to an ffmpeg binary (libx264, yuv420p, fragmented MP4 so a killed run stays playable).
 """
 from __future__ import annotations
@@ -238,22 +241,26 @@ def nearest_label_to_target(targets: list[dict], p) -> dict | None:
 
 
 def frame_metrics(gt: dict, fs: dict, targets: list[dict], current: dict | None, scan_log: list[dict],
-                  task1_end: dict | None = None) -> dict:
+                  task1_end: dict | None = None, subset: bool = False) -> dict:
     """Numbers for the METRICS panel. Root and tip differences in the target-face frame (see module doc), actual minus
     GT. The root is the articulation root body (G1: pelvis); the GT obs pose is a ground pose (x, y, yaw), so the root
     comparison uses the pelvis' ground projection and has no z component.
     task1_end: the stage state {"t_sim", "actual": {"T_world_root"}} once the task-1 phase has ended. The robot then
     walks on to its scan stances, so a live root-vs-obs-pose difference no longer measures anything: the root numbers
-    are frozen at the task-1 end (out["root"]["frozen_t"] = its sim time)."""
-    n, l, z = face_axes(gt["target_face"]["normal"])
-    ob = gt["task1_gt_obs_pose"]
-    Tr = np.asarray((task1_end["actual"] if task1_end is not None else fs)["T_world_root"], float)
-    d = Tr[:3, 3] - np.asarray(ob["pos"], float)
-    yaw = math.atan2(Tr[1, 0], Tr[0, 0])
-    out = {"t_sim": float(fs["t_sim"]),
-           "root": {"dn": float(d @ n), "dl": float(d @ l), "dxy": float(math.hypot(d[0], d[1])),
-                    "dyaw_deg": math.degrees((yaw - ob["yaw"] + math.pi) % (2 * math.pi) - math.pi),
-                    "frozen_t": None if task1_end is None else float(task1_end["t_sim"])},
+    are frozen at the task-1 end (out["root"]["frozen_t"] = its sim time).
+    subset: a subset task (scenario target_boxes): the robot works from near its start pose, the whole-wall GT obs pose
+    is not its goal, so out["root"] is None (n/a, as in the evaluator)."""
+    root = None
+    if not subset:
+        n, l, z = face_axes(gt["target_face"]["normal"])
+        ob = gt["task1_gt_obs_pose"]
+        Tr = np.asarray((task1_end["actual"] if task1_end is not None else fs)["T_world_root"], float)
+        d = Tr[:3, 3] - np.asarray(ob["pos"], float)
+        yaw = math.atan2(Tr[1, 0], Tr[0, 0])
+        root = {"dn": float(d @ n), "dl": float(d @ l), "dxy": float(math.hypot(d[0], d[1])),
+                "dyaw_deg": math.degrees((yaw - ob["yaw"] + math.pi) % (2 * math.pi) - math.pi),
+                "frozen_t": None if task1_end is None else float(task1_end["t_sim"])}
+    out = {"t_sim": float(fs["t_sim"]), "root": root,
            "tip": None, "min_gap": fs.get("min_gap"), "pelvis_z": float(np.asarray(fs["T_world_root"], float)[2, 3]),
            "height_cmd": fs.get("height_cmd")}
     if current is not None and "T_world_tip" in fs:
@@ -527,7 +534,7 @@ class Compositor:
 
     # ---------------------------------------------------------------- main entry
     def compose(self, c: dict) -> np.ndarray:
-        """c: {"t_sim", "hold" (None | "llm" | "detection" | "scan"), "images": {main, side, ego, wrist},
+        """c: {"t_sim", "hold" (None | "llm" | "detection" | "scan"), "images": {main, side, ego, wrist, hand (optional)},
         "cams": {main: (K, T), side: (K, T)}, "markers": [...], "head_det": None | {"boxes", "labels"},
         "target_box": id | None, "ego_text", "wrist_polys": None | [[[u, v], ...]], "wrist_text",
         "agent": {"stage", "llm", "tool", "scan_text", "face" (optional OverlayState.face_text())},
@@ -557,12 +564,27 @@ class Compositor:
                 q = np.asarray(lb["corners_px"], float) * s + [ox, oy]
                 cv2.polylines(panel, [q.round().astype(np.int32)], True, self.col["purple"], lw, cv2.LINE_AA)
         canvas[y:y + h, x:x + w] = panel
-        # WRIST: scanner camera + pyzbar polygons of a decode made on this frame
+        # WRIST: scanner camera + pyzbar polygons of a decode made on this frame (the polygons are scanner pixels: they
+        # are drawn on the scanner image only). With a hand camera (D405) the panel shows it and the scanner image
+        # becomes an inset in the bottom-right corner (where the D405 sees the scanner body)
         x, y, w, h = P["wrist"]
-        panel, s, ox, oy = fit_into(c["images"]["wrist"], w, h)
+        hand = c["images"].get("hand")
+        sc_img = c["images"]["wrist"]
+        if hand is None:
+            panel, s, ox, oy = fit_into(sc_img, w, h)
+            sc_panel = panel
+        else:
+            panel, _, _, _ = fit_into(hand, w, h)
+            iw = int(round(w * self.cfg["hand_panel"]["scanner_inset_frac"]))
+            ih = int(round(iw * sc_img.shape[0] / sc_img.shape[1]))
+            sc_panel, s, ox, oy = fit_into(sc_img, iw, ih)
         for poly in c.get("wrist_polys") or []:
             q = np.asarray(poly, float) * s + [ox, oy]
-            cv2.polylines(panel, [q.round().astype(np.int32)], True, self.col["green"], lw + 1, cv2.LINE_AA)
+            cv2.polylines(sc_panel, [q.round().astype(np.int32)], True, self.col["green"], lw + 1, cv2.LINE_AA)
+        if hand is not None:
+            ax, ay = w - iw - self.ov["pad_px"], h - ih - self.ov["pad_px"]
+            panel[ay:ay + ih, ax:ax + iw] = sc_panel
+            cv2.rectangle(panel, (ax - 1, ay - 1), (ax + iw, ay + ih), (255, 255, 255), 1)
         canvas[y:y + h, x:x + w] = panel
 
         img = Image.fromarray(canvas)
@@ -578,10 +600,13 @@ class Compositor:
             dr.text((bx, by), txt, font=self.small, fill=col)
         hold = {"llm": "  [冻结: LLM 思考]", "detection": "  [冻结: 检测结果]", "scan": "  [冻结: 扫码]"}.get(c.get("hold"), "")
         caption("main", f"MAIN 固定观察相机   t_sim = {c['t_sim']:.2f} s{hold}   "
-                        "绿 GT  黄 实际  红 根目标  蓝 腕目标(头)  紫 腕目标(腕)")
+                        "绿 GT  黄 实际  红 根目标  蓝 腕目标(头)  紫 腕目标(手部相机)")
         caption("side", "SIDE 侧面相机 (机器人-箱面间隙)")
         caption("ego", "EGO 头部相机   " + c["ego_text"])
-        caption("wrist", "WRIST 扫码相机   " + c["wrist_text"])
+        if hand is None:
+            caption("wrist", "WRIST 扫码相机   " + c["wrist_text"])
+        else:
+            caption("wrist", "HAND 左腕 D405 (右下小图: 扫码器视野)   " + c["wrist_text"])
 
         # AGENT panel
         x, y, w, h = P["agent"]
@@ -613,11 +638,14 @@ class Compositor:
         r = m["root"]
         items = [("METRICS (目标面坐标系: n 法向朝机器人, l 机器人左, z 上; 实际 - GT)", self.small, white),
                  (f"骨盆高度 pelvis z {m['pelvis_z']:.3f} m" + (f"  (高度指令 {m['height_cmd']:.2f})" if m.get("height_cmd") is not None else ""),
-                  self.small, white),
-                 ((f"根(pelvis 地面投影) vs GT 观察位姿 — 任务1结束时 (t_sim {r['frozen_t']:.1f} s, 已冻结):"
-                   if r.get("frozen_t") is not None else "根(pelvis 地面投影) vs GT 观察位姿 — 实时:"), self.small, white),
-                 (f"    dn {r['dn']:+.3f}  dl {r['dl']:+.3f} m   |dxy| {r['dxy']:.3f} m   dyaw {r['dyaw_deg']:+.1f}°",
-                  self.font, white)]
+                  self.small, white)]
+        if r is None:                   # subset task: no whole-wall observation pose (n/a, as in the evaluator)
+            items.append(("根 vs GT 观察位姿: n/a (子集任务: 机器人在起点附近工作)", self.small, white))
+        else:
+            items += [((f"根(pelvis 地面投影) vs GT 观察位姿 — 任务1结束时 (t_sim {r['frozen_t']:.1f} s, 已冻结):"
+                        if r.get("frozen_t") is not None else "根(pelvis 地面投影) vs GT 观察位姿 — 实时:"), self.small, white),
+                      (f"    dn {r['dn']:+.3f}  dl {r['dl']:+.3f} m   |dxy| {r['dxy']:.3f} m   dyaw {r['dyaw_deg']:+.1f}°",
+                       self.font, white)]
         tp = m["tip"]
         if tp:
             items += [(f"扫码头 vs GT 目标点 [{tp['content']}] (d={tp['d_gt']:.3f} m):", self.small, white),
@@ -626,7 +654,7 @@ class Compositor:
         else:
             items += [("扫码头 vs GT 目标点: - (当前条码未知)", self.small, white)]
         sc = m["scanned"]
-        items.append((f"已扫描 scanned: {sc['k']}/{sc['n']}" + (f"   非GT: {', '.join(sc['not_gt'])}" if sc["not_gt"] else ""),
+        items.append((f"已扫描 scanned: {sc['k']}/{sc['n']}" + (f"   非目标: {', '.join(sc['not_gt'])}" if sc["not_gt"] else ""),
                       self.font, self.col["green"]))
         g = m.get("min_gap")
         items.append((f"最小间隙 min gap: {g['gap']:.3f} m ({g['body']} ↔ {g['obstacle']})" if g else "最小间隙 min gap: -",
