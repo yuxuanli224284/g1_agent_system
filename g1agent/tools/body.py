@@ -3,6 +3,7 @@
 - Squat levels: measured GR00T body-command calibration (configs/robot.yaml body.calibration): for each commanded base
   height, the settled pelvis height and pitch and the full joint state, measured in Isaac standing still with the arms
   at home (g1_barcode_sim scripts/controller_compare/body_motion_eval.py --parts squat). Only measured levels are planned.
+  A level the robot has been at in this episode is planned with the state measured there (BodyModel.observe).
 - Robot geometry: the robot's own collision points per link (hull vertices / sphere centres + radii, link frames) from
   the robot port (get_robot_geometry): CAD knowledge, not ground truth. Used for
     * clearance to the known box faces of every robot point (knees move ~0.3 m forward of the pelvis in a deep squat)
@@ -70,9 +71,40 @@ class BodyModel:
         org = [kin.pose(q_n, f)[:3, 3] for f in chain]
         self.shoulder_frame = chain[0]
         self.arm_reach = float(sum(np.linalg.norm(b - a) for a, b in zip(org[:-1], org[1:])))
-        self.levels = sorted(calibration, key=lambda c: -c["height_cmd"])
-        if not self.levels:
+        self.calibration = sorted(calibration, key=lambda c: -c["height_cmd"])
+        if not self.calibration:
             raise ValueError("empty body calibration")
+        self.measured = {}                            # height_cmd of a calibrated level -> its state measured here
+
+    @property
+    def levels(self) -> list:
+        """The planned body levels, highest first: per calibrated height command, the state the robot was measured in at
+        that command in this episode (observe), else the calibration. The calibration of a variant can be another
+        robot's (robot.yaml: g1_v2 uses the g1_v1 squat levels as an approximation); 2026-11-20 g1_v2 rule run: the
+        pelvis settled 11-12 mm (0.70, 6 arrivals), 20-22 mm (0.45, 7) and 22 mm (0.40, 1) above the calibrated height,
+        reproducibly (+-1 mm per level), and stances planned on the calibration failed IK after the squat."""
+        return [self.measured.get(c["height_cmd"], c) for c in self.calibration]
+
+    def observe(self, height_cmd: float, T_odom_root, q_full) -> dict | None:
+        """Record the state the robot settled in at a calibrated height command (the calibration's conditions: standing
+        still after the ramp and hold, torso upright, arms at home; the caller checks them): pelvis height and tilt from
+        the odometry pose (it carries the IMU's roll / pitch and the height; only x, y, yaw drift) and the leg / waist
+        joints from the joint state. From then on that level is planned with it (levels). None for a command that is
+        not a calibrated level (it is never planned)."""
+        c = next((c for c in self.calibration if abs(c["height_cmd"] - float(height_cmd)) < 1e-9), None)
+        if c is None:
+            return None
+        T = np.asarray(T_odom_root, float)
+        yaw = math.atan2(T[1, 0], T[0, 0])
+        cz, sz = math.cos(yaw), math.sin(yaw)
+        R_tilt = np.array([[cz, sz, 0.0], [-sz, cz, 0.0], [0.0, 0.0, 1.0]]) @ T[:3, :3]     # Rz(-yaw) R: pitch and roll
+        q = np.asarray(q_full, float)
+        m = {"height_cmd": c["height_cmd"], "pelvis_z": float(T[2, 3]),
+             "pelvis_pitch_deg": math.degrees(math.asin(max(-1.0, min(1.0, -R_tilt[2, 0])))),
+             "R_tilt": R_tilt, "q": {n: float(q[self.kin.joint_q_index[n]]) for n in c["q"] if n in self.kin.joint_q_index},
+             "measured": True}
+        self.measured[c["height_cmd"]] = m
+        return m
 
     @staticmethod
     def _link_chain(kin, tip: str, root_link: str) -> list:
@@ -100,10 +132,11 @@ class BodyModel:
         return q
 
     def T_root(self, x, y, yaw, level: dict, z_ground: float = 0.0):
-        """Pelvis pose (odom) for a pelvis ground position (x, y), yaw, at a level: measured height and pitch."""
+        """Pelvis pose (odom) for a pelvis ground position (x, y), yaw, at a level: its height and tilt (a level measured
+        in this episode: its full tilt, roll included; a calibrated one: its pitch)."""
         from ..common.transforms import T_from_xy_yaw
         T = T_from_xy_yaw(x, y, yaw, z_ground + level["pelvis_z"])
-        T[:3, :3] = T[:3, :3] @ Ry(math.radians(level["pelvis_pitch_deg"]))
+        T[:3, :3] = T[:3, :3] @ (level["R_tilt"] if "R_tilt" in level else Ry(math.radians(level["pelvis_pitch_deg"])))
         return T
 
     def foot_shift(self, level: dict, standing: dict, q_base):

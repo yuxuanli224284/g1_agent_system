@@ -190,8 +190,9 @@ PHASE2_LOOP_LAYOUT = """- Phase 2: you never choose the order. Each plan entry o
   view the whole face): move_arm("home"), compute_wrist_target -> plan_stance -> approach -> move_arm("pre") ->
   refine_with_wrist -> move_arm("final") -> refine_with_wrist -> move_arm("final") -> check_wrist_placement -> scan.
   search_cell recording "no_label" (the whole face was seen and holds no label) is a result: move_arm("home"),
-  next_barcode. search_cell partial (the face not fully seen, or a label at its border not seen whole): move_arm("home"),
-  compute_wrist_target -> plan_stance -> approach -> search_cell again (once), then next_barcode. An entry of kind label
+  next_barcode. search_cell partial (the face not fully seen, or a label at its border not seen whole) or failing with
+  "hand-camera view not reachable from this stance": move_arm("home"), compute_wrist_target -> plan_stance -> approach
+  -> search_cell again (once), then next_barcode. An entry of kind label
   (a second label search_cell added): compute_wrist_target -> plan_stance -> move_arm("home") -> approach -> move_arm("pre")
   -> refine_with_wrist -> move_arm("final") -> refine_with_wrist -> move_arm("final") -> check_wrist_placement -> scan."""
 # sentences appended to the effective tool texts in a wall-layout episode (run_agent_full)

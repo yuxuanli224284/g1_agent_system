@@ -151,32 +151,54 @@ def fit_front_face(depth, K, T_root_cam, bbox, cfg: dict | None = None, sigma_co
             "inlier_frac": float(len(inl) / len(P)), "rms": float(np.sqrt(np.mean(((inl - cen) @ n) ** 2)))}
 
 
-ON, BEHIND, FRONT = 1, 2, 3          # wall_extent pixel labels
+ON, BEHIND, FRONT, FLOOR = 1, 2, 3, 4   # wall_extent pixel labels
 
 
 def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None = None, sigma_coeff: float = 0.0,
-                min_structure_px: int = 0, fov_margin_frac: float = 0.0) -> dict:
+                min_structure_px: int = 0, fov_margin_frac: float = 0.0, floor_z: float | None = None) -> dict:
     """Lateral extent and side edges of a box wall on a known front plane, from one head depth frame (wall layout task,
     Toolbox._wall_extent). plane: {"normal" (odom, unit, horizontal, pointing to the camera), "right" (odom, the robot's
     right along the plane), "point" (odom, on the plane)}; s = (P - point) . right.
     1. Every pixel (full resolution) is back-projected to odom and labelled by its signed distance d to the plane: "on"
        (|d| < tol, the plane-fit tolerance max(inlier_dist, inlier_sigmas x sigma_coeff x z^2)), "behind" (d <= -tol, or
        no valid depth: an occlusion band or a surface out of range) or "front" (d >= tol).
-    2. The "on" mask is opened at the matching-window scale (min_structure_px) and its largest 8-connected component is
+    2. The floor is not the wall: the floor strip along the wall's base lies on the plane too and runs on beyond the
+       wall's ends (2026-11-20 af2 obs pose: seen [-0.33, 1.84] m for a 1.2 m wall). As fit_front_face removes the
+       support plane first, pixels within their tolerance of the floor height floor_z (odom; the caller's floor, None =
+       no removal) are never "on": they are labelled "floor" (they lie within tol of the plane too, so the sign of d
+       there is noise, not a side: 2026-11-20 review, a squat view with stereo noise took the wall's base, where noise
+       put the floor-band pixels behind the plane, for a 3-row right edge 0.71 m inside the true end). The floor's height and not a fitted support
+       plane: from the observation pose the floor in front of the wall is often out of view (the floor in the image
+       lies beyond the wall's ends), and a RANSAC over the whole image rarely draws three floor points.
+    3. The "on" mask is opened at the matching-window scale (min_structure_px) and its largest 8-connected component is
        the wall (the rules of fit_front_face).
-    3. Per image row of the component, its leftmost / rightmost pixel is an EDGE OBSERVATION when (a) it lies strictly
-       inside the image margin (fov_margin_frac of the width; otherwise the image cut the run) and (b) walking outward
-       from it, the first pixel that is not "on" is "behind" (the depth step behind the wall's side, or the stereo
-       occlusion band there), not "front" (something in front of the wall hides its end). No tolerance: containment and
-       sign tests only.
-    4. Its position: the ray through the pixel boundary (x - 0.5 / x + 0.5, row centre) intersected with the plane: the
-       pixel position of the step (~2 mm per px at 1.3 m), not the noisy depth values.
-    5. Per side over the edge rows: median s (the floor crease along the base widens a few rows: the median drops them),
-       MAD, number of rows and the z range.
+    4. Per image row of the component, its leftmost / rightmost pixel is an EDGE OBSERVATION when (a) it lies strictly
+       inside the image margin (fov_margin_frac of the width; otherwise the image cut the run: "cut"), (b) walking
+       outward from it, the first pixel that is not "on" is "behind" (the depth step behind the wall's side, or the
+       stereo occlusion band there), not "front" (something in front of the wall hides its end: "front") and not
+       "floor" (the run ends at the wall's base: "floor"), and (c) the
+       component's boundary there runs vertically: the same side's row ends k = max(1, min_structure_px) rows above and
+       below exist and |s_below - s_above| < |z_below - z_above| (on the plane), else "boundary". The wall's outline on
+       its plane is vertical at the sides and horizontal at the top and the base, so (c) is the halfway rule between the
+       two (45 deg); without it a row that ends where the (slightly slanted) top edge crosses it passed (a)-(b) with the
+       box tops / room wall behind it: 2026-11-20, from the start pose with the wall top in view, false side edges at
+       z 1.25 m (s -0.33 and -0.42 m on a wall whose left edge is at -0.60). k: the stereo matching window, the scale
+       below which the depth resolves no structure (rows closer than it are not independent).
+    5. Its position: the ray through the pixel boundary (x - 0.5 / x + 0.5, row centre) intersected with the plane: the
+       pixel position of the step (~2 mm per px at 1.3 m), not the noisy depth values. With the camera beyond that end
+       (its s outside the edge's) the stack's side face can be in view there; the run of "on" pixels then goes on over
+       it down to d = -tol (step 1's labelling threshold): the boundary ray meets the side face where it crosses the
+       plane d = -tol (the boundary pixel's tolerance), at the corner's s; on d = 0 it lay outward by
+       tol x (s_cam - s_edge) / d_cam (2026-11-20 review: 5.5 mm at the i=151 squat view, 6-26 mm from 0.35-0.85 m, all
+       re-anchored). The run ended on the side face when the next non-"on" pixel is a measured point ON THE SIDE FACE:
+       its s within its own tolerance (step 1's rule, on the side face's plane: s = that crossing) of the crossing.
+       Otherwise (no side face in view, the run ends at invalid depth, or on a surface farther back) the boundary is
+       the depth step at the corner itself: d = 0.
+    6. Per side over the edge rows: median s, MAD, number of rows and the z range.
     Returns {"left" | "right": {"s", "mad", "n_rows", "z_range"} or None, "seen": [s_min, s_max] over every component
-    row (None without a component), "rejected": {"left" | "right": {"cut", "front"}} (rows whose end was not an edge),
-    "rows": [[row, s_left, s_right, left is edge, right is edge]] (log only)}. Left / right as seen from the camera side
-    (the plane's right axis)."""
+    row (None without a component), "rejected": {"left" | "right": {"cut", "front", "floor", "boundary"}} (rows whose
+    end was not an edge), "floor_px_removed" (number of "on" pixels removed as floor; None without floor_z), "rows":
+    [[row, s_left, s_right, left is edge, right is edge]] (log only)}. Left / right as seen from the camera side (the plane's right axis)."""
     c = cfg or config.load("perception")["plane_fit"]
     H, W = depth.shape
     T_odom_cam = np.asarray(T_odom_root, float) @ np.asarray(T_root_cam, float)
@@ -196,12 +218,17 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
     lab[d <= -tol] = BEHIND
     lab[np.abs(d) < tol] = ON
     lab[~valid] = BEHIND
+    n_floor = None
+    if floor_z is not None:
+        fl = valid & (lab == ON) & (np.abs(P[..., 2] - float(floor_z)) < tol)
+        lab[fl] = FLOOR
+        n_floor = int(fl.sum())
     on = (lab == ON).astype(np.uint8)
     k = max(1, int(min_structure_px))
     if k > 1:
         on = cv2.morphologyEx(on, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
-    out = {"left": None, "right": None, "seen": None, "rejected": {"left": {"cut": 0, "front": 0},
-                                                                    "right": {"cut": 0, "front": 0}}, "rows": []}
+    out = {"left": None, "right": None, "seen": None, "floor_px_removed": n_floor, "rows": [],
+           "rejected": {sd: {"cut": 0, "front": 0, "floor": 0, "boundary": 0} for sd in ("left", "right")}}
     n_lab, comp = cv2.connectedComponents(on, connectivity=8)
     if n_lab < 2:
         return out
@@ -217,32 +244,63 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
     mx = fov_margin_frac * W
     cam = t
 
-    def s_at(px, py):
+    s_cam = float((cam - p0) @ right)
+
+    def s_at(px, py, d_off=0.0):
+        """s and z where the ray through pixel (px, py) meets the plane shifted to signed distance d_off."""
         dr = R @ np.array([(px - Kf[0, 2]) / Kf[0, 0], (py - Kf[1, 2]) / Kf[1, 1], 1.0])
         den = float(dr @ n)
         if abs(den) < 1e-9:
             return None, None
-        tt = float((p0 - cam) @ n) / den
+        tt = (float((p0 - cam) @ n) + d_off) / den
         if tt <= 0:
             return None, None
         Q = cam + tt * dr
         return float((Q - p0) @ right), float(Q[2])
 
-    samples = {"left": [], "right": []}
-    s_all = []
-    for y in np.flatnonzero(comp.any(axis=1)):
+    # row ends of the component: {side: {row: (x, step, s, z)}}
+    ends = {"left": {}, "right": {}}
+    rows = np.flatnonzero(comp.any(axis=1))
+    for y in rows:
         xs = np.flatnonzero(comp[y])
-        ends = {}
         for end, x, step in (("lo", int(xs[0]), -1), ("hi", int(xs[-1]), 1)):
             side = ("left" if end == "lo" else "right") if x_is_right else ("right" if end == "lo" else "left")
             s, zq = s_at(x + 0.5 * step, float(y))
-            inside = x > mx if end == "lo" else x < W - 1 - mx
-            beyond = lab[y, x + step::step] if end == "hi" else lab[y, x - 1::-1] if x > 0 else lab[y, :0]
+            if s is not None and (s_cam > s if side == "right" else s_cam < s):
+                # the side face at this end faces the camera: does the run end on it (the next non-"on" pixel is a
+                # measured point on the side face)? Then the boundary lies at d = -tol (step 5)
+                bx = np.arange(x + step, W) if step > 0 else np.arange(x - 1, -1, -1)
+                nxt = bx[lab[y, bx] != ON]
+                s1, z1 = s_at(x + 0.5 * step, float(y), -float(tol[y, x]))
+                if nxt.size and s1 is not None and valid[y, nxt[0]] \
+                        and abs(float((P[y, nxt[0]] - p0) @ right) - s1) < tol[y, nxt[0]]:
+                    s, zq = s1, z1
+            ends[side][int(y)] = (x, step, s, zq)
+
+    def vertical(side, y):
+        a, b = ends[side].get(y - k), ends[side].get(y + k)
+        if a is None or b is None or a[2] is None or b[2] is None:
+            return False
+        return abs(b[2] - a[2]) < abs(b[3] - a[3])
+
+    samples = {"left": [], "right": []}
+    s_all = []
+    for y in rows:
+        y = int(y)
+        row = {}
+        for side in ("left", "right"):
+            x, step, s, zq = ends[side][y]
+            inside = x > mx if step < 0 else x < W - 1 - mx
+            beyond = lab[y, x + step::step] if step > 0 else lab[y, x - 1::-1] if x > 0 else lab[y, :0]
             first = beyond[beyond != ON]
             if not inside or first.size == 0:
                 kind = "cut"
             elif first[0] == FRONT:
                 kind = "front"
+            elif first[0] == FLOOR:
+                kind = "floor"
+            elif not vertical(side, y):
+                kind = "boundary"
             else:
                 kind = "edge"
             if s is not None:
@@ -251,9 +309,8 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
                     samples[side].append((s, zq))
             if kind != "edge":
                 out["rejected"][side][kind] += 1
-            ends[side] = (s, kind == "edge")
-        out["rows"].append([int(y), ends.get("left", (None,))[0], ends.get("right", (None,))[0],
-                            ends.get("left", (None, False))[1], ends.get("right", (None, False))[1]])
+            row[side] = (s, kind == "edge")
+        out["rows"].append([y, row["left"][0], row["right"][0], row["left"][1], row["right"][1]])
     if s_all:
         out["seen"] = [float(min(s_all)), float(max(s_all))]
     for side in ("left", "right"):
@@ -264,4 +321,3 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
             out[side] = {"s": med, "mad": float(np.median(np.abs(S - med))), "n_rows": int(len(S)),
                          "z_range": [float(Z.min()), float(Z.max())]}
     return out
-

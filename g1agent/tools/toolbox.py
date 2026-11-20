@@ -236,8 +236,17 @@ class Toolbox:
             return fail(f"body command: {r['status']}: {r['reason']}")
         self.base_height_cmd = float(height)
         self.view_pitch = 0.0
-        return ok({"height_cmd": float(height), "standing": self._standing(), "pelvis_z": r.get("pelvis_z"),
-                   "tilt_deg": r.get("tilt_deg")}, r["reason"])
+        res = ok({"height_cmd": float(height), "standing": self._standing(), "pelvis_z": r.get("pelvis_z"),
+                  "tilt_deg": r.get("tilt_deg")}, r["reason"])
+        # the state settled in at a calibrated level, in the calibration's conditions (standing still after the ramp and
+        # the calibration hold, torso upright, arms at home), replaces that level's calibration in stance planning
+        # (BodyModel.levels: the planned body pose is the one the arm IK will run on after the squat)
+        m = self._body().observe(height, self._odom(), self._q()) if self.arm_at_home else None
+        if m is None:
+            return res
+        return with_diagnostics(res, {"body_level_measured": {
+            "pelvis_z": m["pelvis_z"], "pelvis_pitch_deg": m["pelvis_pitch_deg"],
+            "waist": {k: v for k, v in m["q"].items() if k.startswith("waist")}}})
 
     # ================================================================== head views (torso lean)
     # The D435i head camera looks ~52 deg down on g1_v1 (~30 deg on g1_v2's raised mount) with a 42 deg vertical field of
@@ -400,6 +409,14 @@ class Toolbox:
             self.head["ir_left"] = o["ir_left"]
         return self.head
 
+    def _fit_face_odom(self, h, bbox) -> dict:
+        """fit_front_face on head frame h, in odom (gravity-aligned; the results are odom): its near-vertical test (and
+        the support plane's) is about its frame's z, and a squatted root is pitched (base_height 0.45 and below:
+        20.7-26 deg, beyond max_normal_tilt_deg 20: a vertical face failed the test in the root frame; 2026-11-20 rule
+        run i=151). The simulator's odometry carries the true roll / pitch."""
+        return fit_front_face(h["depth"], h["K"], np.asarray(h["T_odom_root"], float) @ np.asarray(h["T_root_cam"], float),
+                              bbox, sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px())
+
     def _min_structure_px(self):
         """Smallest surface the head depth resolves (px): the stereo matching window; 0 for delivered depth."""
         hd = self.cfg["perception"]["head_depth"]
@@ -488,7 +505,7 @@ class Toolbox:
             # whole image, or two floor patches); a plain count, or the detection boxes' sides inside the image, kept
             # the floor view.
             def faces_in(hh, ds):
-                return sum(fit_front_face(hh["depth"], hh["K"], hh["T_root_cam"], d["bbox"], sigma_coeff=hh["depth_sigma_coeff"], min_structure_px=self._min_structure_px())["status"] == "ok" for d in ds)
+                return sum(self._fit_face_odom(hh, d["bbox"])["status"] == "ok" for d in ds)
             searched = [{"pitch": self.view_pitch, "n": len(dets), "faces": faces_in(h, dets)}]
             best = ((searched[0]["faces"], len(dets)), self.view_pitch, h, dets)
             for lv in self._lean_levels():
@@ -693,12 +710,12 @@ class Toolbox:
         if box_id not in self.ws.boxes:
             return fail(f"unknown box {box_id!r}; call detect_boxes", {"known": list(self.ws.boxes)})
         h = self.head
-        r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], self.ws.boxes[box_id].bbox, sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px())
+        r = self._fit_face_odom(h, self.ws.boxes[box_id].bbox)
         if r["status"] != "ok":
             return fail(r["reason"], {"n_valid": r.get("n_valid")})
         T = h["T_odom_root"]
-        face = {"center": apply(T, r["center"]), "normal": rotate(T, r["normal"]), "right": rotate(T, r["right"]),
-                "up": rotate(T, r["up"]), "corners": apply(T, r["corners"]), "size": r["size"], "t": h["t"]}
+        face = {"center": r["center"], "normal": r["normal"], "right": r["right"], "up": r["up"], "corners": r["corners"],
+                "size": r["size"], "t": h["t"]}
         self.ws.boxes[box_id].face = face
         d = float(geo.horizontal_distance_to_plane(T[:3, 3], face["center"], face["normal"]))
         return ok({"box_id": box_id, "center_odom": face["center"], "normal_odom": face["normal"], "size_wh": r["size"],
@@ -986,6 +1003,8 @@ class Toolbox:
                 if r["status"] != "ok":
                     return fail(f"squat to the stance height {bh}: {r['reason']}", data)
                 data["base_height"] = r["data"]
+                return with_diagnostics(ok(data, f"at the stance, body height command {self.base_height_cmd:.2f} m"),
+                                        r.get("diagnostics"))
             return ok(data, f"at the stance, body height command {self.base_height_cmd:.2f} m")
         return self.arrive_check(log)
 
@@ -1422,10 +1441,11 @@ class Toolbox:
                 "n_faces": len(faces)}
 
     def _wall_extent(self, h, plane) -> dict:
-        """Side edges and lateral extent of the wall on a plane in head frame h (plane_fit.wall_extent)."""
+        """Side edges and lateral extent of the wall on a plane in head frame h (plane_fit.wall_extent); the floor at
+        odom z 0 (the layout base "floor", LAYOUT_BASES) is removed from the plane's pixels."""
         return wall_extent(h["depth"], h["K"], h["T_root_cam"], h["T_odom_root"], plane, self.cfg["perception"]["plane_fit"],
                            sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px(),
-                           fov_margin_frac=self.cfg["perception"]["fov_margin_frac"])
+                           fov_margin_frac=self.cfg["perception"]["fov_margin_frac"], floor_z=0.0)
 
     def _floor_height(self, h, base_pt, plane) -> dict | None:
         """Cross-check of the odometry floor: the support plane (plane_fit.fit_support_plane, the plane-fit parameters)
@@ -1456,12 +1476,19 @@ class Toolbox:
 
     def _layout_view_points(self, faces):
         """Observation-pose region of a wall-layout task (the _spec_view_points contract): on the front plane
-        (_wall_plane), laterally the wall's place as far as the edges seen in phase 1 tell it (self._layout_edges, odom
-        points: phase 1 walks ~1 m, ~2 cm drift): [s_L, s_L + W] with the left edge seen, [s_R - W, s_R] with the right
-        one, else [s_max - W, s_min + W] (every placement consistent with the extent seen; the face-fit extents only
-        without any wall component in view; a seen extent wider than W fits no placement: [s_min, s_max]); vertically the bottom row, [0, box_h] above the odom floor (in an upright
-        head view the wall's lateral coverage is widest at its lowest points, and the floor line is in view for the
-        floor cross-check)."""
+        (_wall_plane), laterally the wall's place as far as the edges seen in phase 1 tell it (self._layout_edges: per
+        side the newest measurement {"pt" (odom point), "t" (frame time)}; phase 1 walks ~1 m, ~2 cm drift):
+        - both sides known and consistent with the layout (|s_R - s_L - W| < box_w / 2, the halfway rule of
+          _register_wall): centred on their middle, [a - W/2, a + W/2];
+        - both known but contradicting each other (one of them is not the wall's side): only the one measured in the
+          newer frame is kept (stored geometry is trusted relative to the latest measurement: odometry drifts with
+          every step since); measured in the same frame, neither can be preferred and both are dropped;
+        - one side: [s_L, s_L + W] with the left edge, [s_R - W, s_R] with the right one;
+        - none: [s_max - W, s_min + W] (every placement consistent with the extent seen; the face-fit extents only
+          without any wall component in view; a seen extent wider than W fits no placement: [s_min, s_max]).
+        edges_seen: the edges the region was built from. Vertically the bottom row, [0, box_h] above the odom floor
+        (in an upright head view the wall's lateral coverage is widest at its lowest points, and the floor line is in
+        view for the floor cross-check)."""
         L = self.wall_layout
         W = L["columns"] * L["box_w"]
         plane = self._wall_plane(faces)
@@ -1472,15 +1499,26 @@ class Toolbox:
         ext = self._wall_extent(self.head, plane)
         for side in ("left", "right"):
             if ext[side] is not None:
-                mem[side] = p0 + ext[side]["s"] * right
+                mem[side] = {"pt": p0 + ext[side]["s"] * right, "t": self.head["t"]}
         if ext["seen"] is not None:
             mem["seen"] = np.vstack([mem.get("seen", np.zeros((0, 3))), [p0 + v * right for v in ext["seen"]]])
         s_of = lambda P: np.atleast_2d(np.asarray(P, float) - p0) @ right
-        if "left" in mem:
-            lo = float(s_of(mem["left"])[0])
+        s = {sd: float(s_of(mem[sd]["pt"])[0]) for sd in ("left", "right") if sd in mem}
+        conflict = None
+        if len(s) == 2 and abs(s["right"] - s["left"] - W) >= L["box_w"] / 2:
+            tl, tr = mem["left"]["t"], mem["right"]["t"]
+            drop = ["left", "right"] if tl == tr else ["left" if tl < tr else "right"]
+            conflict = {"s_left": s["left"], "s_right": s["right"], "W": W, "dropped": drop}
+            for sd in drop:
+                del mem[sd], s[sd]
+        if len(s) == 2:
+            a = 0.5 * (s["left"] + s["right"])
+            lo, hi = a - W / 2, a + W / 2
+        elif "left" in s:
+            lo = s["left"]
             hi = lo + W
-        elif "right" in mem:
-            hi = float(s_of(mem["right"])[0])
+        elif "right" in s:
+            hi = s["right"]
             lo = hi - W
         else:
             S = s_of(mem["seen"]) if "seen" in mem else s_of(np.vstack([np.asarray(f["corners"], float) for f in faces]))
@@ -1493,8 +1531,11 @@ class Toolbox:
         P = lambda sv, zv: p0 + sv * right + zv * up
         corners = np.array([P(hi, z_hi), P(lo, z_hi), P(lo, z_lo), P(hi, z_lo)])
         ref = P(0.5 * (lo + hi), float(np.asarray(center, float)[2]))
-        return corners, {"layout": True, "lateral": [lo, hi], "z_range": [z_lo, z_hi],
-                         "edges_seen": {sd: sd in mem for sd in ("left", "right")}, "seen": ext["seen"]}, ref
+        info = {"layout": True, "lateral": [lo, hi], "z_range": [z_lo, z_hi],
+                "edges_seen": {sd: sd in s for sd in ("left", "right")}, "seen": ext["seen"]}
+        if conflict is not None:
+            info["edge_conflict"] = conflict
+        return corners, info, ref
 
     def _register_wall(self, h, faces):
         """Initial registration of the wall frame from head frame h (wall-layout plan_scans): plane (_wall_plane), both
@@ -1514,6 +1555,8 @@ class Toolbox:
                 rj = ext["rejected"][sd]
                 if ext["seen"] is None:
                     return "no wall surface found on the plane"
+                if rj["boundary"] > rj["cut"] and rj["boundary"] > rj["front"]:
+                    return "no vertical side boundary: the wall's outline runs across the view there"
                 return "cut by the image border" if rj["cut"] >= rj["front"] else "occluded"
             what = " and the ".join(f"{sd} side edge ({why(sd)})" for sd in missing)
             return with_diagnostics(fail(f"the {what} of the wall {'is' if len(missing) == 1 else 'are'} not in the head view: "
@@ -1713,36 +1756,95 @@ class Toolbox:
         return {"roll_signed": True} if t.get("roll_signed") else {}
 
     # ---- stance re-registration and the search
+    def _wall_region(self, h) -> np.ndarray:
+        """Pixels of head frame h whose ray meets the registered wall's front rectangle ([0, W] x [0, H] on its plane,
+        current registration): where the wall is predicted in the image. A surface seen elsewhere is not the wall's
+        front: the side faces of the stack (from beyond a wall end the ray reaches the front plane outside the
+        rectangle first), the box tops and the room above it, the floor in front of it.
+        A wall end the camera is beyond (its s on the wall outside [0, W]) is pulled in by box_w / 2: from there the
+        stack's side face at that end is in view next to the front, and with the stored end beyond the true one by the
+        frame's error, rays through the strip in between reach the side face (2026-11-20 review, i=151 squat view with
+        stereo noise: a stored end 1-6 cm beyond the true one put 5-32k side-face pixels into the region and tilted the
+        refit by 0.5-0.8 deg). The frame's error is below box_w / 2 by the premise of the same-wall check
+        (_reregister_at_stance), so the pulled-in strip holds no side-face ray; an end the camera is not beyond shows no
+        side face (it faces away)."""
+        wall = self.ws.wall
+        ax = self._wall_axes()
+        T = np.asarray(h["T_odom_root"], float) @ np.asarray(h["T_root_cam"], float)
+        s_cam = float((T[:3, 3] - ax["origin"]) @ ax["right"])
+        s_lo = 0.5 * float(wall["box_w"]) if s_cam < 0.0 else 0.0
+        s_hi = wall["W"] - 0.5 * float(wall["box_w"]) if s_cam > wall["W"] else wall["W"]
+        K = np.asarray(h["K"], float)
+        Hh, Ww = np.asarray(h["depth"]).shape
+        vs, us = np.mgrid[0:Hh, 0:Ww]
+        D = np.stack([(us - K[0, 2]) / K[0, 0], (vs - K[1, 2]) / K[1, 1], np.ones(us.shape)], -1) @ T[:3, :3].T
+        den = D @ ax["normal"]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tt = float((ax["origin"] - T[:3, 3]) @ ax["normal"]) / den
+        Q = T[:3, 3] + np.where(np.isfinite(tt), tt, 0.0)[..., None] * D - ax["origin"]
+        sx, sz = Q @ ax["right"], Q @ ax["up"]
+        return np.isfinite(tt) & (tt > 0) & (sx >= s_lo) & (sx <= s_hi) & (sz >= 0) & (sz <= wall["H"])
+
+    def _wall_shift(self, T_new) -> float:
+        """Largest horizontal displacement of the registered wall (its bottom corners; the displacement of a rigid
+        planar motion is largest at an end of the segment) from the current registration to T_new (odom)."""
+        T_old = self._wall_T()
+        P = np.array([[0.0, 0.0, 0.0], [self.ws.wall["W"], 0.0, 0.0]])
+        dP = apply(np.asarray(T_new, float), P) - apply(T_old, P)
+        return float(np.max(np.linalg.norm(dP[:, :2], axis=1)))
+
+    @staticmethod
+    def _edge_log(ext) -> dict:
+        """Per side of a wall_extent result: s, mad, n_rows, z_range (None: no edge) and the row ends rejected."""
+        return {sd: (None if ext[sd] is None else {k: ext[sd][k] for k in ("s", "mad", "n_rows", "z_range")})
+                for sd in ("left", "right")} | {"rejected": ext["rejected"]}
+
     def _reregister_at_stance(self) -> dict:
-        """Re-register the wall frame from the head at a stance (arm home): fit_front_face on the bbox of the projected
-        wall rectangle; the frame is rotated about the vertical axis through the CURRENT ROOT by the yaw between the
-        stored and the refitted normal and shifted along the new normal onto the refit (the plane gives two of the three
-        planar degrees of freedom; the lateral one stays as odometry predicts it, and the sim's heading drift acts on the
-        root). A side edge in view (_wall_extent) re-anchors the lateral position (both edges: their middle). Every
-        record is appended to ws.wall["history"]; a failed refit changes nothing."""
+        """Re-register the wall frame from the head at a stance (arm home): fit_front_face, in odom (gravity-aligned),
+        on the pixels where the registered wall is predicted (_wall_region). 2026-11-20 rule run i=151 (bc17, a stance
+        0.3 m beyond the wall's right end, squatted to base_height 0.45 with the pelvis pitched 21 deg; reproduced in
+        tests/test_wall_layout.py): the fit ran on the bbox of the projected wall rectangle, which also held the stack's
+        right side face (about as many pixels as the front strip seen at a grazing angle), and in the pitched root
+        frame, where the front's normal is 21 deg off horizontal and fails the 20 deg near-vertical test while the side
+        face's is horizontal: the side face was taken for the wall (dpsi 90.8 deg). The frame is rotated about the
+        vertical axis through the CURRENT ROOT by the yaw between the stored and the refitted normal and shifted along
+        the new normal onto the refit (the plane gives two of the three planar degrees of freedom; the lateral one
+        stays as odometry predicts it, and the sim's heading drift acts on the root). A side edge in view
+        (_wall_extent) re-anchors the lateral position (both edges: their middle).
+        Same-wall check (the halfway rule of the registration, design addendum 2: odometry error over one walk segment
+        is far below half a box, so a correction moving the wall by box_w / 2 or more is no drift correction: another
+        surface was fitted, or the registration is lost): the plane correction and then the correction with the
+        re-anchor must each move the wall (_wall_shift) by less than box_w / 2; a plane correction that does not keeps
+        the previous frame, a re-anchor that does is not applied (the plane correction is).
+        The registered wall without min_inliers valid depth pixels in its predicted region (e.g. out of a squatted,
+        tilted view): no refit. Every record (t, refit applied, region_px, the refit values, per-side edges with s, mad,
+        n_rows, z_range on the refit plane, or on the registered one when the refit failed or was rejected; None with
+        the wall out of view) is appended to ws.wall["history"]; a failed or rejected refit changes nothing."""
         wall = self.ws.wall
         h = self._capture_head()
-        rec = {"t": h["t"], "refit": False}
-        C = self._rect_face(0.0, wall["W"], 0.0, wall["H"])["corners"]
-        uv, z = self._project_odom(h, C)
-        if np.any(z <= 0):
-            rec["note"] = "a wall corner lies behind the head camera: no refit"
+        rec = {"t": h["t"], "refit": False, "edges": None}
+        region = self._wall_region(h)
+        rec["region_px"] = int(region.sum())
+        if not region.any():
+            rec["note"] = "the registered wall is not in the head view: no refit"
             wall["history"].append(rec)
             return rec
-        Hh, Ww = h["depth"].shape
-        x0, y0 = np.clip(uv.min(axis=0), 0, [Ww, Hh])
-        x1, y1 = np.clip(uv.max(axis=0), 0, [Ww, Hh])
-        r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], [x0, y0, x1, y1], sigma_coeff=h["depth_sigma_coeff"],
-                           min_structure_px=self._min_structure_px())
-        if r["status"] != "ok":
-            rec["note"] = f"refit failed: {r['reason']}"
-            wall["history"].append(rec)
-            return rec
+        ys, xs = np.nonzero(region)
         To = np.asarray(h["T_odom_root"], float)
-        c_new = apply(To, r["center"])
-        n_new = rotate(To, r["normal"])
-        n_new = np.array([n_new[0], n_new[1], 0.0]) / np.linalg.norm(n_new[:2])
+        # fitted in odom (z up; _fit_face_odom): a squatted root is pitched (base_height 0.45: 21 deg, beyond
+        # max_normal_tilt_deg 20: the wall's own normal failed the near-vertical test)
+        r = self._fit_face_odom(dict(h, depth=np.where(region, np.asarray(h["depth"], float), np.nan)),
+                                [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1])
         ax = self._wall_axes()
+        stored = {"normal": ax["normal"], "right": ax["right"], "point": ax["origin"]}
+        if r["status"] != "ok":
+            rec["note"] = f"refit failed (the wall's predicted region of the head view): {r['reason']}"
+            rec.update(edges=self._edge_log(self._wall_extent(h, stored)), edges_on="stored plane")
+            wall["history"].append(rec)
+            return rec
+        c_new = np.asarray(r["center"], float)
+        n_new = np.asarray(r["normal"], float)
+        n_new = np.array([n_new[0], n_new[1], 0.0]) / np.linalg.norm(n_new[:2])
         n_old = ax["normal"]
         dpsi = math.atan2(n_old[0] * n_new[1] - n_old[1] * n_new[0], float(n_old[:2] @ n_new[:2]))
         cz, sz = math.cos(dpsi), math.sin(dpsi)
@@ -1753,7 +1855,19 @@ class Toolbox:
         right, normal = Rz @ ax["right"], Rz @ n_old
         dd = float((c_new - origin) @ normal)
         origin = origin + dd * normal
+        half = 0.5 * float(wall["box_w"])
+        shift = self._wall_shift(self._wall_frame(origin, right, normal))
+        rec.update(dpsi_deg=math.degrees(dpsi), dd_m=dd, shift_m=shift, refit_n_inliers=r["n_inliers"],
+                   refit_rms_m=r["rms"])
+        if shift >= half:
+            rec["note"] = (f"refit rejected: it would move the registered wall by {shift:.3f} m (>= box_w / 2 = "
+                           f"{half:.3f} m), more than odometry drifts over a walk segment: not the registered wall's "
+                           "front; the previous frame is kept")
+            rec.update(edges=self._edge_log(self._wall_extent(h, stored)), edges_on="stored plane")
+            wall["history"].append(rec)
+            return rec
         ext = self._wall_extent(h, {"normal": normal, "right": right, "point": origin})
+        rec.update(edges=self._edge_log(ext), edges_on="refit plane")
         el, er = ext["left"], ext["right"]
         ds = None
         if el is not None and er is not None:
@@ -1762,14 +1876,22 @@ class Toolbox:
             ds = el["s"]
         elif er is not None:
             ds = er["s"] - wall["W"]
+        anchored = [sd for sd, e_ in (("left", el), ("right", er)) if e_ is not None]
         net = float((root[:2] - np.asarray(wall["anchor_root_xy"], float)) @ right[:2])
+        if ds is not None:
+            shift_a = self._wall_shift(self._wall_frame(origin + ds * right, right, normal))
+            rec["shift_anchored_m"] = shift_a
+            if shift_a >= half:
+                rec["note"] = (f"re-anchor rejected: the {' and '.join(anchored)} edge(s) would move the registered wall "
+                               f"by {shift_a:.3f} m (>= box_w / 2 = {half:.3f} m): not the wall's side; the plane "
+                               "correction alone is applied")
+                rec["ds_rejected_m"] = ds
+                ds, anchored = None, []
         if ds is not None:
             origin = origin + ds * right
             wall["anchor_root_xy"] = root[:2].copy()
         wall["T_odom_wall"] = self._wall_frame(origin, right, normal)
-        rec.update(refit=True, dpsi_deg=math.degrees(dpsi), dd_m=dd, ds_m=ds,
-                   anchored=[sd for sd, e_ in (("left", el), ("right", er)) if e_ is not None],
-                   net_lateral_since_anchor_m=net)
+        rec.update(refit=True, ds_m=ds, anchored=anchored, net_lateral_since_anchor_m=net)
         wall["history"].append(rec)
         self._sync_layout_all()
         return rec
@@ -1977,8 +2099,10 @@ class Toolbox:
         base = {"barcode_id": bc.id, "views": n_views, "reregistration": rereg}
         if last["outcome"] == "ik":
             self._record_failed_stance(bc, st)
+            # as a partial search (rule mode: one new stance and search for both)
             return with_diagnostics(fail("hand-camera view not reachable from this stance: move_arm('home'), "
-                                         "compute_wrist_target, plan_stance, approach", dict(base, ik=last["reason"])), diag)
+                                         "compute_wrist_target -> plan_stance -> approach -> search_cell again (once), "
+                                         "then next_barcode", dict(base, ik=last["reason"])), diag)
         if last["outcome"] == "found":
             added = self._convert_cell(bc, last["assigned"])
             tr = self.compute_wrist_target(bc.id)
@@ -3019,11 +3143,14 @@ class Toolbox:
                                          look_roll_deg=float(t["alternatives"][ai]["roll_deg"]))
         self._marker("stance", "red", "root", [pw[0], pw[1], 0.0], yaw=yaw)
         squat = chosen is not None and chosen is not levels[0]
-        return ok({"stance_odom": self.ws.stance_target, "joint_limit_margin_rad": m, "clearance": clear,
-                   "squat": squat, "robust": robust, "rejected": rejected},
-                  "stance planned (the robot has not moved): call approach('stance_target') to walk there"
-                  + (f"; it then squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by itself"
-                     if squat else ""))
+        res = ok({"stance_odom": self.ws.stance_target, "joint_limit_margin_rad": m, "clearance": clear,
+                  "squat": squat, "robust": robust, "rejected": rejected},
+                 "stance planned (the robot has not moved): call approach('stance_target') to walk there"
+                 + (f"; it then squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by itself"
+                    if squat else ""))
+        if chosen is None:
+            return res
+        return with_diagnostics(res, {"body_level": "measured" if chosen.get("measured") else "calibration"})
 
     def _body_clearance(self, body, sols, Tc, obstacles, poly):
         """Clearances of the arm solutions sols at root pose Tc (plan_stance's checks, in its order): the smallest
@@ -3204,25 +3331,42 @@ class Toolbox:
 
     def _reach(self, t, off, side, aim=None) -> dict:
         """IK on the current joint state to wrist target t at distance off, set_arm_joints, then closed-loop corrections
-        of the commanded target (arm PD sag) using FK (move_arm and search_cell's look poses). Returns {"ik_fail",
-        "history"} (+ "reason", "iters" when IK found no solution for the first command).
-        aim (a look pose, _look_view): {"corners": the rectangle the look pose was planned to show (odom: the face grown
-        by delta_lat and the slack e), "see": the rectangle the view has to show (the face grown by delta_lat), 4 x 3
-        each}. What a look pose needs is where the hand camera looks; the arm's error there is mostly orientation, a
-        steady PD / gravity sag (2026-11-19 scan room: the tip 8 mm off but the scan axis 4.8 deg off left the face
-        uncovered; final-pose residuals 3-10 deg). So the full tip pose is corrected, as the position already is:
-        the commanded rotation is pre-compensated by the rotation still missing (R_cmd <- R_goal R_reached^T R_cmd)
-        next to p_cmd <- p_cmd + (p_goal - p_reached); this keeps the planned perspective and also corrects the roll
-        (a translation of the camera alone cannot undo a roll, and the translation that undoes a tilt is range x tilt,
-        which often left IK reach). The error measured is _view_error (how far the view lies from the planned one on
-        the wall, at the planned rectangle's corners); the loop stops as soon as the planned rectangle is covered from
-        the pose reached (FK; the view is then as good as planned) or the view error is below correction_tol (the slack
-        e the rectangle was grown by for exactly this placement error, as the tip loop stops on the tip error).
-        The first command of a look pose is not held to the IK tolerance of a scan pose (2 mm / 1 deg): when IK does
-        not converge, its best attempt is sent if that pose's view (FK of the solution) shows the rectangle `see`, the
-        test the capture applies (2026-11-19 rule run: every squat look stance failed the first IK by 4-7 mm /
-        0.7-1.4 deg)."""
+        of the commanded tip pose (arm PD / gravity sag) using FK (move_arm and search_cell's look poses). Returns
+        {"ik_fail", "history"} (+ "reason", "iters" when IK found no solution for the first command).
+        The sag is a steady error of the full tip pose, mostly orientation (2026-11-19 scan room: a look pose with the
+        tip 8 mm off but the scan axis 4.8 deg off left the face uncovered; every logged label pose, 9 of 9 in the
+        layout rule run and the r234 agent_full run, ended 2.7-9.8 deg off the label normal after the position loop while
+        the IK itself is held to 1 deg, and 3 of 6 placements failed the check's axis offset for it: the label centre
+        1.7-3.4 cm off the scanner axis). So the full tip pose is corrected for every target: the commanded rotation is
+        pre-compensated by the rotation still missing (R_cmd <- R_goal R_reached^T R_cmd) next to p_cmd <- p_cmd +
+        (p_goal - p_reached); this keeps the planned perspective and also corrects the roll (a translation alone cannot
+        undo a roll, and the translation that undoes a tilt is range x tilt, which often left IK reach). R_goal: the
+        planned tip rotation (_goal_rotation; a code reads both ways round, so a label's roll sign is the one nearest the
+        pose reached). One loop, two error measures, each stopped below correction_tol (as the tip loop was):
+        - a look pose, aim = {"corners": the rectangle the look pose was planned to show (odom: the face grown by
+          delta_lat and the slack e), "see": the rectangle the view has to show (the face grown by delta_lat), 4 x 3
+          each}: _view_error (how far the view lies from the planned one on the wall, at the planned rectangle's
+          corners); it also stops as soon as the planned rectangle is covered from the pose reached (FK);
+        - a scan pose (aim None): the larger of the tip position error and the label centre's distance from the scanner
+          axis (the check's axis offset at the target stand-off): what the placement check and the scanner need.
+        A correction that makes the error larger is undone (the base / torso moves with the arm). A correction whose IK
+        fails is sent as its position part alone, with the rotation commanded before (the scan-pose correction up to
+        10b05eb: 2026-11-20 review, a wrist joint near its limit put the pre-compensated rotation out of reach and the
+        revert left the label 3.2 cm off the scanner axis where the position step reached 1.95 cm); when that fails
+        too, the best pose reached is kept.
+        The first command is not held to the IK tolerance (2 mm / 1 deg) when what the pose is for holds at the IK's
+        best attempt (FK of the solution): a look pose whose view shows the rectangle `see` (the test the capture
+        applies; 2026-11-19 rule run: every squat look stance failed the first IK by 4-7 mm / 0.7-1.4 deg), a scan
+        pose within the placement check's tolerances at distance off (task2.yaml check: the pose check_wrist_placement
+        accepts for scanning; 2026-11-20 rule run: a re-planned label pre-pose failed IK by 7 mm / 3.1 deg). That
+        acceptance is judged before the sag, so a scan pose accepted unconverged is held to the same test once the loop
+        has ended (FK of the pose reached): a pose at the edge of reach cannot be corrected (the corrections leave the
+        reachable set) and the sag adds to its IK residual; failing the test it is an IK failure, as at 10b05eb, so
+        the caller re-plans the stance (2026-11-20 review: 4 of 4 such cases ended "partial" 2.1-5.8 cm off the axis,
+        and rule mode's single re-plan, which runs on "IK" failures only, never ran). A look pose's acceptance is
+        tested on the capture (_look_view: covered or not)."""
         A = self.cfg["robot"]["arm_motion"]
+        tip_frame = self.cfg["robot"]["wrist_point_frame"]
         p_goal, d_goal = self._target_in_root(t, offset=off)
         p_cmd = p_goal.copy()
         R_cmd = None if aim is None else self._tip_rotation_in_root(t, d_goal)
@@ -3231,23 +3375,54 @@ class Toolbox:
 
         def measure():
             p_g, d_g = self._target_in_root(t, offset=off)   # the base may have drifted: re-express the target
-            T = self.kin.pose(self._q(), self.cfg["robot"]["wrist_point_frame"])
+            T = self.kin.pose(self._q(), tip_frame)
             err = p_g - T[:3, 3]
             rec = {"pos_err_m": float(np.linalg.norm(err)), "angle_err_deg": math.degrees(angle_between(T[:3, 0], d_g))}
+            E = self._goal_rotation(t, d_g, T[:3, :3]) @ T[:3, :3].T        # the rotation still missing
             if aim is None:
-                return err, rec["pos_err_m"], rec, False, d_g
+                v = (p_g + d_g * off) - T[:3, 3]                              # tip -> label centre
+                a = T[:3, 0] / np.linalg.norm(T[:3, 0])
+                rec["axis_offset_m"] = float(np.linalg.norm(v - (v @ a) * a))
+                return (err, E, T[:3, :3]), max(rec["pos_err_m"], rec["axis_offset_m"]), rec, False, d_g
             rec["roll_err_deg"] = self.ik.roll_error_deg(T[:3, :3], d_g, self._roll_in_root(t), signed=True)
             ve = self._view_error(t, off, aim["corners"])
             rec.update(view_err_m=ve["err"] if math.isfinite(ve["err"]) else None, planned_covered=ve["covered"])
-            return (err, self._tip_rotation_in_root(t, d_g) @ T[:3, :3].T), ve["err"], rec, ve["covered"], d_g
+            return (err, E, T[:3, :3]), ve["err"], rec, ve["covered"], d_g
+
+        def placement(q_full) -> dict:
+            """A scan pose's placement measures at distance off of the tip pose of joint state q_full (FK)."""
+            fwd = np.asarray(t["forward"], float)
+            L = t.get("long_axis")
+            return self._placement_measures(self._odom() @ self.kin.pose(q_full, tip_frame),
+                                            np.asarray(t["pos"], float) + float(t["offset"]) * fwd, -fwd, off,
+                                            None if L is None else np.asarray(L, float))
+
+        def usable(sol) -> bool:
+            """The first command's IK attempt, not converged, still serves its purpose (FK of the solution)."""
+            if aim is not None:
+                return self._hand_view().covers(
+                    self._odom() @ self.kin.pose(sol["q_full"], self.cfg["robot"]["hand_camera"]["frame"]), aim["see"])
+            return placement(sol["q_full"])["good"]
+
+        def solve(q, p, R):
+            if R is None:                             # a scan pose's first command: the IK call it always was
+                return self.ik.solve(q, p, d_goal, roll_axis=self._roll_in_root(t), **self._roll_kw(t))
+            if self._roll_in_root(t) is None:         # no roll axis: the scan direction only
+                return self.ik.solve(q, p, R[:, 0])
+            return self.ik.solve(q, p, R[:, 0], roll_axis=R @ self.ik.img_x_in_tip, roll_signed=True)
+        R_prev = None                                 # the rotation commanded before the current correction
+        first_unconverged = False
         for it in range(1 + A["correction_iters"]):
             q = self._q()
-            if aim is None:
-                sol = self.ik.solve(q, p_cmd, d_goal, roll_axis=self._roll_in_root(t), **self._roll_kw(t))
-            else:
-                sol = self.ik.solve(q, p_cmd, R_cmd[:, 0], roll_axis=R_cmd @ self.ik.img_x_in_tip, roll_signed=True)
-            unconverged = not sol["ok"] and aim is not None and best is None and self._hand_view().covers(
-                self._odom() @ self.kin.pose(sol["q_full"], self.cfg["robot"]["hand_camera"]["frame"]), aim["see"])
+            sol = solve(q, p_cmd, R_cmd)
+            kept_rotation = False
+            if not sol["ok"] and best is not None and R_prev is not None:
+                # the full-pose correction is out of reach: its position part with the rotation commanded before
+                sol_p = solve(q, p_cmd, R_prev)
+                if sol_p["ok"]:
+                    sol, R_cmd, kept_rotation = sol_p, R_prev, True
+            unconverged = not sol["ok"] and best is None and usable(sol)
+            first_unconverged = first_unconverged or unconverged
             if not sol["ok"] and not unconverged:
                 if best is not None:                  # a correction left the reachable set: keep the best pose reached
                     self.robot.set_arm_joints(side, best[1], A["duration_s"])
@@ -3256,12 +3431,15 @@ class Toolbox:
                     break
                 return {"ik_fail": True, "iters": it, "history": hist,
                         "reason": f"IK: target not reachable (residual {sol['pos_err']:.3f} m / {sol['angle_err_deg']:.1f} deg)"}
+            d_sent = d_goal
             self.robot.set_arm_joints(side, sol["q_arm"], A["duration_s"])
             self.arm_at_home = False
             self.robot.stand(A["settle_s"])
             err, e, rec, covered, d_goal = measure()
-            if unconverged:                           # the IK residual of the pose sent (it shows `see` by FK)
+            if unconverged:                           # the IK residual of the pose sent (usable by FK)
                 rec.update(ik_unconverged={"pos_err_m": sol["pos_err"], "angle_err_deg": sol["angle_err_deg"]})
+            if kept_rotation:                         # the rotation part of this correction was out of IK reach
+                rec["rotation_kept"] = True
             hist.append(rec)
             if covered:                               # a look pose whose view shows the planned rectangle: done
                 break
@@ -3277,11 +3455,35 @@ class Toolbox:
                 best = (e, sol["q_arm"], rec)
             if e < A["correction_tol"]:
                 break
-            if aim is None:
-                p_cmd = p_cmd + err
-            else:
-                p_cmd, R_cmd = p_cmd + err[0], err[1] @ R_cmd
+            if R_cmd is None:
+                # a scan pose's first command was the goal at the roll sign the IK chose: the one nearest the pose
+                # reached (the sag is far below a half turn)
+                R_cmd = self._goal_rotation(t, d_sent, err[2])
+            R_prev = R_cmd
+            p_cmd, R_cmd = p_cmd + err[0], err[1] @ R_cmd
+        if first_unconverged and aim is None:
+            pm = placement(self._q())
+            if not pm["good"]:
+                return {"ik_fail": True, "iters": len(hist), "history": hist,
+                        "reason": f"IK: target not reachable (the first IK solution did not converge, and the pose "
+                                  f"reached is outside the placement check's tolerances: {pm['axis_offset_m']:.3f} m off "
+                                  f"the scanner axis, {pm['angle_deg']:.1f} deg off the label normal)"}
         return {"ik_fail": False, "history": hist}
+
+    def _goal_rotation(self, t, d, R_reached):
+        """Planned rotation (root frame) of the scanner tip for target t with its scan axis along d, nearest the tip
+        rotation R_reached where the target leaves a choice: a signed roll axis (a look pose) fixes it
+        (_tip_rotation_in_root); a label's roll axis is a line (a code reads both ways round: the sign nearest R_reached,
+        ArmIK.roll_target); without a roll axis only the scan axis is planned (R_reached turned onto d)."""
+        d = np.asarray(d, float) / np.linalg.norm(d)
+        L = self._roll_in_root(t)
+        if L is None:
+            from scipy.spatial.transform import Rotation
+            from ..kinematics.ik import rotation_vector
+            return Rotation.from_rotvec(rotation_vector(R_reached[:, 0], d)).as_matrix() @ R_reached
+        if t.get("roll_signed"):
+            return self._tip_rotation_in_root(t, d)
+        return self.ik.roll_target(R_reached, d, L)
 
     def _tip_rotation_in_root(self, t, d):
         """Planned rotation (root frame) of the scanner tip for a target with a signed roll axis: scan axis along d (t's
@@ -3406,10 +3608,9 @@ class Toolbox:
         refit = None
         if np.all(z > 0):
             x0, y0 = np.clip(uv.min(axis=0), 0, None); x1, y1 = uv.max(axis=0)
-            r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], [x0, y0, x1, y1], sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px())
+            r = self._fit_face_odom(h, [x0, y0, x1, y1])
             if r["status"] == "ok":
-                T = h["T_odom_root"]
-                refit = {"center": apply(T, r["center"]), "normal": rotate(T, r["normal"])}
+                refit = {"center": r["center"], "normal": r["normal"]}
         plane = refit or {"center": face["center"], "normal": face["normal"]}
         w, rec = detect()
         tried = []
@@ -3580,6 +3781,25 @@ class Toolbox:
             self._store_layout(bc)
         return self.compute_wrist_target(bc.id, refined=True)
 
+    def _placement_measures(self, T, center, normal, offset, L) -> dict:
+        """The placement check's measures of scanner-tip pose T (odom) against a label (centre, unit normal, the
+        stand-off offset, long axis L or None) and its verdict "good" with the task's check tolerances (task2.yaml
+        check): distance to the label plane within dist_tol_m of the stand-off, the label centre's distance from the
+        scanner axis, the scan axis' angle to the label normal and the roll (image horizontal vs the long axis: the
+        same tolerance as the scan-axis angle)."""
+        C = self._c2()["check"]
+        p, fwd = T[:3, 3], T[:3, 0]
+        n = np.asarray(normal, float)
+        center = np.asarray(center, float)
+        dist = float((p - center) @ n)
+        v = center - p
+        axis_off = float(np.linalg.norm(v - (v @ fwd) * fwd))
+        ang = math.degrees(angle_between(fwd, -n))
+        roll = None if L is None else self.ik.roll_error_deg(T[:3, :3], fwd, L)
+        good = abs(dist - offset) <= C["dist_tol_m"] and axis_off < C["axis_offset_max_m"] and ang < C["angle_max_deg"] \
+            and (roll is None or roll < C["angle_max_deg"])
+        return {"distance_to_plane_m": dist, "axis_offset_m": axis_off, "angle_deg": ang, "roll_deg": roll, "good": bool(good)}
+
     def check_wrist_placement(self):
         if (rf := self._layout_refusal(self._current())) is not None:
             return rf
@@ -3589,20 +3809,13 @@ class Toolbox:
         if t is None or bc is None:
             return fail("no target")
         T = self._odom() @ self.kin.pose(self._q(), self.cfg["robot"]["wrist_point_frame"])
-        p, fwd = T[:3, 3], T[:3, 0]
-        n = np.asarray(bc.normal, float)
-        dist = float((p - bc.center) @ n)
-        v = bc.center - p
-        axis_off = float(np.linalg.norm(v - (v @ fwd) * fwd))
-        ang = math.degrees(angle_between(fwd, -n))
         L = t.get("long_axis")
-        roll = None if L is None else self.ik.roll_error_deg(T[:3, :3], fwd, np.asarray(L, float))
-        # roll: image horizontal vs the barcode's long axis, same tolerance as the scan-axis angle
-        good = abs(dist - t["offset"]) <= C["dist_tol_m"] and axis_off < C["axis_offset_max_m"] and ang < C["angle_max_deg"] \
-            and (roll is None or roll < C["angle_max_deg"])
-        data = {"barcode_id": bc.id, "distance_to_plane_m": dist, "target_offset_m": t["offset"], "axis_offset_m": axis_off,
-                "angle_deg": ang, "roll_deg": roll}
-        if good:
+        pm = self._placement_measures(T, bc.center, np.asarray(bc.normal, float), t["offset"],
+                                      None if L is None else np.asarray(L, float))
+        dist = pm["distance_to_plane_m"]
+        data = {"barcode_id": bc.id, "distance_to_plane_m": dist, "target_offset_m": t["offset"],
+                "axis_offset_m": pm["axis_offset_m"], "angle_deg": pm["angle_deg"], "roll_deg": pm["roll_deg"]}
+        if pm["good"]:
             return ok(data)
         if self.task == 3:
             # task 3: the check measures the placement, the scan decides. Out of tolerance by a few cm the scanner can

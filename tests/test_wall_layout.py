@@ -65,9 +65,10 @@ def kin_toolbox(spec=SPEC_R234, layout=LAYOUT, order=None):
 
 
 def render_depth(Tc, K=K_HEAD, size=(480, 848), wall_x=WALL_X, half_w=0.6, top=1.25, depth_box=0.4, gap=0.5, floor_z=0.0,
-                 poles=()):
+                 poles=(), side_faces=False):
     """Depth (along the optical axis) of the synthetic scene seen from camera pose Tc (odom); NaN where nothing is hit.
-    poles: axis-aligned boxes [lo, hi] (odom) in front of the wall."""
+    poles: axis-aligned boxes [lo, hi] (odom) in front of the wall; side_faces: also the stack's two side faces
+    (y = +-half_w, depth_box deep: visible from beyond a wall end)."""
     h, w = size
     vs, us = np.mgrid[0:h, 0:w]
     Dc = np.stack([(us - K[0][2]) / K[0][0], (vs - K[1][2]) / K[1][1], np.ones(us.shape)], -1)
@@ -89,6 +90,12 @@ def render_depth(Tc, K=K_HEAD, size=(480, 848), wall_x=WALL_X, half_w=0.6, top=1
         cand(t, np.ones(t.shape, bool))
         t = (floor_z - o[2]) / D[..., 2]
         cand(t, np.ones(t.shape, bool))
+        if side_faces:
+            for ys in (-half_w, half_w):
+                t = (ys - o[1]) / D[..., 1]
+                P = o + t[..., None] * D
+                cand(t, (P[..., 0] >= wall_x) & (P[..., 0] <= wall_x + depth_box) & (P[..., 2] >= floor_z)
+                     & (P[..., 2] <= top))
         for lo, hi in poles:
             t1, t2 = (np.asarray(lo, float) - o) / D, (np.asarray(hi, float) - o) / D
             tn, tf = np.minimum(t1, t2).max(-1), np.maximum(t1, t2).min(-1)
@@ -97,11 +104,22 @@ def render_depth(Tc, K=K_HEAD, size=(480, 848), wall_x=WALL_X, half_w=0.6, top=1
     return best
 
 
-def head_frame(tb, x, y=0.0, yaw=0.0, noise=0.0, seed=0, **scene):
-    """Head frame of the synthetic scene from root (x, y, yaw), upright; T_odom_root = the root pose, T_root_cam = FK."""
+# the simulator's g1_v2 head camera stands ~8 cm higher than this fixture's (2026-11-20: the start frame's face fit
+# reaches z 1.252 m in the sim, 1.185 m here), so that the start view reaches the wall top there
+SIM_HEAD_DZ = 0.08
+STEREO_SIGMA = 0.20 / (447.0 * 0.05)   # perception.yaml head_depth disparity_sigma_px / (f x B) of the D435i pair
+
+
+def head_frame(tb, x, y=0.0, yaw=0.0, noise=0.0, seed=0, dz=0.0, roll_deg=0.0, **scene):
+    """Head frame of the synthetic scene from root (x, y, yaw), upright; T_odom_root = the root pose, T_root_cam = FK
+    (with the camera raised by dz and rolled about its optical axis by roll_deg: the robot's head as measured, not as
+    modelled)."""
     from g1agent.common.transforms import T_from_xy_yaw
     up = tb._lean_levels()[0]
-    Tc = tb._cam_T_at(x, y, yaw, up)
+    Tc = tb._cam_T_at(x, y, yaw, up).copy()
+    Tc[2, 3] += dz
+    a = np.radians(roll_deg)
+    Tc[:3, :3] = Tc[:3, :3] @ np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1.0]])
     depth = render_depth(Tc, **scene)
     if noise > 0:
         # stereo depth noise sigma_z = noise x z^2, correlated over the matching window (7 px block: SGBM averages the
@@ -111,6 +129,30 @@ def head_frame(tb, x, y=0.0, yaw=0.0, noise=0.0, seed=0, **scene):
         depth = depth + g / g.std() * noise * depth ** 2
     To = T_from_xy_yaw(x, y, yaw, float(up["pelvis_z"]))
     return {"rgb": np.zeros((480, 848, 3), np.uint8), "depth": depth, "K": K_HEAD.copy(), "T_root_cam": inv_T(To) @ Tc,
+            "T_odom_root": To, "t": 1.0, "depth_sigma_coeff": noise, "view": {"pitch": 0.0}}
+
+
+def squat_frame(tb, x, y=0.0, yaw=0.0, height=0.45, pelvis_pitch_deg=None, pelvis_z=None, noise=0.0, seed=0, **scene):
+    """Head frame squatted to a calibrated body level (robot.yaml body calibration: the level's leg / waist joints,
+    pelvis height and pitch, unless given as measured), root (pelvis) at (x, y, yaw). T_odom_root carries the pelvis
+    tilt (the simulator's odometry does: roll / pitch are observable)."""
+    import os
+    from g1agent.tools.body import Ry
+    cal = json.load(open(os.path.join(config.ROOT, tb.cfg["robot"]["body"]["calibration"])))["levels"]
+    lv = min(cal, key=lambda l: abs(l["height_cmd"] - height))
+    q = tb._q()
+    for n, v in lv["q"].items():
+        if n in tb.kin.joint_q_index and not any(k in n for k in ("shoulder", "elbow", "wrist", "hand")):
+            q[tb.kin.joint_q_index[n]] = float(v)
+    To = T_from_xy_yaw(x, y, yaw, lv["pelvis_z"] if pelvis_z is None else pelvis_z)
+    To[:3, :3] = To[:3, :3] @ Ry(math.radians(lv["pelvis_pitch_deg"] if pelvis_pitch_deg is None else pelvis_pitch_deg))
+    Trc = tb.kin.pose(q, tb.cfg["robot"]["head_cam_frame"])
+    depth = render_depth(To @ Trc, **scene)
+    if noise > 0:
+        import cv2
+        g = cv2.blur(np.random.default_rng(seed).normal(0, 1, depth.shape), (7, 7), borderType=cv2.BORDER_REFLECT)
+        depth = depth + g / g.std() * noise * depth ** 2
+    return {"rgb": np.zeros((480, 848, 3), np.uint8), "depth": depth, "K": K_HEAD.copy(), "T_root_cam": Trc,
             "T_odom_root": To, "t": 1.0, "depth_sigma_coeff": noise, "view": {"pitch": 0.0}}
 
 
@@ -131,9 +173,9 @@ def box_faces(wall_x=WALL_X, half_w=0.6, cols=6, rows=5, bw=0.2, bh=0.25, t=1.0,
 PLANE = {"normal": np.array([-1.0, 0, 0]), "right": np.array([0, -1.0, 0]), "point": np.array([WALL_X, 0, 0])}
 
 
-def extent(h, plane=PLANE, cfg=None):
+def extent(h, plane=PLANE, cfg=None, floor_z=0.0):
     return plane_fit.wall_extent(h["depth"], h["K"], h["T_root_cam"], h["T_odom_root"], plane,
-                                 cfg or config.load("perception")["plane_fit"], h["depth_sigma_coeff"], 7, 0.05)
+                                 cfg or config.load("perception")["plane_fit"], h["depth_sigma_coeff"], 7, 0.05, floor_z)
 
 
 # ------------------------------------------------------------------ 1. set_wall_layout
@@ -164,16 +206,20 @@ def test_set_wall_layout_validation():
 
 
 # ------------------------------------------------------------------ 2. side edges on synthetic depth
-def test_wall_extent_noise_free_edges_within_one_pixel_and_crease_rows_dropped():
+def test_wall_extent_noise_free_edges_within_one_pixel_and_the_floor_strip_removed():
     tb = kin_toolbox()
     h = head_frame(tb, WALL_X - 1.2)
     ext = extent(h)
     px = 1.3 / FX_HEAD                                          # one pixel footprint at the wall (~2 mm)
     assert ext["left"]["s"] == pytest.approx(-0.6, abs=px) and ext["right"]["s"] == pytest.approx(0.6, abs=px)
-    # the floor crease along the base (floor points within the plane tolerance) widens some rows: the median drops them
     rows = np.array([[r[1], r[2]] for r in ext["rows"] if r[3] and r[4]], float)
-    assert np.abs(rows[:, 0] + 0.6).max() > 5 * px or ext["seen"][0] < -0.6 - 5 * px
+    assert np.abs(rows[:, 0] + 0.6).max() < px and np.abs(rows[:, 1] - 0.6).max() < px
     assert ext["left"]["n_rows"] > 100 and ext["right"]["n_rows"] > 100
+    # the floor strip along the base lies on the plane and runs on beyond the wall's ends: removed at the floor height,
+    # the seen extent is the wall's; without the removal it is wider
+    assert ext["floor_px_removed"] > 0 and ext["seen"] == pytest.approx([-0.6, 0.6], abs=px)
+    raw = extent(h, floor_z=None)
+    assert raw["floor_px_removed"] is None and raw["seen"][1] - raw["seen"][0] > 1.2 + 10 * px
 
 
 def test_wall_extent_with_depth_noise_and_an_invalid_band():
@@ -200,6 +246,40 @@ def test_wall_extent_cut_side_and_occluded_side_are_not_edges():
     ext = extent(head_frame(tb, WALL_X - 1.2, poles=[pole]))
     assert ext["left"] is None and ext["rejected"]["left"]["front"] > 0
     assert ext["right"]["s"] == pytest.approx(0.6, abs=0.003)
+
+
+@pytest.mark.parametrize("roll_deg", [0.0, 0.3, -0.3, 1.0])
+def test_wall_extent_no_side_edge_on_the_wall_top_from_the_start_pose(roll_deg):
+    """2026-11-20 phase 1 (af2): from the start pose 0.6 m from the wall, with the simulator's head height the top rows
+    of the view reach the wall top; rows that end where the (slightly slanted) top edge crosses them, with the box
+    tops / room wall behind, were taken for side edges (s -0.33 / -0.42 m, z 1.25 m). The side test (c): a side edge
+    runs vertically on the plane. Both sides run out of the image here: no edge; the top's row ends are "boundary"."""
+    tb = kin_toolbox()
+    for seed in (1, 2):
+        ext = extent(head_frame(tb, 0.7, yaw=0.015, dz=SIM_HEAD_DZ, roll_deg=roll_deg, noise=STEREO_SIGMA, seed=seed))
+        assert ext["left"] is None and ext["right"] is None, (ext["left"], ext["right"])
+        assert ext["rejected"]["left"]["boundary"] + ext["rejected"]["right"]["boundary"] > 0
+
+
+def test_wall_extent_real_edges_with_the_simulator_head_height():
+    """The side test keeps the real side edges: centred at 1.2 m both within a pixel (noise-free) and within the
+    stereo matching window (stereo noise); from the af2 obs pose (y -0.656) and the C3R4 retry stance only the right
+    edge, from the first C3R4 stance (wall top in view, no end) none (the code before the side test found a right
+    edge at z 1.25 m there)."""
+    tb = kin_toolbox()
+    px, win = 1.3 / FX_HEAD, 7 * 1.3 / FX_HEAD
+    ext = extent(head_frame(tb, WALL_X - 1.2, dz=SIM_HEAD_DZ))
+    assert ext["left"]["s"] == pytest.approx(-0.6, abs=px) and ext["right"]["s"] == pytest.approx(0.6, abs=px)
+    assert ext["left"]["n_rows"] > 100 and ext["right"]["n_rows"] > 100
+    ext = extent(head_frame(tb, WALL_X - 1.2, dz=SIM_HEAD_DZ, noise=STEREO_SIGMA, seed=2))
+    assert ext["left"]["s"] == pytest.approx(-0.6, abs=win) and ext["right"]["s"] == pytest.approx(0.6, abs=win)
+    assert ext["seen"] == pytest.approx([-0.6, 0.6], abs=win)                   # the floor strip removed
+    ext = extent(head_frame(tb, WALL_X - 1.2, y=-0.656, dz=SIM_HEAD_DZ, noise=STEREO_SIGMA, seed=3))
+    assert ext["left"] is None and ext["right"]["s"] == pytest.approx(0.6, abs=win)
+    ext = extent(head_frame(tb, 0.62, y=-0.29, dz=SIM_HEAD_DZ, noise=STEREO_SIGMA, seed=4))
+    assert ext["left"] is None and ext["right"]["s"] == pytest.approx(0.6, abs=win)
+    ext = extent(head_frame(tb, 0.606, y=-0.075, dz=SIM_HEAD_DZ, noise=STEREO_SIGMA, seed=5))
+    assert ext["left"] is None and ext["right"] is None
 
 
 # ------------------------------------------------------------------ 3. registration
@@ -344,6 +424,66 @@ def test_obs_pose_region_without_an_edge_from_the_seen_extent(seen_w, expect):
     tb._layout_edges = {"seen": np.array([plane["point"] + v * plane["right"] for v in (-seen_w / 2, seen_w / 2)])}
     _, info, _ = tb._layout_view_points(faces)
     assert info["lateral"] == pytest.approx(expect, abs=1e-9) and info["edges_seen"] == {"left": False, "right": False}
+
+def _edges_seen_by(tb, faces, frames):
+    """_layout_view_points over a sequence of (t, {"left": s or None, "right": s or None}) edge observations."""
+    plane = tb._wall_plane(faces)
+    out = None
+    for t, e in frames:
+        tb.head = {"t": t}
+        tb._wall_extent = lambda h, pl, e=e: {"left": None if e["left"] is None else {"s": e["left"]},
+                                               "right": None if e["right"] is None else {"s": e["right"]},
+                                               "seen": [-0.3, 0.3]}
+        out = tb._layout_view_points(faces)
+    return plane, out
+
+
+def test_obs_pose_region_edge_memory_newest_consistent_pair_and_contradictions():
+    """Edges remembered over phase 1 (2026-11-20 af2: a stale false left edge, -0.70 m from the real right edge, won
+    over that right edge three times, the remembered right one was never used): both sides consistent with the layout
+    width (halfway rule) -> their middle; contradicting -> the side measured in the newer frame; contradicting within
+    one frame -> neither (the seen extent); edges_seen = the edges used."""
+    faces = list(box_faces().values())
+    W = 1.2
+    tb = kin_toolbox()                                   # stale false left edge, then the real right edge
+    _, (_, info, _) = _edges_seen_by(tb, faces, [(1.0, {"left": 0.12, "right": None}), (2.0, {"left": None, "right": 0.63})])
+    assert info["lateral"] == pytest.approx([0.63 - W, 0.63], abs=1e-9)
+    assert info["edges_seen"] == {"left": False, "right": True} and info["edge_conflict"]["dropped"] == ["left"]
+    assert "left" not in tb._layout_edges
+    tb = kin_toolbox()                                   # the reverse order: the newer left edge wins
+    _, (_, info, _) = _edges_seen_by(tb, faces, [(1.0, {"left": None, "right": -0.2}), (2.0, {"left": -0.61, "right": None})])
+    assert info["lateral"] == pytest.approx([-0.61, -0.61 + W], abs=1e-9) and info["edges_seen"] == {"left": True, "right": False}
+    tb = kin_toolbox()                                   # consistent pair from two frames: their middle
+    _, (_, info, _) = _edges_seen_by(tb, faces, [(1.0, {"left": -0.61, "right": None}), (2.0, {"left": None, "right": 0.62})])
+    assert info["lateral"] == pytest.approx([0.005 - W / 2, 0.005 + W / 2], abs=1e-9)
+    assert info["edges_seen"] == {"left": True, "right": True} and "edge_conflict" not in info
+    tb = kin_toolbox()                                   # contradiction within one frame: neither, the seen extent
+    _, (_, info, _) = _edges_seen_by(tb, faces, [(1.0, {"left": 0.12, "right": 0.63})])
+    assert info["edges_seen"] == {"left": False, "right": False} and info["edge_conflict"]["dropped"] == ["left", "right"]
+    assert info["lateral"] == pytest.approx([0.3 - W, -0.3 + W], abs=1e-9)
+
+
+def test_obs_pose_from_the_start_pose_with_the_wall_top_in_view_then_both_edges_at_the_planned_pose():
+    """CPU end to end of the af2 phase-1 failure: from the start pose (simulator head height, stereo noise, a small
+    roll) no side edge, the region from the seen extent, the pose centred on the wall (the code before the side test
+    found a false edge and planned the pose 0.66 m off to one side); from the planned pose the registration sees both
+    edges."""
+    tb = kin_toolbox()
+    tb.ws.boxes = {k: tbmod.BoxEstimate(k, [0, 0, 1, 1], 0.9, 1.0, face=f) for k, f in box_faces().items()}
+    tb.ws.target_box_id = "all"
+    tb.ws.stack = None
+    tb.head = head_frame(tb, 0.7, yaw=0.015, dz=SIM_HEAD_DZ, roll_deg=-0.3, noise=STEREO_SIGMA, seed=1)
+    tb._odom = lambda: tb.head["T_odom_root"]
+    r = tb.compute_obs_pose("all")
+    assert r["status"] == "ok", r["reason"]
+    sv, p = r["data"]["spec_view"], r["data"]["root_target_odom"]
+    assert sv["edges_seen"] == {"left": False, "right": False}
+    assert abs(p["pos"][1]) < 0.1 and p["d_obs"] == pytest.approx(1.2)
+    h = head_frame(tb, p["pos"][0], y=p["pos"][1], yaw=p["yaw"], dz=SIM_HEAD_DZ, noise=STEREO_SIGMA, seed=7)
+    tb2 = kin_toolbox()
+    failed, _ = _register(tb2, h)
+    assert failed is None and abs(tb2.ws.wall["registration"]["r"]) < 0.02
+
 
 # ------------------------------------------------------------------ 5. hand-camera look pose
 def _hand_view(margin):
@@ -609,6 +749,36 @@ def test_search_cell_preconditions():
 
 
 # ------------------------------------------------------------------ 8. stance re-registration
+@pytest.mark.parametrize("pose", [(0.65, -0.89, 0.0, 0.45), (0.85, -1.0, 0.3, 0.45), (0.75, 1.0, -0.3, 0.70),
+                                  (0.95, 1.0, -0.3, 0.30)])
+def test_wall_extent_edge_seen_beyond_the_wall_end_with_and_without_the_side_face(pose):
+    """From beyond a wall end the stack's side face is in view: the run of "on" pixels goes on over it down to d = -tol,
+    and the boundary ray met d = 0 outward of the corner by tol x (s_cam - s_edge) / d_cam (5.5-28 mm on these views,
+    2026-11-20 review). The ray is now intersected with d = -tol when the run ends on the side face, with d = 0 when no
+    side face is there (the step at the corner): within 1 mm of the true end both ways, and with stereo noise."""
+    x, y, yaw, lvl = pose
+    tb = kin_toolbox()
+    sd, true = ("left", -0.6) if y > 0 else ("right", 0.6)
+    for side_faces in (False, True):
+        e = extent(squat_frame(tb, x, y=y, yaw=yaw, height=lvl, side_faces=side_faces))[sd]
+        assert e is not None and e["s"] == pytest.approx(true, abs=0.001), (side_faces, e)
+        for seed in (0, 1):
+            e = extent(squat_frame(tb, x, y=y, yaw=yaw, height=lvl, side_faces=side_faces, noise=STEREO_SIGMA,
+                                   seed=seed))[sd]
+            assert e is not None and e["s"] == pytest.approx(true, abs=0.002), (side_faces, seed, e)
+
+
+def test_wall_extent_the_wall_base_is_no_side_edge_under_stereo_noise():
+    """The floor band at the wall's base lies within tol of the plane: labelling it by the sign of d labelled it by the
+    noise, and a squatted view with the right end out of view (s_cam -0.98) took the base for a 3-row right edge at
+    s -0.11 (seed 0, before the "floor" label). The run ending at the floor is the base: no edge."""
+    tb = kin_toolbox()
+    for seed in range(4):
+        ext = extent(squat_frame(tb, 0.65, y=1.0, yaw=-0.3, height=0.45, noise=STEREO_SIGMA, seed=seed))
+        assert ext["right"] is None and ext["left"]["s"] == pytest.approx(-0.6, abs=0.002), (seed, ext["right"])
+        assert ext["rejected"]["right"]["floor"] + ext["rejected"]["left"]["floor"] > 0
+
+
 def _stored_frame(tb, dyaw_deg=0.0, dlat=0.0, root=(0.75, 0.0)):
     """The true wall frame, then perturbed as odometry would: rotated about the root by dyaw, shifted along the wall."""
     tb.ws.wall = {"T_odom_wall": tb._wall_frame(np.array([WALL_X, 0.6, 0.0]), np.array([0, -1.0, 0]), np.array([-1.0, 0, 0])),
@@ -664,6 +834,119 @@ def test_layout_entries_follow_the_reregistered_frame():
     tb.ws.wall["T_odom_wall"] = T
     tb._sync_layout_all()
     assert np.allclose(apply(inv_T(T), bc.center), w0) and np.allclose(bc.face["center"], bc.center)
+
+
+def test_reregistration_squatted_beyond_the_wall_end_fits_the_front_not_the_side_face():
+    """2026-11-20 rule run i=151 (bc17 = C6R2): pelvis 0.65 m in front of the face, 0.29 m beyond its right end,
+    squatted to base_height 0.45 (pelvis z 0.447, pitch 21.45 deg measured). Before: dpsi 90.8 deg, dd 0.34 m, ds 2.1 m
+    (reproduced here: 90.0 / 0.36 / 2.12): the bbox of the projected wall rectangle held the stack's right side face
+    and the fit ran in the pitched root frame (the front's normal 21 deg off horizontal, beyond the 20 deg test). Now:
+    the front plane from the wall's predicted pixels, in odom; the right edge in view re-anchors; every record logs
+    the per-side edges."""
+    for noise in (0.0, STEREO_SIGMA):
+        tb = kin_toolbox()
+        _stored_frame(tb, root=(0.65, -0.89))
+        h = squat_frame(tb, 0.65, y=-0.89, height=0.45, pelvis_pitch_deg=21.45, pelvis_z=0.447, noise=noise, seed=3,
+                        side_faces=True)
+        tb._capture_head = lambda: h
+        rec = tb._reregister_at_stance()
+        assert rec["refit"] and abs(rec["dpsi_deg"]) < 0.5 and abs(rec["dd_m"]) < 0.01, rec
+        assert rec["anchored"] == ["right"] and abs(rec["ds_m"]) < 0.02
+        assert tb._wall_axes()["origin"] == pytest.approx([WALL_X, 0.6, 0.0], abs=0.02)
+        e = rec["edges"]["right"]
+        assert set(e) == {"s", "mad", "n_rows", "z_range"} and e["n_rows"] > 100 and rec["edges"]["left"] is None
+        assert rec["edges_on"] == "refit plane"
+    # in front of the wall at the deepest squat levels (pelvis pitched 25-26 deg): a 1 deg heading drift corrected
+    for height in (0.3, 0.25):
+        tb = kin_toolbox()
+        _stored_frame(tb, dyaw_deg=1.0, root=(0.65, 0.0))
+        h = squat_frame(tb, 0.65, height=height, noise=STEREO_SIGMA, seed=3, side_faces=True)
+        tb._capture_head = lambda: h
+        rec = tb._reregister_at_stance()
+        assert rec["refit"] and rec["dpsi_deg"] == pytest.approx(-1.0, abs=0.2), rec
+
+
+@pytest.mark.parametrize("dlat, dyaw", [(0.01, 0.0), (0.03, 0.0), (0.06, 0.0), (0.04, -2.0)])
+def test_reregistration_beyond_the_wall_end_keeps_the_side_face_out_of_the_predicted_region(dlat, dyaw):
+    """The i=151 view with the stored right end beyond the true one (dlat; odometry error below box_w / 2): rays
+    through the strip in between reach the side face, and with stereo noise those pixels tilted the refit 0.5-0.8 deg
+    and moved the far end 1-1.6 cm (2026-11-20 review). The end the camera is beyond is pulled in by box_w / 2: no
+    side-face pixel in the region, the refit within 0.4 deg and 6 mm, the lateral re-anchor within 2 mm."""
+    tb = kin_toolbox()
+    _stored_frame(tb, dlat=dlat, dyaw_deg=dyaw, root=(0.65, -0.89))
+    h = squat_frame(tb, 0.65, y=-0.89, height=0.45, pelvis_pitch_deg=21.45, pelvis_z=0.447, noise=STEREO_SIGMA, seed=3,
+                    side_faces=True)
+    region = tb._wall_region(h)
+    Tc = h["T_odom_root"] @ h["T_root_cam"]
+    clean = squat_frame(tb, 0.65, y=-0.89, height=0.45, pelvis_pitch_deg=21.45, pelvis_z=0.447, side_faces=True)["depth"]
+    vs, us = np.mgrid[0:480, 0:848]
+    P = (np.stack([(us - K_HEAD[0, 2]) / FX_HEAD, (vs - K_HEAD[1, 2]) / FX_HEAD, np.ones(us.shape)], -1)
+         * clean[..., None]) @ Tc[:3, :3].T + Tc[:3, 3]
+    side = np.isfinite(clean) & (np.abs(np.abs(P[..., 1]) - 0.6) < 1e-3) & (P[..., 0] > WALL_X + 1e-3)
+    assert region.sum() > 1000 and not (region & side).any()
+    tb._capture_head = lambda: h
+    rec = tb._reregister_at_stance()
+    ax = tb._wall_axes()
+    assert rec["refit"] and rec["anchored"] == ["right"], rec
+    assert abs(math.degrees(math.atan2(ax["normal"][1], -ax["normal"][0]))) < 0.4
+    far = ax["origin"] + 1.2 * ax["right"]                   # the far (left) end, 1.2 m along the wall
+    assert abs(float(ax["origin"][0]) - WALL_X) < 0.006 and abs(float(far[0]) - WALL_X) < 0.006
+    assert float(ax["origin"][1]) == pytest.approx(0.6, abs=0.002)
+
+
+def test_head_face_fit_in_odom_at_a_pitched_squat():
+    """Every head face fit (detect_boxes' view count, fit_front_face, refine_with_wrist's head refit, the stance
+    re-registration) runs in odom (_fit_face_odom): squatted to base_height 0.45 the pelvis is pitched 21 deg, beyond
+    max_normal_tilt_deg 20, and in the root frame the wall's own normal failed the near-vertical test."""
+    tb = kin_toolbox()
+    for noise in (0.0, STEREO_SIGMA):
+        h = squat_frame(tb, 0.65, height=0.45, pelvis_pitch_deg=21.45, pelvis_z=0.447, noise=noise, seed=3,
+                        side_faces=True)
+        bbox = [300, 100, 548, 380]
+        root = plane_fit.fit_front_face(h["depth"], h["K"], h["T_root_cam"], bbox, sigma_coeff=h["depth_sigma_coeff"],
+                                        min_structure_px=tb._min_structure_px())
+        if noise == 0.0:      # with noise a 3-point hypothesis the noise tilts below 20 deg can pass (it did, 4 of 4 seeds)
+            assert root["status"] != "ok"
+        r = tb._fit_face_odom(h, bbox)
+        assert r["status"] == "ok" and r["normal"] == pytest.approx([-1.0, 0.0, 0.0], abs=0.01)
+        assert float(r["center"][0]) == pytest.approx(WALL_X, abs=0.005)
+
+
+def test_reregistration_rejects_a_correction_of_half_a_box_and_skips_a_wall_out_of_view():
+    """Same-wall check, the registration's halfway rule: a plane correction moving the wall by >= box_w / 2 keeps the
+    previous frame; a re-anchor moving it by >= box_w / 2 is not applied (the plane correction is); the registered
+    wall out of the head view: no refit."""
+    tb = kin_toolbox()
+    _stored_frame(tb, root=(0.75, 0.0))
+    T = tb._wall_T()
+    T[:3, 3] += [0.15, 0.0, 0.0]                         # stored 0.15 m deeper than the wall seen (>= box_w / 2)
+    tb.ws.wall["T_odom_wall"] = T
+    h = head_frame(tb, 0.75, half_w=3.0)
+    tb._capture_head = lambda: h
+    rec = tb._reregister_at_stance()
+    assert not rec["refit"] and "refit rejected" in rec["note"] and rec["shift_m"] == pytest.approx(0.15, abs=0.01)
+    assert rec["edges_on"] == "stored plane" and set(rec["edges"]) == {"left", "right", "rejected"}
+    assert np.array_equal(tb._wall_T(), T) and tb.ws.wall["history"] == [rec]
+    T[:3, 3] += [-0.08, 0.0, 0.0]                        # 0.07 m (< box_w / 2): a correction, applied
+    tb.ws.wall["T_odom_wall"] = T.copy()
+    rec = tb._reregister_at_stance()
+    assert rec["refit"] and rec["dd_m"] == pytest.approx(0.07, abs=0.01)        # toward the robot (the normal)
+    tb = kin_toolbox()                                   # lateral: stored 0.12 m off, the left edge in view
+    _stored_frame(tb, dlat=0.12, root=(0.75, 0.45))
+    h = head_frame(tb, 0.75, y=0.45)
+    tb._capture_head = lambda: h
+    rec = tb._reregister_at_stance()
+    assert rec["refit"] and rec["anchored"] == [] and rec["ds_m"] is None and "re-anchor rejected" in rec["note"]
+    assert rec["ds_rejected_m"] == pytest.approx(-0.12, abs=0.004) and rec["edges"]["left"] is not None
+    assert tb._wall_axes()["origin"] == pytest.approx([WALL_X, 0.6 - 0.12, 0.0], abs=0.004)
+    tb = kin_toolbox()                                   # facing away from the wall
+    _stored_frame(tb, root=(0.75, 0.0))
+    T = tb._wall_T().copy()
+    h = head_frame(tb, 0.75, yaw=math.pi)
+    tb._capture_head = lambda: h
+    rec = tb._reregister_at_stance()
+    assert not rec["refit"] and rec["region_px"] == 0 and "not in the head view" in rec["note"]
+    assert np.array_equal(tb._wall_T(), T)
 
 
 # ------------------------------------------------------------------ 9. refusals and next_barcode
@@ -980,22 +1263,16 @@ def _look_setup():
     return tb, ta, aim, e
 
 
-@pytest.mark.parametrize("joint, sag_deg, tip_loop_covers", [("wrist_pitch", 6.0, False), ("wrist_roll", 5.0, False),
-                                                             ("shoulder_pitch", -5.0, True)])
-def test_look_pose_closed_loop_corrects_the_full_tip_pose_under_a_steady_sag(joint, sag_deg, tip_loop_covers):
+@pytest.mark.parametrize("joint, sag_deg", [("wrist_pitch", 6.0), ("wrist_roll", 5.0), ("shoulder_pitch", -5.0)])
+def test_look_pose_closed_loop_corrects_the_full_tip_pose_under_a_steady_sag(joint, sag_deg):
     """2026-11-19 scan room (rule run, cells C3R4 / C4R4): the look pose reached with the tip 8 mm off (below
     correction_tol, the tip loop stopped) and the scan axis 4.8 deg off left the face uncovered. A fake arm with a
-    steady joint sag: the tip loop (a label target's loop, unchanged) leaves the face uncovered for a wrist-pitch tilt
-    and a roll; the look loop corrects the full tip pose (orientation pre-compensated as the position is) and covers it
-    within the correction budget, without leaving IK reach, also where a camera translation alone needed a step out of
-    reach (shoulder_pitch -5 deg: 6 cm, reverted, uncovered) or could not undo the roll."""
+    steady joint sag: the look loop corrects the full tip pose (orientation pre-compensated as the position is) and
+    covers the face within the correction budget, without leaving IK reach, also where a camera translation alone needed
+    a step out of reach (shoulder_pitch -5 deg: 6 cm) or could not undo the roll (wrist_roll)."""
     tb, ta, aim, e = _look_setup()
     off = float(ta["offset"])
     cur, q0 = _sagging_arm(tb, sag_deg, joint)
-    tip = tb._reach(ta, off, tb.side)
-    assert set(tip["history"][-1]) == {"pos_err_m", "angle_err_deg"}
-    assert tb._view_error(ta, off, aim["see"])["covered"] is tip_loop_covers
-    cur["q"] = q0.copy()
     r = tb._reach(ta, off, tb.side, aim=aim)
     h = r["history"]
     A = tb.cfg["robot"]["arm_motion"]
@@ -1015,7 +1292,7 @@ def test_look_pose_first_command_is_held_to_its_view_not_to_the_ik_tolerance_of_
     """2026-11-19 rule run: every squat look stance failed the first IK of its look pose by 4-7 mm / 0.7-1.4 deg (scan
     pose tolerance 2 mm / 1 deg) and the box was lost. A look pose's IK attempt that did not converge is sent when its
     view (FK of the solution) shows the rectangle that has to be seen; one whose view misses it is an IK failure, nothing
-    sent. A label target keeps the IK tolerance."""
+    sent. A scan pose's attempt is held to the placement check instead (test_scan_pose_unconverged_first_command_...)."""
     tb, ta, aim, e = _look_setup()
     off = float(ta["offset"])
     cur, q0 = _sagging_arm(tb, 0.0)
@@ -1029,7 +1306,6 @@ def test_look_pose_first_command_is_held_to_its_view_not_to_the_ik_tolerance_of_
     assert tb._view_error(ta, off, aim["see"])["covered"]
     sent.clear()
     cur["q"] = q0.copy()
-    assert tb._reach(ta, off, tb.side)["ik_fail"] and not sent                # the label loop: IK tolerance
     tb.ik.solve = lambda *a, **k: dict(real(*a, **k), ok=False, q_full=q0.copy(), q_arm=q0[tb.ik.qi].copy())
     r = tb._reach(ta, off, tb.side, aim=aim)                                   # an attempt that looks elsewhere
     assert r["ik_fail"] and r["reason"].startswith("IK: target not reachable") and not sent
@@ -1154,3 +1430,221 @@ def test_rule_layout_searches_again_from_a_new_stance_when_the_look_pose_is_not_
         h = _layout_harness(tb)
         rule.Task3(h, cfg, "all").run()
         assert [c[0] for c in tb.calls].count("search_cell") == 2 and h.finished["success"] is False
+
+
+# ------------------------------------------------------------------ 2026-11-20 rule run: scan-pose sag, squat body model
+SCAN_STANCE = ((0.576, 0.311, 0.032), ([1.006, 0.585, 0.982], [0.999, 0.049, 0.0], 0.266))   # C1 R4, scanned from there
+
+
+def _scan_setup():
+    """The logged look stance of C1 R4 (standing, odometry) and its label target, reachable from there."""
+    tb = kin_toolbox()
+    tb.body_cmd = None
+    (x, y, yaw), (pos, fwd, off) = SCAN_STANCE
+    tb._odom = lambda: T_from_xy_yaw(x, y, yaw, 0.746)
+    return tb, _label_target(pos, fwd, off), off
+
+
+def _placement(tb, t, off):
+    fwd = np.asarray(t["forward"], float)
+    T = tb._odom() @ tb.kin.pose(tb._q(), tb.cfg["robot"]["wrist_point_frame"])
+    return tb._placement_measures(T, np.asarray(t["pos"]) + t["offset"] * fwd, -fwd, off, np.asarray(t["long_axis"]))
+
+
+@pytest.mark.parametrize("joint, sag_deg", [("wrist_pitch", 6.0), ("wrist_yaw", -6.0), ("wrist_roll", 5.0)])
+def test_scan_pose_closed_loop_corrects_the_full_tip_pose_under_a_steady_sag(joint, sag_deg):
+    """2026-11-19/20 logs: every label pose (9 of 9, rule layout run and r234 agent_full run) ended 2.7-9.8 deg off the
+    label normal after the tip-position loop, and 3 of 6 placements failed the check's axis offset (the label centre
+    1.7-3.4 cm off the scanner axis). The scan-pose loop now pre-compensates the commanded rotation as the look loop
+    does (one loop): under a steady joint sag the first command misses the check, the corrected pose passes it with the
+    tip, the axis and the roll corrected, within the correction budget and without a revert; no sag: one command."""
+    tb, t, off = _scan_setup()
+    cur, q0 = _sagging_arm(tb, sag_deg, joint)
+    A = tb.cfg["robot"]["arm_motion"]
+    r = tb._reach(t, off, tb.side)
+    h = r["history"]
+    assert not r["ik_fail"] and not any(x.get("reverted_to_best") for x in h) and 1 < len(h) <= 1 + A["correction_iters"]
+    assert set(h[0]) == {"pos_err_m", "angle_err_deg", "axis_offset_m"}
+    T = tb.kin.pose(tb._q(), tb.cfg["robot"]["wrist_point_frame"])
+    _, d = tb._target_in_root(t, offset=off)
+    roll = tb.ik.roll_error_deg(T[:3, :3], d, tb._roll_in_root(t))
+    pm = _placement(tb, t, off)
+    assert pm["good"] and max(h[-1]["pos_err_m"], h[-1]["axis_offset_m"]) < A["correction_tol"]
+    assert h[-1]["angle_err_deg"] < 1.0 and roll < 1.0
+    if joint != "wrist_roll":                               # a tilt misses the label by about range x tilt
+        assert h[0]["angle_err_deg"] > 4.0 and h[0]["axis_offset_m"] > 0.015
+    _sagging_arm(tb, 0.0)
+    r0 = tb._reach(t, off, tb.side)
+    assert len(r0["history"]) == 1 and r0["history"][0]["axis_offset_m"] < 0.003
+
+
+def test_scan_pose_unconverged_first_command_is_held_to_the_placement_check():
+    """2026-11-20 rule run i=145: a re-planned label pre-pose failed IK by 7 mm / 3.1 deg (IK tolerance 2 mm / 1 deg) and
+    the barcode was lost. A scan pose's IK attempt that did not converge is sent when its FK pose passes the placement
+    check's tolerances at that distance (task2.yaml check, what check_wrist_placement accepts); one the check would
+    reject (the attempt 3 cm to the side: axis offset > axis_offset_max_m 0.02) is an IK failure, nothing sent."""
+    tb, t, off = _scan_setup()
+    cur, q0 = _sagging_arm(tb, 0.0)
+    real = tb.ik.solve
+    sent = []
+    set_arm = tb.robot.set_arm_joints
+    tb.robot.set_arm_joints = lambda side, q, dur: (sent.append(q), set_arm(side, q, dur))[1]
+    tb.ik.solve = lambda *a, **k: dict(real(*a, **k), ok=False)          # converged to ~2 mm, reported not ok
+    r = tb._reach(t, off, tb.side)
+    assert not r["ik_fail"] and len(sent) == 1 and r["history"][0]["ik_unconverged"]["pos_err_m"] < 0.003
+    assert _placement(tb, t, off)["good"]
+    sent.clear()
+    cur["q"] = q0.copy()
+    side_root = tb._roll_in_root(t)                                        # horizontal, along the face
+    tb.ik.solve = lambda q, p, *a, **k: dict(real(q, np.asarray(p) + 0.03 * side_root, *a, **k), ok=False)
+    r = tb._reach(t, off, tb.side)
+    assert r["ik_fail"] and r["reason"].startswith("IK: target not reachable") and not sent
+
+
+def test_scan_pose_correction_out_of_ik_reach_keeps_its_position_part():
+    """A steady wrist_pitch sag of 4 deg with wrist_pitch 0.5 deg from its IK limit at the first solution (the logged
+    C1 R4 stance): the pre-compensated rotation leaves the IK's reach. The revert to the first pose left the label 3.2
+    cm off the scanner axis (the check fails; 2026-11-20 review), the position step with the rotation commanded before
+    reaches it (10b05eb's position-only correction: 1.95 cm, passes). Now that step is sent: logged rotation_kept, no
+    revert, the check passes."""
+    from g1agent.kinematics.ik import ARM
+    tb, t, off = _scan_setup()
+    _sagging_arm(tb, 0.0)
+    p, d = tb._target_in_root(t, offset=off)
+    j = ARM.index("wrist_pitch")
+    tb.ik.lo[j] = tb.ik.solve(tb._q(), p, d, roll_axis=tb._roll_in_root(t))["q_arm"][j] - math.radians(0.5)
+    _sagging_arm(tb, 4.0, "wrist_pitch")
+    r = tb._reach(t, off, tb.side)
+    h = r["history"]
+    assert not r["ik_fail"] and not any(x.get("reverted_to_best") for x in h)
+    assert any(x.get("rotation_kept") for x in h) and _placement(tb, t, off)["good"]
+
+
+def test_scan_pose_unconverged_first_command_is_an_ik_failure_when_the_pose_reached_fails_the_check():
+    """The unconverged first command is accepted on the FK of the IK solution, before the sag. At the edge of reach the
+    corrections are out of IK reach, the arm reverts to the first pose, and its IK residual plus the sag fails the
+    check: 2026-11-20 review, 4 of 4 such cases (IK residual -4..4 deg, sag 5 deg) ended "partial" 2.1-5.8 cm off the
+    axis, and rule mode's single re-plan (on "IK" failures only) never ran. The pose reached is held to the same test:
+    an IK failure, as at 10b05eb."""
+    from scipy.spatial.transform import Rotation
+    for tilt in (-4.0, 4.0):
+        tb, t, off = _scan_setup()
+        _sagging_arm(tb, 5.0, "wrist_pitch")
+        real = tb.ik.solve
+        n = {"k": 0}
+
+        def solve(q, p, d, *a, **k):
+            n["k"] += 1
+            if n["k"] == 1:                               # the best attempt `tilt` deg off, not converged
+                ax = np.cross(d, [0, 0, 1.0])
+                d2 = Rotation.from_rotvec(math.radians(tilt) * ax / np.linalg.norm(ax)).apply(d)
+                return dict(real(q, p, d2, *a, **k), ok=False)
+            return dict(real(q, p, d, *a, **k), ok=False, q_full=q, q_arm=q[tb.ik.qi])   # every correction out of reach
+        tb.ik.solve = solve
+        r = tb._reach(t, off, tb.side)
+        assert r["ik_fail"] and r["reason"].startswith("IK: target not reachable"), r.get("reason")
+        assert r["history"][0]["ik_unconverged"] and not _placement(tb, t, off)["good"]
+
+
+def _body(tb):
+    """BodyModel on the g1_v2 kinematics with the configured squat calibration and a minimal collision geometry (one
+    leg and one arm link: the geometry plays no part in the level model)."""
+    import os
+    from g1agent.tools.body import BodyModel
+    cal = json.load(open(os.path.join(config.ROOT, tb.cfg["robot"]["body"]["calibration"])))["levels"]
+    geom = {"body_names": ["left_knee_link", "left_elbow_link"], "points": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            "radius": [0.05, 0.05], "owner": [0, 1]}
+    return BodyModel(tb.kin, geom, cal, "left", tb.cfg["robot"]["wrist_point_frame"])
+
+
+def _tilt(pitch_deg, roll_deg=0.0):
+    """Ry(pitch) Rx(roll): the odometry rotation with the yaw removed (R = Rz Ry Rx, g1_barcode_sim env._update_odom)."""
+    from scipy.spatial.transform import Rotation
+    return Rotation.from_euler("YX", [pitch_deg, roll_deg], degrees=True).as_matrix()
+
+
+def test_body_level_measured_at_the_stance_replaces_the_calibration():
+    """A squat level is planned with the state measured at it (pelvis height and full tilt from the odometry pose, leg /
+    waist joints from the joint state) once the robot has been there; other levels keep the calibration; a command
+    that is no calibrated level is not recorded."""
+    tb = kin_toolbox()
+    body = _body(tb)
+    cal45 = next(c for c in body.levels if c["height_cmd"] == 0.45)
+    T = T_from_xy_yaw(0.3, -0.2, 0.5, 0.449)
+    T[:3, :3] = T[:3, :3] @ _tilt(21.2, 0.6)
+    q = tb.kin.q_from_state([], [])
+    for n, v in cal45["q"].items():
+        if n in tb.kin.joint_q_index:
+            q[tb.kin.joint_q_index[n]] = v
+    q[tb.kin.joint_q_index["waist_pitch_joint"]] += 0.05
+    m = body.observe(0.45, T, q)
+    lv = {c["height_cmd"]: c for c in body.levels}
+    assert lv[0.45] is m and m["measured"] and m["pelvis_z"] == pytest.approx(0.449)
+    assert m["pelvis_pitch_deg"] == pytest.approx(21.2, abs=1e-6)
+    assert all(not c.get("measured") for h, c in lv.items() if h != 0.45) and len(lv) == len(body.calibration)
+    assert np.allclose(body.T_root(0.3, -0.2, 0.5, m), T, atol=1e-9)               # the measured pose, roll included
+    q_lv = body.q_at(tb.kin.q_from_state([], []), m)
+    assert q_lv[tb.kin.joint_q_index["waist_pitch_joint"]] == pytest.approx(cal45["q"]["waist_pitch_joint"] + 0.05)
+    assert body.observe(0.47, T, q) is None and len(body.measured) == 1
+
+
+def test_set_base_height_measures_the_level_only_with_the_arm_home():
+    """set_base_height records the settled state of the level (the calibration's conditions: upright, arms home) and
+    logs it in its diagnostics (not shown to the LLM); with the arm raised the waist balances the arm, nothing is
+    recorded."""
+    tb = kin_toolbox()
+    tb._body_model = _body(tb)
+    T = T_from_xy_yaw(0.3, -0.2, 0.5, 0.449)
+    T[:3, :3] = T[:3, :3] @ _tilt(21.4)
+    tb._odom = lambda: T
+    tb.robot.set_body_pose = lambda h, rpy, ramp, settle: {"status": "ok", "reason": "", "pelvis_z": 0.449, "tilt_deg": 21.4}
+    tb.arm_at_home = False
+    r = tb.set_base_height(0.45)
+    assert r["status"] == "ok" and "diagnostics" not in r and not tb._body_model.measured
+    tb.arm_at_home = True
+    r = tb.set_base_height(0.45)
+    assert r["diagnostics"]["body_level_measured"]["pelvis_z"] == pytest.approx(0.449)
+    assert set(r["diagnostics"]["body_level_measured"]["waist"]) == {"waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"}
+    assert tb._body_model.levels[[c["height_cmd"] for c in tb._body_model.levels].index(0.45)]["measured"]
+
+
+# the logged squat stances of the 2026-11-20 rule run whose poses failed IK after the squat: plan_stance's stance (pelvis
+# position, yaw, level), the measured pelvis z / tilt after the squat (approach data base_height), the target
+LOGGED_SQUAT = {
+    # i=76 -> 78: look pose of C? R3 (alternative 0, roll 90 deg) at 0.70; search_cell IK 6 mm / 1.1 deg
+    "look_070": {"stance": (0.823, -0.848, 0.108), "level": 0.70, "measured": (0.702, 1.424),
+                 "target": {"pos": [1.007, -0.506, 0.625], "forward": [0.99326, 0.11588, 0.0], "offset": 0.33,
+                            "long_axis": [0.0, 0.0, 1.0], "roll_signed": True, "purpose": "look", "barcode_id": "bc6"},
+                 "finals": [0.33], "pre": None},
+    # i=143 -> 145: label C5 R2 at 0.40 (pre gap -0.05: pre-pose 0.25 m, final the clamp 0.12 m); move_arm('pre') IK
+    # 7 mm / 3.1 deg
+    "label_040": {"stance": (0.956, -0.52, 0.172), "level": 0.40, "measured": (0.401, 25.052),
+                  "target": {"pos": [1.004, -0.207, 0.472], "forward": [0.985, 0.171, 0.0], "offset": 0.3,
+                             "long_axis": [0.171, -0.985, 0.0], "barcode_id": "bc16"},
+                  "finals": [0.12], "pre": 0.25},
+}
+
+
+@pytest.mark.parametrize("case", sorted(LOGGED_SQUAT))
+def test_logged_squat_stances_are_not_robust_on_the_measured_body_pose(case):
+    """Root cause of the squat IK failures (plan accepted, execution failed by 4-14 mm): the stances were planned on the
+    squat calibration (g1_v1's, robot.yaml: an approximation for g1_v2), whose pelvis is 11-22 mm lower than the
+    pelvis g1_v2 settles at (all 14 logged squat arrivals). plan_stance's robustness test (the stance displaced by the
+    walk tolerance) passes with the calibrated level and fails with the measured pelvis height and tilt (the measured
+    tilt taken as pitch; the leg / waist joints of the calibration: the run logged no joint state): planned on the body
+    pose the robot is measured in, these stances are not chosen. All 12 logged squat look stances behave so (2 of the
+    7 displaced poses unreachable each, offline check)."""
+    c = LOGGED_SQUAT[case]
+    tb = kin_toolbox()
+    body = _body(tb)
+    lv = next(l for l in body.levels if l["height_cmd"] == c["level"])
+    t = {k: (np.asarray(v, float) if isinstance(v, list) else v) for k, v in c["target"].items()}
+    x, y, yaw = c["stance"]
+    q_lv = body.q_at(tb.kin.q_from_state([], []), lv)
+    tb.ik.cfg["restarts"] = 1                                                   # as plan_stance plans
+    assert tb._stance_robust(t, body.T_root(x, y, yaw, lv), q_lv, c["finals"], c["pre"])
+    z, tilt = c["measured"]
+    T = T_from_xy_yaw(x, y, yaw, z)
+    T[:3, :3] = T[:3, :3] @ _tilt(tilt)
+    m = body.observe(c["level"], T, q_lv)
+    assert not tb._stance_robust(t, body.T_root(x, y, yaw, m), q_lv, c["finals"], c["pre"])
