@@ -898,3 +898,28 @@ def test_task_tools_helper():
     assert task_tools(3, tb) == TASK_TOOLS[3] and "search_cell" not in TASK_TOOLS[2] and "search_cell" not in TASK_TOOLS[3]
     tb.wall_layout = dict(LAYOUT)
     assert task_tools(3, tb) == TASK_TOOLS[3] + ["search_cell"] and task_tools(2, tb) == TASK_TOOLS[2]
+
+
+# ------------------------------------------------------------------ 2026-11-19 layout test run (agent_full) fixes
+def test_summary_holds_a_look_target_with_alternative_poses():
+    """look_head crashed (TypeError) while ws.wrist_target was a look target: its 'alternatives' is a list of dicts."""
+    tb = kin_toolbox()
+    tb.ws.wrist_target = {"pos": np.array([1.0, 0.123456, 0.8]), "offset": 0.3, "purpose": "look",
+                          "alternatives": [{"pos": [1.0, 0.1, 0.8], "roll_deg": 90.0, "long_axis": np.array([0.0, 0.0, 1.0])},
+                                           {"pos": [1.0, 0.2, 0.8], "roll_deg": 270.0, "long_axis": [0.0, 0.0, -1.0]}],
+                          "rect": [[0.0, 0.1], [0.2, 0.3]], "empty": []}
+    s = tb.ws.summary()["wrist_target"]
+    assert s["pos"] == [1.0, 0.123, 0.8] and s["rect"] == [[0.0, 0.1], [0.2, 0.3]] and s["empty"] == []
+    assert s["alternatives"][0] == {"pos": [1.0, 0.1, 0.8], "roll_deg": 90.0, "long_axis": [0.0, 0.0, 1.0]}
+    assert s["alternatives"][1]["long_axis"] == [0.0, 0.0, -1.0]
+    json.dumps(s)
+
+
+def test_walking_tools_refuse_while_the_arm_is_raised():
+    tb = kin_toolbox()
+    tb.arm_at_home = False
+    reached = object()
+    tb._stance_reached = reached
+    g = tb._walk_guard()
+    assert g is not None and g["status"] == "fail" and "move_arm('home')" in g["reason"]
+    assert tb._stance_reached is reached                         # a refused walk keeps the reached stance

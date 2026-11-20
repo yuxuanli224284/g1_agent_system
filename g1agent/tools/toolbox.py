@@ -869,8 +869,12 @@ class Toolbox:
         """Walking while squatted degrades badly (GR00T in MuJoCo: 0.38 m in 7 s at height 0.60 vs 1.09 m standing): a
         walking tool stands the robot up first, which needs the arm at home (it must not sweep through the legs while
         they extend). 2026-11-07: the agent_full LLM squatted before walking and never squatted again at the stance, so
-        standing up / squatting belong to the tools, not to the call order."""
-        self._stance_reached = None                     # every walking tool calls this guard first: the robot leaves
+        standing up / squatting belong to the tools, not to the call order.
+        The base never walks with the arm raised, whatever the posture (the prompt's rule, now enforced: 2026-11-19 the
+        agent_full LLM walked from one box to the next with the scanner raised in front of the wall)."""
+        if not self.arm_at_home:
+            return fail("the arm is raised: call move_arm('home') first (the base never walks with the arm raised)")
+        self._stance_reached = None                    # every walking tool calls this guard first: the robot leaves
         if self._standing() and abs(self.view_pitch) < 1e-9:   # the stance it may have reached
             return None
         if self._standing():                            # leaned back for a head view: upright before walking
@@ -1934,7 +1938,8 @@ class Toolbox:
         if getattr(self, "_stance_reached", None) is not st:
             return fail("the robot is not at the planned stance: call approach('stance_target') first")
         if not self.arm_at_home:
-            return fail("the arm must be at home (the wall is re-registered from the head): call move_arm('home')")
+            return fail("the arm must be at home: call move_arm('home'), then search_cell again (search_cell re-registers "
+                        "the wall from the head camera by itself)")
         self._stance_attempted.add(bc.id)
         rounds = []
         for k in range(2):

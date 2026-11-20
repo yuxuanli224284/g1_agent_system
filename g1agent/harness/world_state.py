@@ -142,6 +142,23 @@ class WorldState:
 
 
 def _target(t, r):
+    """Numeric sequences rounded by r; a sequence holding non-numbers (e.g. the look target's list of alternative poses,
+    which are dicts) is walked element by element, so any target structure can be summarised."""
     if t is None:
         return None
-    return {k: (r(v) if isinstance(v, (list, tuple, np.ndarray)) else v) for k, v in t.items()}
+    return {k: (_seq(v, r) if isinstance(v, (list, tuple, np.ndarray)) else v) for k, v in t.items()}
+
+
+def _numeric(v) -> bool:
+    if isinstance(v, np.ndarray):
+        return v.dtype.kind in "biuf"
+    if isinstance(v, (list, tuple)):
+        return all(_numeric(x) for x in v)
+    return isinstance(v, (int, float, np.number, np.bool_))
+
+
+def _seq(v, r):
+    if _numeric(v):
+        return r(v)
+    return [_seq(x, r) if isinstance(x, (list, tuple, np.ndarray)) else _target(x, r) if isinstance(x, dict) else x
+            for x in v]
