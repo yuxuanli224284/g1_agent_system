@@ -2206,6 +2206,24 @@ class Toolbox:
         wall["delta_lat"] = self._delta_now()
         rec["delta_lat"] = wall["delta_lat"]
         rec["D_m"] = self._strip_D_now()
+        self._resync_label_targets()
+
+    def _resync_label_targets(self):
+        """Strip mode, after a re-registration: the stored wrist targets of a label entry (ws.wrist_target and
+        ws.wrist_target_refined) are re-derived from the entry's re-synced odometry geometry with their own stand-off
+        (pos = centre + offset * normal, as compute_wrist_target), so the arm moves to the label in the re-registered
+        frame (user decision 2026-11-20: re-register before the arm moves). A look target (a cell entry) is left alone:
+        search_cell computes its look pose on the re-registered cell itself."""
+        ws = self.ws
+        for name in ("wrist_target", "wrist_target_refined"):
+            t = getattr(ws, name)
+            if t is None or t.get("purpose") == "look":
+                continue
+            bc = ws.barcodes.get(t.get("barcode_id"))
+            if bc is None or bc.wall is None or bc.kind != "label" or bc.center is None:
+                continue
+            setattr(ws, name, dict(t, pos=bc.center + float(t["offset"]) * bc.normal, forward=-bc.normal,
+                                   bar_dir=bc.bar_dir, long_axis=self._long_axis(bc)))
 
     def _strip_anchor(self, el, er, root, right, net, t):
         """Strip mode: the lateral re-anchor of a re-registration from the side edges in view (el / er on the refit
@@ -2464,7 +2482,7 @@ class Toolbox:
         self._store_layout(b)
 
     def _record_failed_stance(self, bc, st):
-        self._failed_stances.add(self._failed_key(bc.id, st))
+        self._failed_stances.update(self._failed_keys(bc.id, st))
 
     def search_cell(self, barcode_id: str | None = None):
         """Wall-layout task: find the label of the current box (an entry of kind "cell") with the hand camera, at the
@@ -2606,8 +2624,9 @@ class Toolbox:
         """Strip mode, search_cell: every other box the look stance st serves (st["serves"], plan order) that is still a
         pending cell entry is searched from this stance as the current one (arm home, the wall re-registered, the look
         pose of its own alternative st["look_alts"], a second search after "none"): found -> its entry becomes the label
-        (_convert_cell), none twice -> no_label, otherwise it stays a cell. Returns ([{"barcode_id", "outcome",
-        "barcode_status"?, "added"?}], [{"barcode_id", "rounds"}]) (ids for the harness and the logs only)."""
+        (_convert_cell), none twice -> no_label, otherwise it stays a cell and st is recorded failed for it. Returns
+        ([{"barcode_id", "outcome", "barcode_status"?, "added"?}], [{"barcode_id", "rounds"}]) (ids for the harness and
+        the logs only)."""
         out, logs = [], []
         for mid in (st.get("serves") or [])[1:]:
             m = self.ws.barcodes.get(mid)
@@ -2636,6 +2655,11 @@ class Toolbox:
                                  f"label centre lies in it ({len(rounds)} searches, from the stance of the row's box "
                                  f"{bc.id})")
                 rec["barcode_status"] = "no_label"
+            elif last["outcome"] != "home_failed":
+                # not covered / a cut label / its view not reachable from this stance: recorded failed for the member
+                # as for the current box (_record_failed_stance), so that its own stance, when it is current, is
+                # another one (in place, this one would be planned again while the robot has not walked)
+                self._record_failed_stance(m, st)
             out.append(rec)
             logs.append({"barcode_id": mid, "rounds": rounds})
         return out, logs
@@ -3619,8 +3643,9 @@ class Toolbox:
         strips = self.strip_mode
 
         def rel(p):
-            """Identity of a stance point for the failed-stance record: (face distance, lateral offset) of the pelvis
-            point relative to the CURRENT barcode (strip mode: a group grid is laid around the group's centre)."""
+            """(face distance, lateral offset) of the pelvis point relative to the CURRENT barcode, for the stance's
+            log fields (strip mode: a group grid is laid around the group's centre). Not an identity: it is recomputed
+            from the barcode centre, which every re-registration re-syncs (the grid's own (d, l) are the identity)."""
             v = np.asarray(p, float)[:2] - cur["base"][:2]
             return float(v @ nh[:2]), float(v @ left[:2])
 
@@ -3632,6 +3657,13 @@ class Toolbox:
             member. Returns (best, chosen level, its index, fallback)."""
             best, chosen, chosen_li, fallback, cands = None, None, None, None, []
             base = cur["base"] if len(members) == 1 else np.mean([m["base"] for m in members], axis=0)
+            # failed-stance identity of a grid point: the grid's own exact (d, l) and level (approach A); strip mode adds
+            # the grid's members (its base point is their mean): the identity survives a re-registration, which moves
+            # the members' centres and so the base, but not the grid parameters (rel(p) floats would differ)
+            gid = tuple(m["bc"].id for m in members)
+
+            def key(d, l, li):
+                return ((gid, float(d)), float(l), li) if strips else (float(d), float(l), li)
             for li, lv in enumerate(levels):
                 q_lv = q0 if lv is None else body.q_at(q0, lv)
                 # with the feet fixed the pelvis moves while squatting: walk (standing) to the pelvis position minus
@@ -3641,7 +3673,7 @@ class Toolbox:
                 for d in dists:
                     for l in lat:
                         p = base + d * nh + l * left
-                        if ((*rel(p), li) if strips else (float(d), float(l), li)) in failed:
+                        if key(d, l, li) in failed:
                             rejected["failed_placement"] += 1
                             continue
                         pw = p[:2] - shift
@@ -3718,7 +3750,7 @@ class Toolbox:
                             rejected[rej] += 1
                             continue
                     out = {"p": p, "pw": pw, "d": d, "l": l, "m": evs[j0]["margin"], "travel": travel, "clear": clear,
-                           "gap": evs[j0]["gap"], "Tc": Tc, "ai": alt_of[j0], "lv": lv, "li": li,
+                           "gap": evs[j0]["gap"], "Tc": Tc, "ai": alt_of[j0], "lv": lv, "li": li, "key": key(d, l, li),
                            "members": [{"m": m, "ai": alt_of[j], "ev": evs[j]} for m, j in zip(members, picks)]}
                     if fallback is None:
                         fallback = (out, lv)
@@ -3803,6 +3835,7 @@ class Toolbox:
             else:
                 st["pre_gaps"] = {x["m"]["bc"].id: float(x["ev"]["gap"]) for x in mem}
                 st["finals_by"] = {x["m"]["bc"].id: list(x["m"]["finals"]) for x in mem}
+            st["stance_key"] = best["key"]            # the failed-stance identity (_failed_keys)
             if in_place:
                 st["in_place"] = self._walk_seq
         self._marker("stance", "red", "root", [pw[0], pw[1], 0.0], yaw=st["yaw"])
@@ -3816,11 +3849,18 @@ class Toolbox:
             msg = ("stance planned (the robot has not moved): call approach('stance_target') to walk there"
                    + (f"; it then squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by itself"
                       if squat else ""))
-        res = ok({"stance_odom": self.ws.stance_target, "joint_limit_margin_rad": m, "clearance": clear,
+        shown, diag = self.ws.stance_target, {}
+        if strips:
+            # the members a stance serves are named only in the diagnostics (design C1 P6: ids of other boxes invite
+            # tool calls for them, the stack4c refusal loops); the reply carries the stance itself
+            own = ("serves", "look_alts", "target_pos_by", "pre_gaps", "finals_by", "stance_key")
+            shown = {k: v for k, v in st.items() if k not in own}
+            diag["stance_members"] = {k: st[k] for k in own if k in st}
+        res = ok({"stance_odom": shown, "joint_limit_margin_rad": m, "clearance": clear,
                   "squat": squat, "robust": robust, "rejected": rejected}, msg)
-        if chosen is None:
-            return res
-        return with_diagnostics(res, {"body_level": "measured" if chosen.get("measured") else "calibration"})
+        if chosen is not None:
+            diag["body_level"] = "measured" if chosen.get("measured") else "calibration"
+        return with_diagnostics(res, diag) if diag else res
 
     def _stance_member(self, bc, t) -> dict:
         """What plan_stance needs of one barcode's wrist target t: the required final distances and the pre-pose
@@ -3856,8 +3896,23 @@ class Toolbox:
             pre_dists = list(np.arange(t["offset"] + gap0, t["offset"] - 1e-9, -S["step"]))
         return {"bc": bc, "t": t, "look": look, "finals": finals, "pre_dists": pre_dists,
                 "alts": [dict(t, pos=a["pos"], long_axis=a["long_axis"]) for a in t["alternatives"]] if look else [t],
-                "tpos": ("look",) if look else _stance_target_key(t["pos"]),
+                "tpos": self._target_identity(bc, t),
                 "base": np.array([bc.center[0], bc.center[1], 0.0])}
+
+    def _target_identity(self, bc, t) -> tuple:
+        """Identity of wrist target t of barcode bc for the failed-stance record: a look target is the box (("look",),
+        recomputed on every re-registration); a label target is its exact position (an unchanged estimate gives
+        bit-identical numbers, so no tolerance; a new measurement is a new problem). Strip mode re-registers the frame
+        at every stance arrival and re-syncs every layout entry's odometry centre from its wall-frame geometry, so the
+        odometry position changes without a new measurement: there the position in the wall frame is used, from the
+        stored wall-frame centre and normal (bc.wall, changed only by a measurement: _store_layout) and the target's
+        stand-off (t["pos"] = centre + offset * normal)."""
+        if t.get("purpose") == "look":
+            return ("look",)
+        if self.strip_mode and bc.wall is not None:
+            w = bc.wall
+            return _stance_target_key(np.asarray(w["center"], float) + float(t["offset"]) * np.asarray(w["normal"], float))
+        return _stance_target_key(t["pos"])
 
     def _label_target(self, bc) -> dict:
         """The wrist target compute_wrist_target gives a label entry by default (its stand-off), without the current-id
@@ -3934,20 +3989,27 @@ class Toolbox:
             if len(picks) != len(members):
                 continue
             j0 = picks[0]
-            return {"p": Tc[:2, 3].copy(), "pw": pw_now, "d": None, "l": None, "m": evs[j0]["margin"], "travel": 0.0,
+            return {"p": Tc[:2, 3].copy(), "pw": pw_now, "d": None, "l": None, "key": ("in_place", self._walk_seq, li),
+                    "m": evs[j0]["margin"], "travel": 0.0,
                     "clear": clear, "gap": evs[j0]["gap"], "Tc": Tc, "ai": owner[j0][1], "lv": lv, "li": li,
                     "yaw": yaw_now, "members": [{"m": m, "ai": owner[j][1], "ev": evs[j]} for m, j in zip(members, picks)]}
         return None
 
-    @staticmethod
-    def _failed_key(bc_id, st) -> tuple:
-        """Identity of a stance that failed placement for barcode bc_id (the _failed_stances record plan_stance skips):
-        (id, its target identity, face distance, lateral offset, level index); an in-place stance (strip mode) is
-        identified by the walk counter it was planned at instead of its position (the same place while no walk)."""
+    def _failed_keys(self, bc_id, st) -> list:
+        """Identities of a stance that failed placement for barcode bc_id (the _failed_stances records plan_stance
+        skips): (id, its target identity, face distance, lateral offset, level index) (approach A: the grid's exact
+        values). Strip mode: (id, target identity, *st["stance_key"]): a grid stance by its grid parameters and members,
+        an in-place stance by the walk counter it was planned at ("in_place", walk counter, level: the same place while
+        no walk). A walked stance the robot stands on (reached, no walk since) is also recorded as its in-place twin at
+        the current walk counter: plan_stance tries the place where the robot stands first, and while no walk happens
+        that place at this level IS the failed stance."""
         tp = tuple((st.get("target_pos_by") or {}).get(bc_id, st["target_pos"]))
-        if st.get("in_place") is not None:
-            return bc_id, tp, "in_place", st["in_place"], st["level_index"]
-        return bc_id, tp, st["face_dist"], st["lateral_offset"], st["level_index"]
+        if "stance_key" not in st:
+            return [(bc_id, tp, st["face_dist"], st["lateral_offset"], st["level_index"])]
+        keys = [(bc_id, tp, *st["stance_key"])]
+        if st.get("in_place") is None and getattr(self, "_stance_reached", None) is st:
+            keys.append((bc_id, tp, "in_place", self._walk_seq, st["level_index"]))
+        return keys
 
     def _body_clearance(self, body, sols, Tc, obstacles, poly):
         """Clearances of the arm solutions sols at root pose Tc (plan_stance's checks, in its order): the smallest
@@ -4637,7 +4699,7 @@ class Toolbox:
             if st is not None and st.get("barcode_id") == bc.id:
                 # this stance failed placement for this wrist target: plan_stance will not plan it again for the same
                 # target (identity: barcode, target position, face distance, lateral offset, body level)
-                self._failed_stances.add(self._failed_key(bc.id, st))
+                self._record_failed_stance(bc, st)
                 data["failed_stance"] = {k: st[k] for k in ("face_dist", "lateral_offset", "base_height", "level_index")}
             return fail(f"{where}: move_arm('final') did not reach it ({last.get('status')}); re-plan the stance "
                         "(move_arm('home'), compute_wrist_target, plan_stance, approach)", data)

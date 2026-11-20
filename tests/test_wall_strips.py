@@ -152,6 +152,25 @@ def test_evaluator_strips_use_absolute_columns_in_a_yawed_frame(yaw):
         ev.order_items([], "strips")
 
 
+def test_evaluator_strips_one_side_test_without_a_tolerance():
+    """The labels' side is checked by box_face's own face choice (no rounding tolerance): a wall whose boxes carry a
+    tiny yaw jitter is one side; a label on another side of its box is refused."""
+    def wall(jitter):
+        boxes, labels = {}, []
+        for k, y in enumerate((0.3, 0.1, -0.1, -0.3)):
+            a = 0.5 * jitter * k
+            boxes[f"b{k}"] = {"pos": [1.0, y, 0.125], "size": [0.3, 0.2, 0.25],
+                              "quat_wxyz": [math.cos(a), 0.0, 0.0, math.sin(a)]}
+            labels.append({"key": f"l{k}", "center": [0.85, y, 0.125], "normal": [-1.0, 0.0, 0.0], "up": [0, 0, 1],
+                           "size": [0.05, 0.05], "box_id": f"b{k}"})
+        return boxes, labels
+    boxes, labels = wall(1e-7)
+    assert ev.order_boxes_in_frame(labels, boxes, np.eye(4), "strips", 2, 4) == ["l0", "l1", "l2", "l3"]
+    labels[3] = dict(labels[3], center=[1.0, -0.4, 0.125], normal=[0.0, -1.0, 0.0])
+    with pytest.raises(ValueError, match="one labelled wall side"):
+        ev.order_boxes_in_frame(labels, boxes, np.eye(4), "strips", 2, 4)
+
+
 # ------------------------------------------------------------------ 5. settle before the first head view
 class SettleRobot:
     def __init__(self):
@@ -582,6 +601,124 @@ def test_search_cell_member_no_label_and_member_partial():
     r = tb.search_cell()
     assert m.kind == "cell" and m.status == "pending" and m.id not in tb._stance_attempted
     assert "it gets its own stance when it is current" in r["reason"]
+
+
+# ------------------------------------------------------------------ 11b. failed-stance identity across re-registrations
+def _refit(tb, shift, dyaw):
+    """A re-registration of the frame (rotation dyaw about the odom origin, shift along the wall), entries re-synced."""
+    T = T_from_xy_yaw(0.0, 0.0, dyaw, 0.0) @ np.array(tb.ws.wall["T_odom_wall"], float)
+    T[:3, 3] += shift * T[:3, 0]
+    tb.ws.wall["T_odom_wall"] = T
+    tb._sync_layout_all()
+
+
+def _replan(tb):
+    assert tb.compute_wrist_target()["status"] == "ok"
+    r = tb.plan_stance()
+    assert r["status"] == "ok", r["reason"]
+    return dict(tb.ws.stance_target)
+
+
+def _same(a, b):
+    return np.hypot(*np.subtract(a["pelvis_pos"], b["pelvis_pos"])) < 0.01 and a["level_index"] == b["level_index"]
+
+
+@pytest.mark.parametrize("shift,dyaw", [(0.0, 0.0), (0.0003, 0.0), (0.0003, 0.0004), (0.001, -0.0007)])
+def test_failed_grid_stance_stays_skipped_after_a_reregistration(shift, dyaw):
+    """A grid look stance recorded failed (search_cell partial) is not planned again after the frame moved a little
+    (rel(p) floats differ after a re-sync; the identity is the grid's (d, l), members and level)."""
+    tb, _ = planned()
+    stub_stances(tb)
+    _refit(tb, 0.0, 0.003)
+    at(tb, WALL_X - 0.6, -0.5)                                            # far right: a grid stance
+    bc = first_cell(tb)
+    st = _replan(tb)
+    assert "in_place" not in st
+    tb._record_failed_stance(bc, tb.ws.stance_target)
+    _refit(tb, shift, dyaw)
+    st2 = _replan(tb)
+    assert not _same(st, st2) and st2["stance_key"] != st["stance_key"]
+
+
+def test_failed_walked_stance_is_not_planned_again_in_place():
+    """A walked grid stance the robot stands on fails: its in-place twin (same place, same level) is skipped too."""
+    tb, _ = planned()
+    stub_stances(tb)
+    at(tb, WALL_X - 0.6, -0.5)
+    bc = first_cell(tb)
+    st = _replan(tb)
+    assert "in_place" not in st and st["level_index"] == 0
+    tb._walk_seq += 1                                                     # the walk to it (approach -> _walk_guard)
+    T = T_from_xy_yaw(st["pos"][0], st["pos"][1], st["yaw"], 0.75)
+    tb._odom = lambda: T
+    tb._stance_reached = tb.ws.stance_target
+    tb._record_failed_stance(bc, tb.ws.stance_target)
+    assert ("in_place", tb._walk_seq, 0) in {k[2:] for k in tb._failed_stances}
+    st2 = _replan(tb)
+    assert not (st2.get("in_place") is not None and st2["level_index"] == st["level_index"])
+    assert not _same(st, st2)
+
+
+def test_member_left_partial_gets_another_stance_when_current():
+    """search_cell leaves the row member partial from the shared look stance: when it is current, plan_stance does not
+    give it the same place and level again (in place, no walk since)."""
+    x1, x2 = cell_x(1), cell_x(2)
+    a = [x1[0] + 0.05, x1[0] + 0.15, 0.85, 0.9]
+    big = [x2[0] - 0.5, x2[1] + 0.5, 0.80, 0.99]
+    tb, bc, m, cam = search_row([a, big])
+    st = tb.ws.stance_target
+    tb.search_cell()
+    assert m.kind == "cell" and m.status == "pending" and m.id not in tb._stance_attempted
+    assert (m.id, ("look",), "in_place", tb._walk_seq, st["level_index"]) in tb._failed_stances
+    for b in tb.ws.scan_plan:
+        if tb.ws.barcodes[b].box_id == bc.box_id:
+            tb.ws.barcodes[b].status = "scanned"
+    assert tb.next_barcode()["data"]["barcode_id"] == m.id
+    st2 = _replan(tb)
+    assert not (st2.get("in_place") is not None and st2["level_index"] == st["level_index"])
+
+
+def test_label_target_identity_is_the_wall_frame_position_and_targets_follow_a_reregistration():
+    """Strip mode: a label's failed-stance target identity is its wall-frame position (unchanged by a re-registration,
+    which moves its odometry centre); the stored label wrist target is re-derived on the re-synced entry with its own
+    stand-off; a look target is left alone."""
+    x1, x2 = cell_x(1), cell_x(2)
+    tb, bc, m, cam = search_row([[x1[0] + 0.05, x1[0] + 0.15, 0.85, 0.9], [x2[0] + 0.05, x2[0] + 0.15, 0.85, 0.9]])
+    assert tb.search_cell()["status"] == "ok" and bc.kind == "label"
+    t = dict(tb.ws.wrist_target)
+    ident = tb._target_identity(bc, t)
+    odom_key = tbmod._stance_target_key(t["pos"])
+    _refit(tb, 0.004, 0.002)
+    tb._resync_label_targets()
+    t2 = tb.ws.wrist_target
+    assert tb._target_identity(bc, t2) == ident and tbmod._stance_target_key(t2["pos"]) != odom_key
+    assert t2["offset"] == t["offset"] and np.allclose(t2["pos"], bc.center + t["offset"] * bc.normal, atol=0, rtol=0)
+    assert np.array_equal(t2["forward"], -bc.normal)
+    look = tb._look_target(m)
+    tb.ws.wrist_target = look
+    tb._resync_label_targets()
+    assert tb.ws.wrist_target is look
+
+
+def test_plan_stance_reply_names_no_member_and_the_summary_serialises():
+    """The members a strip stance serves are only in the diagnostics (design C1 P6); ws.summary() (look_head,
+    result.json) serialises a strip stance and an approach-A look stance."""
+    tb, _ = planned()
+    stub_stances(tb)
+    at(tb, WALL_X - 0.6, 0.4)
+    bc = first_cell(tb)
+    mate = tb.ws.scan_plan[1]
+    r = tb.plan_stance()
+    st = tb.ws.stance_target
+    assert r["status"] == "ok" and st["serves"] == [bc.id, mate]
+    assert mate not in json.dumps(r["data"]) and not {"serves", "look_alts", "target_pos_by", "stance_key"} & set(
+        r["data"]["stance_odom"])
+    assert r["diagnostics"]["stance_members"]["serves"] == [bc.id, mate]
+    json.dumps(tb.ws.summary())
+    a = kin_toolbox()
+    a.ws.stance_target = {"barcode_id": "bc0", "purpose": "look", "look_alt": 0, "target_pos": ["look"],
+                          "face_dist": 0.5, "lateral_offset": 0.0, "level_index": 0, "pos": [0.5, 0.0], "yaw": 0.0}
+    assert json.loads(json.dumps(a.ws.summary()))["stance_target"]["target_pos"] == ["look"]
 
 
 # ------------------------------------------------------------------ 14. re-registration triggers

@@ -226,10 +226,11 @@ def order_boxes_in_frame(labels: list[dict], boxes: dict, T_world_frame, rule: s
     if rule == "strips":
         if not isinstance(strip_columns, int) or isinstance(strip_columns, bool) or strip_columns < 1:
             raise ValueError(f"order 'strips' needs strip_columns (an integer >= 1), got {strip_columns!r}")
-        normals = {tuple(np.round(f["normal"], 9)) for f in faces.values()}
-        if len(normals) != 1:
-            raise ValueError("order 'strips' is defined on one labelled wall side, the labels lie on several")
+        # one labelled side, without a tolerance: every labelled box's face for the first label face's normal (the
+        # face box_face picks for it, the side of the wall the strips are laid on) is the face its labels lie on
         n = next(iter(faces.values()))["normal"]
+        if any(not np.array_equal(box_face(boxes[b], n)["normal"], f["normal"]) for b, f in faces.items()):
+            raise ValueError("order 'strips' is defined on one labelled wall side, the labels lie on several")
         wall = [_face_item(bid, box_face(b, n), T_fw) for bid, b in boxes.items()]
         groups = _containment_groups(wall, "y_lo", "y_hi", "y")          # left to right (descending y)
         if layout_columns is not None and len(groups) != int(layout_columns):

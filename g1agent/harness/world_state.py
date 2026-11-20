@@ -139,7 +139,8 @@ class WorldState:
                 "root_target": None if self.root_target is None else {k: (r(v) if isinstance(v, (list, np.ndarray)) else v) for k, v in self.root_target.items()},
                 "wrist_target": _target(self.wrist_target, r),
                 "wrist_target_refined": _target(self.wrist_target_refined, r),
-                "stance_target": None if self.stance_target is None else {k: (r(v) if isinstance(v, (list, np.ndarray)) else v) for k, v in self.stance_target.items()},
+                # a stance holds non-numeric sequences too (a look stance's target_pos ["look"], strip mode's served ids)
+                "stance_target": _target(self.stance_target, r),
                 "explore_steps": self.explore_steps,
                 "scan_plan": self.scan_plan_export(),
                 "scanned": [dict(s) for s in self.scanned],
