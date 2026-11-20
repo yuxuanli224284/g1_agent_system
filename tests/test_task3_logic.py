@@ -129,6 +129,9 @@ def bare_toolbox(robot, task=3, variant="g1_v1"):
     tb._body_model = None
     tb.multi_face = False
     tb.scan_targets = None               # every label, column order (Toolbox.set_scan_targets)
+    tb.head_views = None                 # the camera model's lean views (Toolbox.set_head_views)
+    tb.phase1_view = "start_pose"        # Toolbox.set_phase1_view
+    tb._obs_region = None
     tb.view_pitch = 0.0                  # head view upright (torso lean, robot.yaml view)
     tb._leans = None
     tb._plan_update_from_here = lambda: None   # next_barcode's automatic look (needs the head camera); tested separately
@@ -422,7 +425,7 @@ def test_next_barcode_looks_again_after_each_barcode_and_check_guides_to_final()
     tb = bare_toolbox(FakeRobot(), task=3)
     plan_of(tb, 2)
     looks = []
-    tb._plan_update_from_here = lambda: looks.append(1) or {"status": "ok", "reason": "", "added": []}
+    tb._plan_update_from_here = lambda: looks.append(1) or {"status": "ok", "reason": "", "added": [], "diagnostics": None}
     tb.next_barcode()
     assert looks == []                                           # first barcode: the plan was just made
     bc = tb.ws.barcodes["bc0"]
@@ -728,15 +731,26 @@ def test_rectified_face_maps_detections_to_the_plane(monkeypatch):
         cx, cy = (0.2 - (0.3 - 0.2)) * s_, (0.2 - (1.1 - 1.0)) * s_
         q = np.array([[cx - 0.05 * s_, cy - 0.025 * s_], [cx + 0.05 * s_, cy - 0.025 * s_], [cx + 0.05 * s_, cy + 0.025 * s_],
                       [cx - 0.05 * s_, cy + 0.025 * s_]])
-        return [{"kind": "label", "corners": q, "center": q.mean(axis=0), "score": 0.6, "bar_dir": np.array([1.0, 0.0])}]
+        sym = None if not seen.get("with_symbol") else (q - q.mean(axis=0)) * [0.8, 0.6] + q.mean(axis=0)   # 8 cm code
+        return [{"kind": "label", "corners": q if sym is None else sym, "center": q.mean(axis=0), "score": 0.6,
+                 "bar_dir": np.array([1.0, 0.0]), "label_corners": q, "label_center": q.mean(axis=0), "symbol_corners": sym,
+                 "refined_by_cv2": sym is not None}]
 
     monkeypatch.setattr(tbmod, "detect_label_dino", fake_dino)
     tb.det = None
     (rec, est), = tb._labels_on_rectified_face(h, face)
     assert seen["s"] == pytest.approx(200.0, rel=0.02)              # focal 200 px / nearest depth 1.0 m
     assert est["center"] == pytest.approx([1.5, 0.3, 1.1], abs=0.01)
-    assert est["width"] == pytest.approx(0.10, abs=0.01)
+    assert est["width"] == pytest.approx(0.10, abs=0.01) and tbmod._label_width(est) == pytest.approx(0.10, abs=0.01)
     assert abs(est["bar_dir"][1]) == pytest.approx(1.0, abs=1e-6)  # rect x axis = the face's lateral axis
+    assert rec["symbol_corners"] is None
+    # D5: with a cv2 symbol inside the label, the label extent (corners, centre, label width) stays the label box and
+    # only the stand-off width is the symbol's
+    seen["with_symbol"] = True
+    (rec, est), = tb._labels_on_rectified_face(h, face)
+    assert est["center"] == pytest.approx([1.5, 0.3, 1.1], abs=0.01)
+    assert tbmod._label_width(est) == pytest.approx(0.10, abs=0.01) and est["width"] == pytest.approx(0.08, abs=0.01)
+    assert rec["symbol_corners"] is not None and np.ptp(rec["corners"][:, 0]) > np.ptp(rec["symbol_corners"][:, 0])
 
 
 class UnreachableTB(SquatTB):
@@ -1128,3 +1142,217 @@ def test_no_lean_views_without_them():
     with_note, _ = load_prompt("task3_agent_full", **kw, **af.task3_prompt_kw(tb, True))
     without, _ = load_prompt("task3_agent_full", **kw, **af.task3_prompt_kw(tb, False))
     assert "lean the torso back" in with_note and "lean the torso back" not in without
+
+
+# ------------------------------------------------------------------ scan-room rows 2-4 design (D1, D4-D7)
+def test_upright_head_views_keep_only_the_upright_level():
+    """Scenario head_views "upright": _lean_levels is the pitch-0 level only although the camera model (d435i) has lean
+    views; the effective flag is off; any other value is an error."""
+    tb = bare_toolbox(FakeRobot(), variant="g1_v2")
+    tb.body_cmd = {"height_default": 0.74, "height_range": [0.3, 0.8], "rpy_default": [0, 0, 0]}
+    assert tb.cfg["robot"]["lean_views"] is True and tb.lean_views_on() and len(tb._lean_levels()) > 1
+    tb.set_head_views("upright")
+    lv = tb._lean_levels()
+    assert len(lv) == 1 and abs(lv[0]["pitch_cmd"]) < 1e-9 and not tb.lean_views_on()
+    tb.set_head_views(None)
+    assert len(tb._lean_levels()) > 1
+    with pytest.raises(ValueError):
+        tb.set_head_views("leaned")
+    with pytest.raises(ValueError):
+        tb.set_phase1_view("walk")
+    tb.set_phase1_view(None)
+    assert tb.phase1_view == "start_pose"
+
+
+class _LabelDet:
+    cfg = {"box_threshold": 0.3}
+
+    def detect(self, img, prompt):
+        return [{"bbox": [300, 300, 600, 420], "score": 0.5}]          # upscale 3 -> label box x 100..200, y 100..140
+
+
+@pytest.mark.parametrize("quad, accepted", [
+    ([[95, 110], [150, 110], [150, 130], [95, 130]], False),          # partly left of the unpadded label box (padding only)
+    ([[110, 105], [190, 105], [190, 135], [110, 135]], True)])        # inside: the symbol
+def test_label_dino_keeps_the_label_box_and_takes_cv2_only_inside_it(monkeypatch, quad, accepted):
+    from g1agent.perception import barcode_detector as bd
+    q = np.asarray(quad, float)
+    monkeypatch.setattr(bd, "detect_barcodes", lambda *a, **k: [{"kind": "barcode", "corners": q, "center": q.mean(axis=0),
+                                                                 "bar_dir": np.array([0.0, 1.0]), "coherence": 0.9}])
+    img = np.zeros((300, 300, 3), np.uint8)
+    cfg = {"upscale": 3, "label_threshold": 0.25, "label_prompt": "x", "label_max_area_frac": 0.5, "roi_pad_frac": 0.05}
+    (r,) = bd.detect_label_dino(img, [0, 0, 300, 300], _LabelDet(), cfg)
+    box = np.array([[100, 100], [200, 100], [200, 140], [100, 140]], float)
+    assert np.allclose(r["label_corners"], box) and np.allclose(r["label_center"], [150, 120])
+    assert r["refined_by_cv2"] is accepted and r["cv2_quads_outside_label"] == (0 if accepted else 1)
+    if accepted:
+        assert np.allclose(r["symbol_corners"], q) and np.allclose(r["corners"], q)
+    else:
+        assert r["symbol_corners"] is None and np.allclose(r["corners"], box)
+
+
+def _paper(y, z, x=1.3, w=0.106, h=0.038):
+    """A scan-room paper label rectangle (0.106 x 0.038 m) on a -x face, consecutive corners."""
+    return np.array([[x, y + w / 2, z + h / 2], [x, y - w / 2, z + h / 2], [x, y - w / 2, z - h / 2], [x, y + w / 2, z - h / 2]])
+
+
+def test_paper_sized_label_boxes_are_one_label_and_neighbours_are_not():
+    """D5/D6: with the label extent = the paper box, two estimates of one paper 1.6 cm apart overlap (the bc16 / bc3
+    case); the neighbouring label of the next column (0.20 m) or row (0.25 m) does not."""
+    n = np.array([-1.0, 0, 0])
+    b = BarcodeEstimate("bc3", "box", np.array([1.3, 0.3, 0.98]), n, None, "head", 0.0, corners_odom=_paper(0.3, 0.98),
+                        width_m=0.03, label_width_m=0.106, plan_center=np.array([1.3, 0.3, 0.98]))
+    same = {"center": np.array([1.3, 0.3, 0.964]), "corners": _paper(0.3, 0.964)}
+    assert tbmod._same_planned_label(same, b) and tbmod._same_est(same, {"corners": _paper(0.3, 0.98)}, n)
+    for dy, dz in ((0.20, 0.0), (0.0, 0.25)):
+        other = {"center": np.array([1.3, 0.3 - dy, 0.98 - dz]), "corners": _paper(0.3 - dy, 0.98 - dz)}
+        assert not tbmod._same_planned_label(other, b) and not tbmod._same_est(other, same, n)
+    # the 2.5 mm sliver at the seam that cv2 returned (bc14) would not overlap; its paper box does
+    sliver = {"corners": _paper(0.3, 1.009, w=0.03, h=0.0025)}
+    assert not tbmod._same_est(sliver, {"corners": _paper(0.3, 0.98, w=0.03, h=0.01)}, n)
+    assert tbmod._same_est({"corners": _paper(0.3, 1.0)}, {"corners": _paper(0.3, 0.98)}, n)
+
+
+def _one_face_scene(monkeypatch, tb, labels):
+    """plan_scans on one fitted face (x 1.5, y -0.4..0.4, z 0.8..1.2) with the given head label estimates
+    [(name, y, z, score)] (paper boxes), the detections projected into the synthetic head frame."""
+    h = _head_frame()
+    T_odom_cam = h["T_odom_root"] @ h["T_root_cam"]
+    face = _face(-0.4, 0.4, x=1.5)
+
+    def px(P):
+        uv, _ = geo.project(h["K"], np.linalg.inv(T_odom_cam), np.atleast_2d(P))
+        return uv
+
+    def fake_detect_boxes(prompt="cardboard box", view="auto"):
+        tb.head = h
+        tb.ws.boxes = {"box0": tbmod.BoxEstimate("box0", [0, 0, 1, 1], 0.9, 3.0)}
+        return {"status": "ok", "data": {}, "reason": ""}
+
+    def fake_fit(box_id):
+        tb.ws.boxes[box_id].face = face
+        return {"status": "ok", "data": {}, "reason": ""}
+
+    def fake_rectified(frame, f):
+        out = []
+        for name, y, z, score in sorted(labels, key=lambda l: -l[3]):
+            q3 = _paper(y, z, x=1.5)
+            q = px(q3)
+            out.append(({"name": name, "kind": "label", "corners": q, "center": q.mean(axis=0), "score": score,
+                         "refined_by_cv2": False, "symbol_corners": None},
+                        {"center": q3.mean(axis=0), "bar_dir": np.array([0, -1.0, 0]), "corners": q3, "width": 0.106}))
+        return out
+
+    monkeypatch.setattr(tb, "detect_boxes", fake_detect_boxes)
+    monkeypatch.setattr(tb, "_fit_one", fake_fit)
+    monkeypatch.setattr(tb, "_labels_on_rectified_face", fake_rectified)
+    tb.det = None
+    return px
+
+
+def test_plan_scans_drops_overlapping_detections_whose_centres_lie_outside_each_other(monkeypatch):
+    """D6 (the bc4 / bc5 case): two detections of one paper label 7 cm apart laterally overlap on the face, but neither
+    centre lies in the other's quad (the former pixel test kept both). One plan entry; the same for a plan update."""
+    tb = bare_toolbox(FakeRobot())
+    labels = [("A", 0.20, 1.10, 0.6), ("A2", 0.13, 1.10, 0.5)]
+    px = _one_face_scene(monkeypatch, tb, labels)
+    qa, qb = px(_paper(0.20, 1.10, x=1.5)), px(_paper(0.13, 1.10, x=1.5))
+    assert not so.point_in_quad(qa.mean(axis=0), qb) and not so.point_in_quad(qb.mean(axis=0), qa)
+    r = tb.plan_scans()
+    assert r["status"] == "ok" and len(r["data"]["barcodes"]) == 1, r
+    b0, d0 = r["data"]["barcodes"][0], r["diagnostics"]["plan_entries"][0]          # diagnostics: logged only (D11)
+    assert d0["id"] == b0["id"] and d0["score"] == 0.6 and d0["label_width_m"] == pytest.approx(0.106, abs=1e-3)
+    assert [d["matched"] for d in r["diagnostics"]["dropped_labels"]] == [b0["id"]]       # the higher score kept
+    tb.ws.barcodes[b0["id"]].status = "scanned"                    # the plan runs: a call updates it
+    labels += [("B", -0.20, 0.95, 0.6), ("B2", -0.27, 0.95, 0.5)]
+    u = tb.plan_scans()
+    assert u["data"]["updated"] and len(u["data"]["added"]) == 1 and len(tb.ws.scan_plan) == 2
+    assert tb.ws.barcodes[u["data"]["added"][0]["id"]].label_width_m == pytest.approx(0.106, abs=1e-3)
+    rules = [d["rule"] for d in u["diagnostics"]["dropped_labels"]]       # B2 (same face), A / A2 (the plan entry)
+    assert sorted(rules) == ["same label as a plan entry"] + ["same label on this face (higher score kept)"] * 2
+
+
+def _gate_setup(monkeypatch, jump):
+    """Current barcode bc0 with a fragment stand-off width (0.03 m) and a paper label width (0.11 m); the hand camera
+    detects a label `jump` m (lateral) from the estimate."""
+    tb = bare_toolbox(FakeRobot())
+    plan_of(tb, 2, width=0.03)
+    for b in tb.ws.barcodes.values():
+        b.label_width_m = 0.11
+        b.face["corners"] = np.array([[1.0, 0.4, 1.2], [1.0, 0.2, 1.2], [1.0, 0.2, 0.8], [1.0, 0.4, 0.8]])
+    tb.next_barcode()
+    tb.compute_wrist_target()
+    bc = tb.ws.barcodes["bc0"]
+    h = _head_frame()
+    h["T_odom_root"] = T_from_xy_yaw(0.0, 0.0, math.pi)          # looking away from the face: no plane refit
+    monkeypatch.setattr(tb, "_capture_head", lambda: h)
+    monkeypatch.setattr(tb, "_detect_wrist", lambda expect=None: ({"frame": 1}, {"center": [10.0, 10.0], "kind": "label"}))
+    target = bc.center + np.array([0.0, -jump, 0.0])
+    monkeypatch.setattr(tb, "_pixel_on_face", lambda frame, px_, plane: target.copy())
+    monkeypatch.setattr(tb, "_wrist_symbol_width", lambda *a, **k: {"width_m": None})
+    return tb, bc, target
+
+
+def test_wrist_gate_uses_the_label_width_not_the_fragment_width(monkeypatch):
+    """D7 (2026-11-19 calls 9/18/27/36): the correct label 6 cm away was rejected against a 3 cm fragment width. With the
+    label's extent (0.11 m) it is accepted; a detection 15 cm away is still rejected, with the nearest other plan entry
+    reported."""
+    tb, bc, target = _gate_setup(monkeypatch, 0.06)
+    r = tb.refine_with_wrist()
+    assert r["status"] == "ok" and np.allclose(bc.center, target) and bc.source == "wrist"
+    tb, bc, target = _gate_setup(monkeypatch, 0.15)
+    r = tb.refine_with_wrist()
+    assert r["status"] == "partial" and "not the planned label" in r["reason"]
+    assert r["data"]["nearest_other_plan_entry"]["id"] == "bc1"
+
+
+def test_wrist_target_reports_the_label_width_and_logs_the_standoff_width(monkeypatch):
+    """Review 2026-11-19: compute_wrist_target's label_width_m is the label's extent (the same number plan_scans logs
+    and the D7 gate uses), never the stand-off / cv2 fragment width, which is logged only (not shown to the LLM)."""
+    from g1agent.orchestrators.common import tool_result_text
+    tb, bc, _ = _gate_setup(monkeypatch, 0.06)
+    r = tb.compute_wrist_target()
+    assert r["data"]["label_width_m"] == pytest.approx(0.11) and r["diagnostics"]["standoff_width_m"] == pytest.approx(0.03)
+    assert "standoff_width_m" not in tool_result_text(r)
+
+
+def test_pending_targets_are_ordered_by_their_grid_cell():
+    """D4: once the side's grid is resolved and every pending entry has a cell, the order follows the cells (rows from
+    the top, left to right; a spec counted from the bottom is turned around over the row slots), not the label extents:
+    a label fragment high in its box row is not ordered as a row of its own."""
+    tb = bare_toolbox(FakeRobot())
+    tb.set_scan_targets({"columns_from_left": [1, 2], "rows_from_bottom": [1, 2], "order": "rows"})
+    tb.ws.scan_ref_T = np.eye(4)
+    # bottom row (cell row 1) and the row above it (row 2); "frag" belongs to row 1 but its extent lies above r2's labels
+    spec = {"r2c1": (0.3, 0.95, 2, 1), "r2c2": (0.1, 0.95, 2, 2), "r1c1": (0.3, 0.70, 1, 1), "frag": (0.1, 0.99, 1, 2)}
+    for k, (y, z, row, col) in spec.items():
+        tb.ws.barcodes[k] = BarcodeEstimate(k, "box", np.array([1.0, y, z]), np.array([-1.0, 0, 0]), None, "head", 0.0,
+                                            corners_odom=_paper(y, z, x=1.0, h=0.004 if k == "frag" else 0.038),
+                                            status="pending", grid_cell={"column": col, "row": row})
+        tb.ws.scan_plan.append(k)
+    tb._reorder_pending(0)
+    assert tb.ws.scan_plan[0] == "frag"                              # no grid yet: the label rule (highest first)
+    slot = lambda i, lo, hi: {"index": i, "lo": lo, "hi": hi}
+    tb.ws.target_grid = {"faces": {0: {"columns": [slot(1, 0.2, 0.4), slot(2, 0.0, 0.2)],     # from the left
+                                       "rows": [slot(1, 0.5, 0.75), slot(2, 0.75, 1.0)]}}}       # from the bottom
+    tb._reorder_pending(0)
+    assert tb.ws.scan_plan == ["r2c1", "r2c2", "r1c1", "frag"]
+    tb.ws.barcodes["frag"].grid_cell = {"column": None, "row": 1}   # a late label no slot holds: back to the label rule
+    tb._reorder_pending(0)
+    assert tb.ws.scan_plan[0] == "frag"
+
+
+def test_grid_evidence_bounds_the_floor_in_the_planning_frame():
+    """D3: the floor (odom z 0) under the side's faces, in the planning frame (root at pelvis height 0.75 m)."""
+    tb = bare_toolbox(FakeRobot())
+    C = np.array([[1.3, 0.3, 1.0], [1.3, 0.1, 1.0], [1.3, 0.1, 0.75], [1.3, 0.3, 0.75]])
+    tb.ws.target_grid = {"edges_seen": [], "face_centres": [{"face_id": 0, "center": np.array([1.3, 0.2, 0.9])},
+                                                           {"face_id": 0, "center": np.array([1.3, -0.2, 0.6])}],
+                         "fitted_faces": [{"face_id": 0, "face": {"t": 1.0, "corners": C, "edges_seen": {"top": True}}}],
+                         "faces": {}}
+    edges, centres, faces, bounds = tb._grid_evidence(0, T_from_xy_yaw(0.5, 0.0, 0.0, 0.75))
+    assert bounds == {"bottom": pytest.approx(-0.75)} and centres["rows"] == pytest.approx([0.15, -0.15])
+    # a fitted face (with or without labels) is passed as box evidence, in the planning frame
+    assert len(faces) == 1 and (faces[0]["z_lo"], faces[0]["z_hi"]) == pytest.approx((0.0, 0.25))
+    assert faces[0]["seen"] == {"top": True}
+    assert tb._grid_evidence(1, np.eye(4))[3] is None               # no face of that side: no bound

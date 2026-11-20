@@ -59,6 +59,14 @@ class FinishArgs(BaseModel):
     summary: str
 
 
+# plan_scans text in two parts: where it is called from, and what it does. The obs_pose phase 1 of a target-spec task
+# (Toolbox.set_phase1_view) replaces the first part with PLAN_SCANS_FROM_OBS (orchestrators.agent_full); every
+# other scenario keeps the text of the 4-box tag g1v2-sub4-run1 byte for byte.
+PLAN_SCANS_FROM_START = ("Task 3, after reaching the observation pose (or, when the task names the labels by their "
+                         "place on the wall, from near the start pose): ")
+PLAN_SCANS_FROM_OBS = "Task 3, after reaching the observation pose: "
+PLAN_SCANS_BODY = ("localise every barcode label on every visible box face in the head image and order them (columns left to right, top to bottom inside a column; or rows top to bottom, left to right inside a row when the task says so). With a target spec only the labels in the requested cells are planned (the others are listed as not_targeted). The order is fixed; next_barcode follows it. Called again while the plan runs (e.g. after a barcode, arm at home, before standing up), it only ADDS labels seen for the first time from the current view.")
+
 TOOLS = {
     "look_head": (NoArgs, "Capture the head camera image (attached to the reply) and a short state summary."),
     "detect_boxes": (DetectBoxesArgs, "Detect boxes in the head image; ids are ordered left to right (robot's left first)."),
@@ -78,7 +86,7 @@ TOOLS = {
     "refine_with_wrist": (BarcodeArgs, "Re-detect the barcode in the wrist image and intersect with the re-fitted face plane; updates the refined wrist target."),
     "stereo_check_wrist": (BarcodeArgs, "Shift the wrist 4 cm, triangulate the barcode centre from two wrist views and compare with the refined estimate."),
     "check_wrist_placement": (NoArgs, "Check the wrist point: at the wrist target's stand-off +- 0.02 m from the barcode plane, barcode centre within 2 cm of the axis, angle < 10 deg."),
-    "plan_scans": (NoArgs, "Task 3, after reaching the observation pose (or, when the task names the labels by their place on the wall, from near the start pose): localise every barcode label on every visible box face in the head image and order them (columns left to right, top to bottom inside a column; or rows top to bottom, left to right inside a row when the task says so). With a target spec only the labels in the requested cells are planned (the others are listed as not_targeted). The order is fixed; next_barcode follows it. Called again while the plan runs (e.g. after a barcode, arm at home, before standing up), it only ADDS labels seen for the first time from the current view."),
+    "plan_scans": (NoArgs, PLAN_SCANS_FROM_START + PLAN_SCANS_BODY),
     "go_to_next_face": (NoArgs, "Task 3 with every side of the stack: walk around the stack to the next side of the tour (front -> right -> back -> left) and stand at its observation pose (arm home, stand up, back off, sidestep past the corner, turn, fit the side, step to its observation pose). Call it when next_barcode returns face_done=true, then plan_scans."),
     "next_barcode": (NoArgs, "Task 3: switch to the next barcode of the scan plan (an unfinished current barcode is marked failed); clears the per-barcode wrist / stance targets. Works on the current side of the stack: when that side is finished and the task covers every side, it returns face_done=true (call go_to_next_face, then plan_scans); done=true when everything has been handled."),
     "scan": (NoArgs, "Trigger the scanner and decode what it sees. The code nearest the image centre counts for the current barcode; a content read before is a duplicate and is not counted again. On no read the tool itself retries once (refine_with_wrist + move_arm final + scan); data.retries records it."),

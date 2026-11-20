@@ -36,10 +36,15 @@ class BarcodeEstimate:
     t: float
     pixel: list | None = None
     face: dict | None = None        # copy of the box face the label lies on (box ids are re-assigned by detect_boxes)
-    corners_odom: np.ndarray | None = None   # 4x3 label corners on the face plane (head estimate)
+    corners_odom: np.ndarray | None = None   # 4x3 label corners on the face plane (head estimate: the label box)
     corners_px: list | None = None  # 4x2 label corners in the head image the label was found in
-    width_m: float | None = None    # estimated width on the plane (longer side, see scan_order.quad_width): head = the
-                                    # label detection box (an upper bound of the symbol), wrist = the decoded symbol
+    width_m: float | None = None    # stand-off width on the plane (longer side, see scan_order.quad_width): head = the
+                                    # cv2 symbol quad inside the label box when one was accepted, else the label box (an
+                                    # upper bound of the symbol); wrist = the decoded symbol
+    label_width_m: float | None = None   # width of the LABEL (the paper the detector found: head detection box on the
+                                    # face plane), never replaced by a wrist symbol width; the extent every same-label
+                                    # test and the wrist consistency gate use (corners_odom is that box)
+    detection: dict | None = None   # head detection diagnostics (kind, refined_by_cv2, score, label / symbol corners px)
     width_source: str = "head"      # head | wrist
     width_support: int = 0          # wrist width: number of decoded outlines (image rotations) it is the median of
     status: str = "pending"         # pending | scanned | duplicate | failed | unreachable
@@ -74,7 +79,8 @@ class WorldState:
     scanned: list = field(default_factory=list)     # [{"content", "barcode_id", "order_index", "t"}], first read only
     target_grid: dict | None = None          # with a target spec: {"targets" (scan_order.parse_targets), "edges_seen":
                                              #  [{"face_id", "edge", "pts" (odom), "clear"}], "face_centres":
-                                             #  [{"face_id", "center" (odom)}], "faces": {fid: resolved grid}}
+                                             #  [{"face_id", "center" (odom)}], "fitted_faces": [{"face_id", "face":
+                                             #  {"t", "corners" (odom), "edges_seen"}}], "faces": {fid: resolved grid}}
 
     def targeted(self, bid) -> bool:
         """A plan entry that is part of the task (everything but not_targeted)."""

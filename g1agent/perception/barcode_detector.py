@@ -61,10 +61,24 @@ def _encloses(a, b) -> bool:
         (b[2] - b[0]) * (b[3] - b[1]) < (a[2] - a[0]) * (a[3] - a[1])
 
 
+def _inside_box(quad, x0, y0, x1, y1) -> bool:
+    """Every corner of the quad lies inside the axis-aligned box [x0, x1] x [y0, y1] (boundary included)."""
+    q = np.asarray(quad, float)
+    return bool(np.all((q[:, 0] >= x0) & (q[:, 0] <= x1) & (q[:, 1] >= y0) & (q[:, 1] <= y1)))
+
+
 def detect_label_dino(rgb, roi, box_detector, cfg: dict | None = None) -> list[dict]:
     """Label localisation with the open-vocabulary detector on the upsampled ROI (head camera; also the hand-camera
-    fallback of Toolbox._detect_wrist). Returns the same
-    record format as detect_barcodes (corners = detection box), with cv2 refinement inside the label when possible."""
+    fallback of Toolbox._detect_wrist). Returns the same record format as detect_barcodes, plus:
+    - "label_corners" / "label_center": the detection box, i.e. the paper label the detector was prompted for. This is
+      the label's extent (every same-label test, the target grid and the scan order use it);
+    - "symbol_corners": the cv2.barcode / QR quad found inside the label, or None.
+    cv2 only refines the symbol inside the label: its quad is accepted only when all four corners lie inside the
+    UNPADDED detection box (detect_barcodes pads its search region by roi_pad_frac for the code's quiet zone; that
+    padding must not enlarge the label). 2026-11-19 scanroom run: at 1-1.7 mm/px cv2 returned 2-4 px slivers and pieces
+    of the codes, which replaced the label box and were then planned as separate labels / rows.
+    "corners" / "center" / "bar_dir" keep their meaning (the accepted cv2 quad, else the detection box), so the
+    hand-camera fallback is unchanged."""
     c = cfg or config.load("perception")["barcode"]
     h, w = rgb.shape[:2]
     x0, y0, x1, y1 = (int(round(v)) for v in roi)
@@ -87,17 +101,21 @@ def detect_label_dino(rgb, roi, box_detector, cfg: dict | None = None) -> list[d
     # removes; it also drops the looser of two nested boxes on the same label.
     dets = [d for d in dets if not any(e is not d and _encloses(d["bbox"], e["bbox"]) for e in dets)]
     out = []
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     for d in dets:
         bx0, by0, bx1, by1 = d["bbox"]
         q = np.array([[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]]) / s + [x0, y0]
-        rec = {"kind": "label", "corners": q, "center": q.mean(axis=0), "score": d["score"], "width_px": float(q[1, 0] - q[0, 0])}
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        rec = {"kind": "label", "corners": q, "center": q.mean(axis=0), "score": d["score"], "width_px": float(q[1, 0] - q[0, 0]),
+               "label_corners": q, "label_center": q.mean(axis=0), "symbol_corners": None, "refined_by_cv2": False}
         rec["bar_dir"], rec["coherence"] = _bar_direction(gray, q)
-        refined = detect_barcodes(rgb, [q[0, 0], q[0, 1], q[2, 0], q[2, 1]], cfg=c)      # exact corners if cv2 can
-        if refined:
-            r = refined[0]
+        lx0, ly0, lx1, ly1 = q[0, 0], q[0, 1], q[2, 0], q[2, 1]
+        refined = detect_barcodes(rgb, [lx0, ly0, lx1, ly1], cfg=c)      # the symbol, if cv2 finds one inside the label
+        inside = [r for r in refined if _inside_box(r["corners"], lx0, ly0, lx1, ly1)]
+        r = inside[0] if inside else None                   # the largest symbol inside the label (detect_barcodes order)
+        if r is not None:
             rec.update({"kind": r["kind"], "corners": r["corners"], "center": r["center"], "bar_dir": r["bar_dir"],
-                        "coherence": r["coherence"], "refined_by_cv2": True})
+                        "coherence": r["coherence"], "symbol_corners": r["corners"], "refined_by_cv2": True})
+        rec["cv2_quads_outside_label"] = len(refined) - len(inside)      # rejected cv2 quads (diagnostics)
         out.append(rec)
     out.sort(key=lambda r: -r["score"])
     return out

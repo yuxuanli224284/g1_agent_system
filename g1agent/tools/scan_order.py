@@ -10,8 +10,12 @@ tests/test_no_gt_leak.py); tests/test_task3_logic.py checks that both give the s
   are the connected groups of overlapping vertical extents (z), the same rule on the other axis; rows go top to bottom,
   inside a row labels go left to right (descending lateral centre).
 - Target grid (task instruction in robot terms, e.g. "columns 1-2 from the left, rows 2-3 from the top of the box
-  wall"): the columns and rows above, counted from the stated edge, over the localised labels (parse_targets,
-  resolve_grid, grid_cell).
+  wall", or "all columns, rows 2-4 from the bottom"): box rows / columns from the box faces seen whole (labels go to the
+  nearest box slot holding their centre; label overlap groups only where no box was seen whole), counted from the
+  stated edge ("all": anchored at both edges); the floor bounds the bottom edge (parse_targets, resolve_grid,
+  grid_cell).
+- Scan order inside a resolved grid (order_by_cells): the order rule applied to the box cells of the labels, so a
+  duplicate or a fragment inside a cell never forms a row / column of its own.
 - Adaptive stand-off (user requirement 5): d = label_width / (2 tan(hfov / 2)) / fill, clamped to [d_min, d_max].
 """
 from __future__ import annotations
@@ -104,15 +108,17 @@ _AXIS = {"columns": ("y_lo", "y_hi"), "rows": ("z_lo", "z_hi")}
 
 
 def parse_targets(spec) -> dict | None:
-    """Task target spec in robot terms -> {"columns": None | {"from", "index"}, "rows": None | {"from", "index"},
-    "order": rule, "spec": the spec}. spec: None (every label, order "columns") or a dict with at most one of
-    columns_from_left / columns_from_right, at most one of rows_from_top / rows_from_bottom (lists of 1-based indices
-    counted from that edge of the box wall) and "order" (ORDER_RULES, default "columns"). Anything else is an error."""
+    """Task target spec in robot terms -> {"columns": None | {"from", "index"} | {"from", "index": None, "all": True},
+    "rows": (same), "order": rule, "spec": the spec}. spec: None (every label, order "columns") or a dict with at most
+    one of columns_from_left / columns_from_right / columns, at most one of rows_from_top / rows_from_bottom / rows
+    (*_from_*: lists of 1-based indices counted from that edge of the box wall; "columns" / "rows": the value "all",
+    every column / row of the wall, which needs both of its edges) and "order" (ORDER_RULES, default "columns").
+    Anything else is an error."""
     if spec is None:
         return None
     if not isinstance(spec, dict):
         raise ValueError(f"scan target spec must be a dict, got {type(spec).__name__}")
-    known = {k for opts in _DIMS.values() for k, _ in opts} | {"order"}
+    known = {k for opts in _DIMS.values() for k, _ in opts} | set(_DIMS) | {"order"}
     bad = set(spec) - known
     if bad:
         raise ValueError(f"unknown scan target keys {sorted(bad)} (known: {sorted(known)})")
@@ -121,6 +127,15 @@ def parse_targets(spec) -> dict | None:
         raise ValueError(f"scan target order must be one of {ORDER_RULES}, got {out['order']!r}")
     for dim, opts in _DIMS.items():
         given = [(k, edge) for k, edge in opts if k in spec]
+        if dim in spec:
+            if given:
+                raise ValueError(f"scan target spec gives {dim!r} together with {[k for k, _ in given]}")
+            if spec[dim] != "all":
+                raise ValueError(f"scan target {dim!r} must be \"all\", got {spec[dim]!r}")
+            # the count runs from the high edge (left / top); "all" is anchored at both edges, so the start side
+            # does not change the result
+            out[dim] = {"from": _HIGH_EDGE[dim], "index": None, "all": True}
+            continue
         if len(given) > 1:
             raise ValueError(f"scan target spec counts {dim} from two edges: {[k for k, _ in given]}")
         out[dim] = None
@@ -140,7 +155,9 @@ def describe_targets(t: dict | None) -> str:
         return "every barcode label"
     parts = []
     for dim in ("columns", "rows"):
-        if t[dim] is not None:
+        if t[dim] is not None and t[dim].get("all"):
+            parts.append(f"all {dim}")
+        elif t[dim] is not None:
             parts.append(f"{dim} {', '.join(str(i) for i in t[dim]['index'])} from the {t[dim]['from']}")
     return "the labels of the boxes in " + " and ".join(parts) + " of the box wall" if parts else "every barcode label"
 
@@ -162,78 +179,162 @@ def _n_missing(space: float, unit: float) -> int:
     return max(0, int(math.floor(space / unit + 0.5)))
 
 
-def _dim_slots(items: list[dict], dim: str, spec: dict | None, edges: list, centres: list) -> dict:
+def _mid(extents) -> float:
+    """Mean centre of a list of extents (lo, hi)."""
+    return float(np.mean([(lo + hi) / 2 for lo, hi in extents]))
+
+
+def _nearest_slot(c: float, extents: list, centres: list) -> int | None:
+    """Index of the box slot for a label centre c: among the slots whose extent [lo, hi] holds c, the one whose centre is
+    nearest (the axis is split halfway between two slot centres where their extents overlap); None when no slot holds
+    it or two hold it at the same distance."""
+    hit = sorted((abs(c - centres[j]), j) for j, (lo, hi) in enumerate(extents) if lo <= c <= hi)
+    if not hit or (len(hit) > 1 and hit[0][0] == hit[1][0]):
+        return None
+    return hit[0][1]
+
+
+def _dim_slots(items: list[dict], dim: str, spec: dict | None, edges: list, centres: list, faces: list = (),
+               bounds: dict | None = None) -> dict:
     """Slots (box rows / columns) of one dimension, counted from the spec's edge. See resolve_grid."""
     lo_k, hi_k = _AXIS[dim]
     edge = spec["from"] if spec is not None else _HIGH_EDGE[dim]
+    every = spec is not None and bool(spec.get("all"))
     high = edge == _HIGH_EDGE[dim]
     # u: the axis coordinate oriented so that larger u = closer to the counted edge
     to_u = (lambda lo, hi: (lo, hi)) if high else (lambda lo, hi: (-hi, -lo))
     from_u = to_u                                           # the same map is its own inverse
-    groups = _overlap_groups(items, lo_k, hi_k)             # high end first
-    if not high:
-        groups = groups[::-1]
-    gi = {it["key"]: i for i, g in enumerate(groups) for it in g}
-    # box faces carrying the labels (the fitted face each label was found on)
-    faces = {}
-    for it in items:
-        f = it.get("face")
-        if f is None:
-            continue
-        e = faces.setdefault(f["key"], {"u": to_u(f[lo_k], f[hi_k]), "full": bool(f["seen"][edge] and f["seen"][_OPP[edge]]),
-                                        "groups": set()})
-        e["groups"].add(gi[it["key"]])
-    # a face whose both edges along the axis were seen inside an image and that carries labels of one group only
-    full = [f for f in faces.values() if f["full"] and len(f["groups"]) == 1]
-    unit = min((f["u"][1] - f["u"][0] for f in full), default=None)        # the smallest box seen whole
-    singles = {}
-    for f in full:
-        if f["u"][1] - f["u"][0] < 1.5 * unit:        # under 1.5 boxes: one box (halfway between one and two boxes)
-            singles.setdefault(next(iter(f["groups"])), []).append(f)
-    box = {i: (min(f["u"][0] for f in fs), max(f["u"][1] for f in fs)) for i, fs in singles.items()}
+    # 1. box slots: the fitted box faces of the side (one entry per fitted face, key) seen whole along the axis (both
+    # edges inside a head image).
+    # - Box size (unit): the smallest whole face that CARRIES a label (a plan entry was found on it), the evidence the
+    #   rule trusted before D4. A face without a label may be a part of a box or a floor patch that happens to lie
+    #   inside the image: it never sets the box size.
+    # - A whole face is one box when round(size / unit) == 1 (_n_missing: halfway between no box and one, and between
+    #   one and two); with or without a label it is then box evidence. A sliver (under half a box) or a face of several
+    #   boxes is not.
+    # - One box row / column = the boxes whose centres lie within half a unit of the row's mean centre
+    #   (_n_missing(distance, unit) == 0: halfway between the same row, distance 0, and the next one, distance 1 unit;
+    #   extents of adjacent boxes touch, so strict extent overlap would chain neighbours on fitting noise). Faces are
+    #   taken from the counted edge; each joins the current row (the nearest one) or starts the next.
+    # - A row counts only when its faces agree on one box: round(union / unit) == 1. Otherwise its faces are no box
+    #   evidence, and a note says so (the lost evidence is visible).
+    # - Slot extent = the union of its faces (outer bounds); slot centre = the mean of its face centres (a sloppy fit
+    #   moves it by its error / number of faces, and it decides between two slots that both hold a label, step 2).
+    fs = {}
+    for f in list(faces) + [it["face"] for it in items if it.get("face") is not None]:
+        fs.setdefault(f["key"], f)
+    labelled = {it["face"]["key"] for it in items if it.get("face") is not None}
+    whole = {k: to_u(f[lo_k], f[hi_k]) for k, f in fs.items() if f["seen"][edge] and f["seen"][_OPP[edge]]}
+    unit = min((hi - lo for k, (lo, hi) in whole.items() if k in labelled), default=None)
+    singles = [] if unit is None else sorted((u for u in whole.values() if _n_missing(u[1] - u[0], unit) == 1),
+                                             key=lambda u: -(u[0] + u[1]))
+    clusters = []
+    for u in singles:                                       # from the counted edge
+        if clusters and _n_missing(_mid(clusters[-1]) - (u[0] + u[1]) / 2, unit) == 0:
+            clusters[-1].append(u)
+        else:
+            clusters.append([u])
     warnings, notes = [], []
-    slots = []                                              # in counting order, each {"u", "box", "keys", "inserted"}
+    box_u, box_c = [], []
+    for cl in clusters:
+        lo_u, hi_u = min(u[0] for u in cl), max(u[1] for u in cl)
+        if _n_missing(hi_u - lo_u, unit) == 1:
+            box_u.append((lo_u, hi_u))
+            box_c.append(_mid(cl))
+        else:
+            lo, hi = from_u(lo_u, hi_u)
+            notes.append(f"{len(cl)} box face(s) seen whole at {dim[:-1]} extent {lo:.3f}..{hi:.3f} m do not agree on "
+                         f"one box ({(hi_u - lo_u) / unit:.1f} box sizes together): not used as box evidence")
+    # 2. each label goes to the box slot whose centre is nearest to the label centre, among the slots whose extent holds
+    # it (grid_cell applies the same rule to late labels): a fit that reaches into the next row does not take that
+    # row's labels. Labels in no box slot (or exactly halfway between two) form label-only slots: their overlap groups,
+    # as the order rule
+    box_keys = [[] for _ in box_u]
+    free = []
+    for it in items:
+        j = _nearest_slot(sum(to_u(it[lo_k], it[hi_k])) / 2, box_u, box_c)
+        if j is not None:
+            box_keys[j].append(it["key"])
+        else:
+            free.append({"key": it["key"], "u_lo": to_u(it[lo_k], it[hi_k])[0], "u_hi": to_u(it[lo_k], it[hi_k])[1]})
+    core = [{"u": b, "c": c, "box": True, "keys": ks} for b, c, ks in zip(box_u, box_c, box_keys)]
+    core += [{"u": (lo, hi), "c": (lo + hi) / 2, "box": False, "keys": [it["key"] for it in g]}
+             for g in _overlap_groups(free, "u_lo", "u_hi")
+             for lo, hi in [(min(it["u_lo"] for it in g), max(it["u_hi"] for it in g))]]
+    core.sort(key=lambda sl: (-sl["c"], -sl["u"][1]))      # from the counted edge
+    anchored = {}
+
+    def anchor(which):
+        """The wall edge at the counted end ("near") or the opposite end ("far"): an edge observation that is clear
+        (no detected box beyond it in the view that saw it) or, for an edge with a physical bound (bounds: the floor
+        under the bottom edge), that leaves no room for a box between it and the bound (_n_missing == 0); and no fitted
+        face centre / localised label centre beyond it in any view; and the outermost slot at that end must be a box
+        slot (else rows / columns of boxes without labels between it and the edge cannot be excluded). Returns the
+        edge (u) or None, with a warning."""
+        name = edge if which == "near" else _OPP[edge]
+        s = 1 if which == "near" else -1                    # outward direction of this edge in u
+        bound = None if bounds is None or name not in bounds else to_u(bounds[name], bounds[name])[0]
+        beyond = ([s * to_u(c, c)[0] for c in centres] + [s * sum(to_u(f[lo_k], f[hi_k])) / 2 for f in fs.values()]
+                  + [s * sum(to_u(it[lo_k], it[hi_k])) / 2 for it in items])
+        cand = []
+        for ob in edges:
+            if ob["edge"] != name:
+                continue
+            e = to_u(ob["coord"], ob["coord"])[0]
+            on_bound = bound is not None and unit is not None and _n_missing(s * (bound - e), unit) == 0
+            if ob["clear"] or on_bound:
+                cand.append(s * e)
+        cand = [e for e in cand if not any(b > e for b in beyond)]
+        outer = core[0] if which == "near" else core[-1]
+        if not cand:
+            anchored[name] = False
+            warnings.append(f"the {name} edge of the box wall was not seen with nothing beyond it: {dim} are counted "
+                            f"from the {name}most {dim[:-1]} of labels seen")
+            return None
+        if not outer["box"]:
+            anchored[name] = False
+            warnings.append(f"the {name} edge of the box wall was seen, but the boxes of the {name}most {dim[:-1]} of "
+                            f"labels were not seen whole: {dim} of boxes without labels between it and the edge cannot "
+                            "be excluded")
+            return None
+        anchored[name] = True
+        return s * max(cand)
+
+    slots = []                                  # in counting order, each {"u", "c", "box", "keys", "inserted"}
 
     def insert(k, lo, hi, where):
         for j in range(k):                                  # equal shares of the free space, from the counted side
-            slots.append({"u": (hi - (j + 1) * (hi - lo) / k, hi - j * (hi - lo) / k), "box": True, "keys": [],
-                          "inserted": True})
+            u = (hi - (j + 1) * (hi - lo) / k, hi - j * (hi - lo) / k)
+            slots.append({"u": u, "c": (u[0] + u[1]) / 2, "box": True, "keys": [], "inserted": True})
         if k:
             notes.append(f"{k} {dim[:-1]}(s) of boxes without a localised label {where} (from the box faces)")
 
-    anchored = None
     gaps_unknown = []                                       # slot counts before which a gap could not be excluded
-    if spec is not None and groups:
-        # the wall edge: a face edge seen inside a head image with no detected box beyond it in that view, and no fitted
-        # face centre / localised label centre beyond it in any view
-        beyond = [to_u(c, c)[1] for c in centres] + [sum(to_u(it[lo_k], it[hi_k])) / 2 for it in items]
-        cand = [to_u(ob["coord"], ob["coord"])[1] for ob in edges if ob["edge"] == edge and ob["clear"]]
-        cand = [e for e in cand if not any(b > e for b in beyond)]
-        if not cand:
-            anchored = False
-            warnings.append(f"the {edge} edge of the box wall was not seen with nothing beyond it: {dim} are counted "
-                            f"from the {edge}most {dim[:-1]} of labels seen")
-        elif 0 not in box:
-            anchored = False
-            warnings.append(f"the {edge} edge of the box wall was seen, but the boxes of the {edge}most {dim[:-1]} of "
-                            f"labels were not seen whole: {dim} of boxes without labels between it and the edge cannot "
-                            "be excluded")
-        else:
-            anchored = True
-            e = max(cand)
-            insert(_n_missing(e - box[0][1], unit), box[0][1], e, f"at the {edge} edge")
-    for i, g in enumerate(groups):
+    if spec is not None and not core:
+        for name in ((edge, _OPP[edge]) if every else (edge,)):
+            anchored[name] = False
+        warnings.append(f"no {dim[:-1]} of boxes or labels was localised: {dim} cannot be counted")
+    near = far = None
+    if spec is not None and core:
+        near = anchor("near")
+        if every:
+            far = anchor("far")
+    if near is not None:
+        insert(_n_missing(near - core[0]["u"][1], unit), core[0]["u"][1], near, f"at the {edge} edge")
+    for i, sl in enumerate(core):
         if spec is not None and i > 0:
-            if i - 1 in box and i in box:
-                insert(_n_missing(box[i - 1][0] - box[i][1], unit), box[i][1], box[i - 1][0],
+            if core[i - 1]["box"] and sl["box"]:
+                insert(_n_missing(core[i - 1]["u"][0] - sl["u"][1], unit), sl["u"][1], core[i - 1]["u"][0],
                        f"between the {dim} of labels {len(slots)} and {len(slots) + 1}")
             else:
                 gaps_unknown.append(len(slots))
-        lo_u, hi_u = (box[i] if i in box else
-                      (min(to_u(it[lo_k], it[hi_k])[0] for it in g), max(to_u(it[lo_k], it[hi_k])[1] for it in g)))
-        slots.append({"u": (lo_u, hi_u), "box": i in box, "keys": [it["key"] for it in g], "inserted": False})
+        if sl["box"] and not sl["keys"]:
+            notes.append(f"{dim[:-1]} {len(slots) + 1} (from the {edge}): boxes seen whole without a localised label")
+        slots.append({**sl, "inserted": False})
+    if far is not None:
+        insert(_n_missing(core[-1]["u"][0] - far, unit), far, core[-1]["u"][0], f"at the {_OPP[edge]} edge")
     if spec is not None:
-        last = max(spec["index"])
+        last = len(slots) if every else max(spec["index"])  # "all": every gap matters
         for n in gaps_unknown:
             if n < last:                                    # the count up to a requested index crosses this gap
                 warnings.append(f"between {dim[:-1]}s {n} and {n + 1} (counted from the {edge}) a {dim[:-1]} of boxes "
@@ -241,8 +342,8 @@ def _dim_slots(items: list[dict], dim: str, spec: dict | None, edges: list, cent
     out = []
     for n, sl in enumerate(slots):
         lo, hi = from_u(*sl["u"])
-        out.append({"index": n + 1, "lo": float(lo), "hi": float(hi), "box": sl["box"], "keys": sl["keys"],
-                    "inserted": sl["inserted"]})
+        out.append({"index": n + 1, "lo": float(lo), "hi": float(hi), "center": float(from_u(sl["c"], sl["c"])[0]),
+                    "box": sl["box"], "keys": sl["keys"], "inserted": sl["inserted"]})
     evidence = None
     if spec is not None:
         evidence = "box faces" if not warnings else "labels (box faces not resolved where the warnings say)"
@@ -250,34 +351,53 @@ def _dim_slots(items: list[dict], dim: str, spec: dict | None, edges: list, cent
             "edge": edge, "unit": unit}
 
 
-def resolve_grid(items: list[dict], targets: dict, edges: list | None = None, face_centres: list | None = None) -> dict:
+def resolve_grid(items: list[dict], targets: dict, edges: list | None = None, face_centres: list | None = None,
+                 faces: list | None = None, bounds: dict | None = None) -> dict:
     """Box columns and rows of a side (items: order_items_in_frame of every label of the side, planning frame, each with
     "face": the fitted box face it was found on {"key", "y_lo", "y_hi", "z_lo", "z_hi", "seen": {edge: bool}} or None),
     indexed from the edges the target spec counts from, and the labels in the requested cells.
 
-    - Rows / columns of LABELS: the overlap groups of the label extents (as the order rule).
-    - Box evidence, independent of label recall where it exists: a box face seen whole along the axis (both its edges
-      inside a head image) and carrying labels of one group only is one box when it is under 1.5 times the smallest
-      such face (halfway between one and two boxes). The smallest one is the box size. Between two consecutive label
-      groups, and between the counted edge of the wall and the outermost label group, the free space between their
-      boxes holds round(space / box size) rows / columns of boxes WITHOUT a localised label: they are inserted as empty
-      slots (indices are never shifted by a missed label row), so a label found there later fills its cell.
+    - Box slots, independent of label recall where they exist: the fitted box faces of the side (faces: [face dicts
+      as above, planning frame], with or without labels, plus the faces of the items; one entry per key) seen whole
+      along the axis (both its edges inside a head image). The box size is the smallest such face that carries a label
+      (a face without a label may be part of a box or a floor patch: it never sets the box size); a face of
+      round(size / box size) == 1 is one box (halfway rules), with or without a label; boxes whose centres lie less
+      than half a box size from the mean centre of a row (halfway between the same and the next row) form that box row
+      / column when together they still round to one box; its extent = their union, its centre = the mean of their
+      centres. A row whose faces disagree is no box evidence (a note says so).
+    - Each label goes to the box slot nearest to its centre among those whose extent holds it (as grid_cell for late
+      labels), so two label groups (a duplicate, a fragment) inside one box row are one row, and a fit reaching into
+      the next row does not take that row's labels. Labels in no box slot form label-only slots: the overlap groups of
+      their extents (as the order rule).
+    - Between two consecutive box slots, and between the counted edge of the wall and the outermost box slot, the free
+      space holds round(space / box size) rows / columns of boxes WITHOUT a localised label: they are inserted as empty
+      slots (indices are never shifted by a missed label row), so a label found there later fills its cell. A gap next
+      to a label-only slot cannot be excluded: a warning when the count up to a requested index crosses it.
     - The wall edge (edges: [{"edge", "coord" (planning frame z / y), "clear": no detected box beyond it in the view
-      that saw it}]) counts only when no fitted face centre (face_centres: [coord on the axis] of every face fitted on
-      the side, per dimension {"columns": [...], "rows": [...]}) and no label centre lies beyond it.
-    - Where that evidence is missing (edge not seen clear, boxes not seen whole), the count rests on the labels alone:
+      that saw it}]) counts when it is clear, or when it lies on a physical bound (bounds: {edge: coord}, e.g.
+      {"bottom": floor z}; nothing stands below the floor) with no room for a box between them; and only when no
+      fitted face centre (face_centres: per dimension {"columns": [...], "rows": [...]}, plus the faces' centres) and
+      no label centre lies beyond it; and only when the outermost slot at that end is a box slot. The bound never
+      stands in for an edge that was not seen.
+    - A dimension given as "all" (parse_targets) is anchored at BOTH edges (rows / columns of boxes without labels
+      inserted at both ends) and requests every slot.
+    - Where that evidence is missing (an edge not seen, boxes not seen whole), the count rests on the labels alone:
       it is reported in "warnings" (the plan must not claim success with it).
 
-    Returns {"columns" / "rows": [slots {"index", "lo", "hi", "box", "keys", "inserted"}], "cell_of": {key: {"column",
-    "row"}}, "selected", "requested", "resolved", "missing" (cells), "anchored": {edge: bool}, "warnings", "notes",
-    "evidence": {dim: str}}. A cell is {"column": i | None, "row": j | None} (None = any, for an unconstrained
+    Returns {"columns" / "rows": [slots {"index", "lo", "hi", "center", "box", "keys", "inserted"}], "cell_of": {key:
+    {"column", "row"}}, "selected", "requested", "resolved", "missing" (cells), "anchored": {edge: bool}, "warnings",
+    "notes", "evidence": {dim: str}}. A cell is {"column": i | None, "row": j | None} (None = any, for an unconstrained
     dimension)."""
     dims = {}
     for dim in ("columns", "rows"):
         dims[dim] = _dim_slots(items, dim, targets[dim], [e for e in (edges or []) if e["edge"] in _DIM_EDGES[dim]],
-                               (face_centres or {}).get(dim, []))
+                               (face_centres or {}).get(dim, []), faces or [], bounds)
     index_of = {dim: {k: sl["index"] for sl in dims[dim]["slots"] for k in sl["keys"]} for dim in dims}
-    want = {dim: (None if targets[dim] is None else targets[dim]["index"]) for dim in ("columns", "rows")}
+    want = {}
+    for dim in ("columns", "rows"):
+        spec = targets[dim]
+        want[dim] = (None if spec is None else
+                     [sl["index"] for sl in dims[dim]["slots"]] if spec.get("all") else spec["index"])
     cell_of = {it["key"]: {"column": index_of["columns"][it["key"]], "row": index_of["rows"][it["key"]]} for it in items}
     selected = [it["key"] for it in items
                 if all(want[d] is None or cell_of[it["key"]][d[:-1]] in want[d] for d in ("columns", "rows"))]
@@ -285,9 +405,12 @@ def resolve_grid(items: list[dict], targets: dict, edges: list | None = None, fa
     have = [cell_of[k] for k in selected]
     resolved = [c for c in requested if any(all(c[a] is None or c[a] == h[a] for a in ("column", "row")) for h in have)]
     missing = [c for c in requested if c not in resolved]
+    anchored = {}
+    for d in dims:
+        if targets[d] is not None:
+            anchored.update(dims[d]["anchored"])
     return {"columns": dims["columns"]["slots"], "rows": dims["rows"]["slots"], "cell_of": cell_of, "selected": selected,
-            "requested": requested, "resolved": resolved, "missing": missing,
-            "anchored": {dims[d]["edge"]: dims[d]["anchored"] for d in dims if targets[d] is not None},
+            "requested": requested, "resolved": resolved, "missing": missing, "anchored": anchored,
             "warnings": dims["columns"]["warnings"] + dims["rows"]["warnings"],
             "notes": dims["columns"]["notes"] + dims["rows"]["notes"],
             "evidence": {d: dims[d]["evidence"] for d in dims if targets[d] is not None}}
@@ -297,26 +420,34 @@ _DIM_EDGES = {"columns": ("left", "right"), "rows": ("top", "bottom")}
 
 
 def grid_cell(item: dict, grid: dict) -> dict:
-    """Cell of a label found after the grid was resolved (plan update): per dimension, the slot that holds it: a box slot
-    (box extent known) when it contains the label centre, a label-only slot when it overlaps the label (strict overlap,
-    the rule that formed the label groups); None when no slot or more than one does."""
+    """Cell of a label found after the grid was resolved (plan update): per dimension, the slot that holds it, by the
+    rule resolve_grid used: the box slot (box extent known) nearest to the label centre among those whose extent
+    contains it; else a label-only slot when it overlaps the label (strict overlap, the rule that formed the label
+    groups); None when no slot holds it, or two box slots at the same distance or two label-only slots do."""
     out = {}
     for dim, a in (("columns", "column"), ("rows", "row")):
         lo, hi = _AXIS[dim]
         c = (item[lo] + item[hi]) / 2
-        hit = [g["index"] for g in grid[dim]
-               if (g["lo"] <= c <= g["hi"] if g["box"] else (item[hi] > g["lo"] and g["hi"] > item[lo]))]
+        box = [g for g in grid[dim] if g["box"]]
+        j = _nearest_slot(c, [(g["lo"], g["hi"]) for g in box], [g["center"] for g in box])
+        if j is not None or any(g["lo"] <= c <= g["hi"] for g in box):
+            out[a] = None if j is None else box[j]["index"]
+            continue
+        hit = [g["index"] for g in grid[dim] if not g["box"] and item[hi] > g["lo"] and g["hi"] > item[lo]]
         out[a] = hit[0] if len(hit) == 1 else None
     return out
 
 
 def grid_conflict(item: dict, cell: dict, grid: dict, targets: dict) -> str | None:
-    """A label found after the grid was resolved that no slot holds, in a constrained dimension, on the counted side of
-    the farthest requested slot: the count up to the requested cells did not see it (the indices may be off)."""
+    """A label found after the grid was resolved that no slot holds, in a constrained dimension: for a dimension given
+    as "all", always (the wall extends beyond the rows / columns counted); otherwise on the counted side of the farthest
+    requested slot (the count up to the requested cells did not see it: the indices may be off)."""
     for dim, a in (("columns", "column"), ("rows", "row")):
         spec = targets[dim]
         if spec is None or cell[a] is not None:
             continue
+        if spec.get("all"):
+            return f"a label that no resolved {dim[:-1]} holds: the box wall extends beyond the {dim} counted"
         lo, hi = _AXIS[dim]
         c = (item[lo] + item[hi]) / 2
         far = [g for g in grid[dim] if g["index"] == max(spec["index"])]
@@ -329,8 +460,28 @@ def grid_conflict(item: dict, cell: dict, grid: dict, targets: dict) -> str | No
 
 
 def cell_targeted(cell: dict, targets: dict) -> bool:
-    """A label in this cell is to be scanned (a None index in a constrained dimension is not)."""
-    return all(targets[d] is None or cell[d[:-1]] in targets[d]["index"] for d in ("columns", "rows"))
+    """A label in this cell is to be scanned (a None index in a constrained dimension is not; "all": any slot)."""
+    return all(targets[d] is None or (cell[d[:-1]] is not None if targets[d].get("all") else
+                                      cell[d[:-1]] in targets[d]["index"]) for d in ("columns", "rows"))
+
+
+def order_by_cells(items: list[dict], cells: dict, grid: dict | None, rule: str = "columns") -> list:
+    """Scan order of labels by their box cells in a resolved grid (items: order items, cells: {key: {"column", "row"}},
+    grid: {"columns": slots, "rows": slots} of resolve_grid). Rule "rows": row slots from the top, inside a row column
+    slots from the left; rule "columns": column slots from the left, inside a column row slots from the top (slot
+    position = its centre, so the result does not depend on the edge the indices are counted from). Labels of one cell
+    keep the order of order_items. Without a grid, or when a label has no cell in either dimension, order_items."""
+    base = order_items(items, rule)
+    keys = [it["key"] for it in items]
+    if grid is None or any(cells[k]["column"] is None or cells[k]["row"] is None for k in keys):
+        return base
+    rank = {k: i for i, k in enumerate(base)}
+    pos = {a: {g["index"]: (g["lo"] + g["hi"]) / 2 for g in grid[dim]} for dim, a in (("columns", "column"), ("rows", "row"))}
+
+    def key(k):
+        r, c = -pos["row"][cells[k]["row"]], -pos["column"][cells[k]["column"]]      # top first, left first
+        return ((r, c) if rule == "rows" else (c, r), rank[k])
+    return sorted(base, key=key)
 
 
 def quad_width(corners) -> float:

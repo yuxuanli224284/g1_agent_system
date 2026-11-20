@@ -51,4 +51,6 @@ def clean(messages):
 
 
 def tool_result_text(res: dict) -> str:
-    return json.dumps({k: v for k, v in res.items() if k not in ("image", "traceback")}, ensure_ascii=False)
+    """A tool result as the LLM sees it: without the image (sent as an image part), the traceback and the log-only
+    diagnostics (toolbox.with_diagnostics)."""
+    return json.dumps({k: v for k, v in res.items() if k not in ("image", "traceback", "diagnostics")}, ensure_ascii=False)

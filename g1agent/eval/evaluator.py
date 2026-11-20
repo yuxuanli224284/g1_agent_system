@@ -145,7 +145,7 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
         out["task1"] = {"success": False, "failure": "the run never reached the task1_end stage"}
         T_ref = None
     elif target_boxes is not None:
-        out["task1"] = {"success": None, "note": "n/a (subset task: the robot works from near its start pose)",
+        out["task1"] = {"success": None, "note": "n/a (subset task)",
                         "t_sim": t1.get("t_sim")}
         T_ref = np.asarray(t1["actual"]["T_world_root"], float)
     else:

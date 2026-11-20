@@ -6,11 +6,14 @@ python scripts/run_task.py --scenario t2_L0_0000 --mode rule [--task 3] [--run_d
 "find + scan all barcodes" task); the simulator is reset with the scenario unchanged.
 Task-3 subset scenarios: "scan_targets" (the target in robot terms, e.g. columns 1-2 from the left, rows 2-3 from the top,
 order rows) is the task instruction given to the agent; "target_boxes" (GT box ids) goes to the evaluator only.
+"head_views" ("upright": no lean-back head views; absent = the camera model's default) and "phase1_view" ("start_pose" |
+"obs_pose"; absent = start_pose) are task parameters for the agent (Toolbox.set_head_views / set_phase1_view).
+result.json records the commit, branch and dirty flag of the agent and the simulator repositories (provenance).
 Needs the sim server (scripts/start_sim_server.sh) and, for agent modes, the VLM server (scripts/start_vllm.sh).
 Per episode: tool_calls.jsonl, llm.jsonl, stages.jsonl, images/, result.json (incl. stage states, full stage log + scan log), final.png,
 episode.mp4 (composite video, unless --no_video), timeline.md / timeline.jsonl.
 """
-import argparse, copy, json, os, sys, time
+import argparse, copy, json, os, subprocess, sys, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +39,14 @@ def load_scenario_arg(scenario: str) -> dict:
             return json.load(f)
     from g1_barcode_sim.testsuite import load_scenario
     return load_scenario(scenario)
+
+
+def git_provenance(path: str) -> dict:
+    """Commit, branch and dirty flag (uncommitted changes to tracked or untracked files) of the git repository at path.
+    A path that is not a git checkout raises (the run must not be recorded without its code version)."""
+    git = lambda *a: subprocess.run(["git", "-C", path, *a], check=True, capture_output=True, text=True).stdout.strip()
+    return {"path": os.path.abspath(path), "commit": git("rev-parse", "HEAD"), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(git("status", "--porcelain"))}
 
 
 def subset_eval_args(sc: dict, task: int) -> dict:
@@ -68,6 +79,7 @@ def make_episode_runner(device=None):
         if task not in TASKS:
             raise ValueError(f"unknown task {task!r} (known: {TASKS})")
 
+        provenance = {"agent": git_provenance(ROOT), "sim": git_provenance(SIM)}
         stage_ws = {}              # harness estimates at a stage, paired with the GT state the eval port stores there
 
         def on_event(e):           # harness log events -> composite-video overlays / stage states on the eval port
@@ -93,6 +105,12 @@ def make_episode_runner(device=None):
         tb.multi_face = task == 3 and sc.get("scan_faces") == "all"
         if task == 3:
             tb.set_scan_targets(sc.get("scan_targets"))
+            # scenario task parameters, only when the scenario gives them (absent: the Toolbox defaults, i.e. the
+            # camera model's lean views and phase 1 near the start pose)
+            if "head_views" in sc:
+                tb.set_head_views(sc["head_views"])
+            if "phase1_view" in sc:
+                tb.set_phase1_view(sc["phase1_view"])
         tcfg = cfg[f"task{task}"]
         h = Harness(tb, task, tcfg["budget"], log, cfg["robot"]["limits"])
         # tasks 1/2 work on the scenario's left/right target box; task 3 covers every box (task3.yaml selector_default)
@@ -136,6 +154,8 @@ def make_episode_runner(device=None):
         res = {"scenario": sc["id"], "task": task, "scenario_task": sc["task"], "mode": mode,
                "robot_variant": tb.info["robot_variant"], "head_camera_model": tb.info["head_camera_model"],
                "target_boxes": sc.get("target_boxes"), "scan_targets": sc.get("scan_targets"),
+               "head_views": sc.get("head_views"), "phase1_view": sc.get("phase1_view"),
+               "provenance": provenance,
                "robot_init": sc.get("robot_init"), "harness_finish": h.finished,
                "orchestrator_error": err, "tool_calls": h.n_calls, "explore_steps": tb.ws.explore_steps,
                "wall_s": round(time.time() - t0, 1), "llm": dict(llm.stats) if llm else None, "world_state": summ,

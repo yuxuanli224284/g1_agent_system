@@ -277,7 +277,9 @@ class Task3:
     """Task 1 over all boxes (fast end), plan_scans, then every planned barcode in the plan's order (next_barcode decides,
     never this code) with Task2.place_and_scan; finish(task=3) with the success computed by the Harness from the ledger.
     The scenario's left/right selector is not used: task 3 observes and scans every box. With a target spec in robot
-    terms (Toolbox.scan_targets) phase 1 stays near the start pose (_stay_stage) and only the targeted labels count."""
+    terms (Toolbox.scan_targets) only the targeted labels count, and phase 1 stays near the start pose (_stay_stage;
+    phase1_view "start_pose", the default) or walks to the observation pose compute_obs_pose plans from the spec
+    (phase1_view "obs_pose": the task-1 stage, Toolbox.set_phase1_view)."""
 
     def __init__(self, h, cfg, selector, explore_policy=None, recovery_policy=None):
         self.h, self.cfg = h, cfg
@@ -298,7 +300,7 @@ class Task3:
     def run(self):
         h = self.h
         h.tb.remember_home()
-        stay = h.tb.scan_targets is not None
+        stay = h.tb.scan_targets is not None and h.tb.phase1_view == "start_pose"
         while True:                                                   # phase 1 (task 1) until a scan plan exists
             s = self._stay_stage() if stay else self.t1.stage()
             if h.finished is not None:
