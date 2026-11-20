@@ -285,10 +285,9 @@ def assign_faces(label_normals, face_normals) -> list[int]:
     return [int(np.argmax(F @ np.asarray(n, float))) for n in label_normals]
 
 
-def labelled_faces(labels: list[dict], faces: list[dict], rule: str = "columns"):
-    """labels: [{"key", "center", "normal", "up", "size"}] (world); faces: GT "faces" entries (I2) {"face", "normal",
-    "gt_obs_pose"}. Returns [(face label, [keys in that face's scan order])] for the faces carrying at least one label,
-    in tour order (FACE_TOUR). Each face is ordered in its own ideal frame (face_frame at its gt_obs_pose)."""
+def face_groups(labels: list[dict], faces: list[dict]) -> list:
+    """[(GT face entry, [its labels])] for the faces carrying at least one label, in tour order (FACE_TOUR); no ordering
+    inside a face (the grouping alone tells how many sides are labelled, which the box order unit needs)."""
     for f in faces:
         if f["face"] not in FACE_TOUR:
             raise ValueError(f"unknown face {f['face']!r} (tour {FACE_TOUR})")
@@ -298,5 +297,13 @@ def labelled_faces(labels: list[dict], faces: list[dict], rule: str = "columns")
     for i, f in enumerate(faces):
         mine = [lb for lb, j in zip(labels, idx) if j == i]
         if mine:
-            out.append((f["face"], order_labels_in_frame(mine, face_frame(f["normal"], f["gt_obs_pose"]["pos"]), rule)))
+            out.append((f, mine))
     return out
+
+
+def labelled_faces(labels: list[dict], faces: list[dict], rule: str = "columns"):
+    """labels: [{"key", "center", "normal", "up", "size"}] (world); faces: GT "faces" entries (I2) {"face", "normal",
+    "gt_obs_pose"}. Returns [(face label, [keys in that face's scan order])] for the faces carrying at least one label,
+    in tour order (FACE_TOUR). Each face is ordered in its own ideal frame (face_frame at its gt_obs_pose)."""
+    return [(f["face"], order_labels_in_frame(mine, face_frame(f["normal"], f["gt_obs_pose"]["pos"]), rule))
+            for f, mine in face_groups(labels, faces)]

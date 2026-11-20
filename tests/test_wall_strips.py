@@ -129,6 +129,11 @@ def test_evaluator_strip_order_equals_the_agent_order_on_the_suites(sid):
     agent = [x["key"] for x in so.order_lattice(_lattice(sc["target_boxes"]), "strips", st["strip_columns"])]
     assert [box[c] for c in m["gt_order"]] == agent == (QUICK if "c12" in sid else FULL)
     assert m["strip_columns"] == 2 and m["layout_columns"] == 6 and m["order_unit"] == "box"
+    # the live sim GT carries "faces" (2026-11-20 strip-1 run: the evaluator then ordered labels by the label rule and
+    # raised on "strips"); one labelled face must give the same box order
+    face = {"face": ev.FACE_TOUR[0], "normal": gt["barcodes"][0]["normal"], "gt_obs_pose": {"pos": [0.0, 0.0, 0.0]}}
+    m_faces = evaluator.evaluate(3, dict(gt, faces=[face]), {}, ws, stages=stages, scan_log=[], **kw)
+    assert m_faces["gt_order"] == m["gt_order"]
     with pytest.raises(ValueError, match="columns"):
         evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], **dict(kw, layout_columns=5))
     with pytest.raises(ValueError, match="order unit 'box'"):

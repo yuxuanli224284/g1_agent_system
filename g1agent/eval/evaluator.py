@@ -12,7 +12,7 @@ import yaml
 from ..common import config
 from ..common.transforms import angle_between, apply, wrap
 from ..perception import geometry as geo
-from .scan_order import (FACE_TOUR, ORDER_RULES, ORDER_UNITS, adaptive_standoff, hfov_from_intrinsics, labelled_faces,
+from .scan_order import (FACE_TOUR, ORDER_RULES, ORDER_UNITS, adaptive_standoff, face_groups, hfov_from_intrinsics, labelled_faces,
                          order_boxes_in_frame, order_labels_in_frame, yaw_only)
 
 
@@ -202,7 +202,13 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
               for b in exp]
     # several labelled sides of a free-standing stack (I2 "faces"): the four-face tour, each face in its own ideal frame;
     # otherwise (one labelled face, or a legacy GT without "faces") the single-face rule in the task1_end root frame
-    groups = labelled_faces(labels, gt["faces"], order_rule) if gt.get("faces") else []
+    # the box order unit only needs how many sides carry labels (its rules, e.g. "strips", are not label rules)
+    if not gt.get("faces"):
+        groups = []
+    elif order_unit == "box":
+        groups = face_groups(labels, gt["faces"])
+    else:
+        groups = labelled_faces(labels, gt["faces"], order_rule)
     multi = len(groups) > 1
     if multi and order_unit == "box":
         raise ValueError("order unit 'box' is defined for one labelled wall face, the GT has several labelled faces")
