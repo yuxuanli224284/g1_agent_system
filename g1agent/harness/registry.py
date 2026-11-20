@@ -67,6 +67,17 @@ PLAN_SCANS_FROM_START = ("Task 3, after reaching the observation pose (or, when 
 PLAN_SCANS_FROM_OBS = "Task 3, after reaching the observation pose: "
 PLAN_SCANS_BODY = ("localise every barcode label on every visible box face in the head image and order them (columns left to right, top to bottom inside a column; or rows top to bottom, left to right inside a row when the task says so). With a target spec only the labels in the requested cells are planned (the others are listed as not_targeted). The order is fixed; next_barcode follows it. Called again while the plan runs (e.g. after a barcode, arm at home, before standing up), it only ADDS labels seen for the first time from the current view.")
 
+# plan_scans body of a task with a wall layout (Toolbox.set_wall_layout; orchestrators.agent_full applies it)
+PLAN_SCANS_LAYOUT_BODY = ("register the wall seen from here to the given layout (front plane, both side edges, floor) and "
+                          "plan one entry of kind cell per requested box, in the order of the task's rule; fails, naming "
+                          "the reason, when a side edge is not in view or the wall does not match the layout; a later "
+                          "call changes nothing.")
+SEARCH_CELL_TEXT = ("Task 3 with a wall layout: for the current box (an entry of kind cell), stand at the planned stance "
+                    "with the arm home, then: re-register the wall from the head, move the hand camera (D405) to the view "
+                    "of the whole box face, find the label inside that face and make the entry that label (its wrist "
+                    "target is computed); a second label in the same box is added as the next entry. Records no_label "
+                    "when the whole face was seen and holds none.")
+
 TOOLS = {
     "look_head": (NoArgs, "Capture the head camera image (attached to the reply) and a short state summary."),
     "detect_boxes": (DetectBoxesArgs, "Detect boxes in the head image; ids are ordered left to right (robot's left first)."),
@@ -89,6 +100,7 @@ TOOLS = {
     "plan_scans": (NoArgs, PLAN_SCANS_FROM_START + PLAN_SCANS_BODY),
     "go_to_next_face": (NoArgs, "Task 3 with every side of the stack: walk around the stack to the next side of the tour (front -> right -> back -> left) and stand at its observation pose (arm home, stand up, back off, sidestep past the corner, turn, fit the side, step to its observation pose). Call it when next_barcode returns face_done=true, then plan_scans."),
     "next_barcode": (NoArgs, "Task 3: switch to the next barcode of the scan plan (an unfinished current barcode is marked failed); clears the per-barcode wrist / stance targets. Works on the current side of the stack: when that side is finished and the task covers every side, it returns face_done=true (call go_to_next_face, then plan_scans); done=true when everything has been handled."),
+    "search_cell": (BarcodeArgs, SEARCH_CELL_TEXT),
     "scan": (NoArgs, "Trigger the scanner and decode what it sees. The code nearest the image centre counts for the current barcode; a content read before is a duplicate and is not counted again. On no read the tool itself retries once (refine_with_wrist + move_arm final + scan); data.retries records it."),
     "finish": (FinishArgs, "End the task and report success or failure with a one-sentence summary."),
 }
@@ -100,8 +112,16 @@ TOOLS = {
 TASK1_TOOLS = ["look_head", "detect_boxes", "select_target_box", "fit_front_face", "compute_obs_pose", "approach",
                "check_face_in_view", "explore", "finish"]
 TASK3_ONLY = ["plan_scans", "next_barcode", "go_to_next_face"]
-TASK2_TOOLS = [n for n in TOOLS if n not in TASK3_ONLY]
-TASK_TOOLS = {1: TASK1_TOOLS, 2: TASK2_TOOLS, 3: list(TOOLS)}
+# tools of a task-3 episode with a wall layout only (Toolbox.wall_layout): every other episode's tool list and texts stay
+# as they were (task_tools)
+LAYOUT_ONLY = ["search_cell"]
+TASK2_TOOLS = [n for n in TOOLS if n not in TASK3_ONLY + LAYOUT_ONLY]
+TASK_TOOLS = {1: TASK1_TOOLS, 2: TASK2_TOOLS, 3: [n for n in TOOLS if n not in LAYOUT_ONLY]}
+
+
+def task_tools(task: int, toolbox) -> list:
+    """The tools of an episode: the task's tools, plus the layout-only tools in a task-3 episode with a wall layout."""
+    return TASK_TOOLS[task] + (LAYOUT_ONLY if task == 3 and getattr(toolbox, "wall_layout", None) is not None else [])
 
 
 def openai_tools(names=None, texts: dict | None = None) -> list[dict]:

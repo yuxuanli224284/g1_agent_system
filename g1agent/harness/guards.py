@@ -7,8 +7,10 @@ Task 3 bookkeeping lives here so that the rule and the LLM orchestrators behave 
 - next_barcode ok -> the per-tool failure streaks are reset (retries are per barcode), barcode_end of an unfinished
   barcode (failed), barcode_start of the next one, scan_done when the plan is exhausted;
 - scan resolving the current barcode -> barcode_end;
+- search_cell (wall layout only) -> labels it added extend the budget like planned ones, no_label -> barcode_end;
 - finish -> the scan ledger and plan statuses are attached and success is computed from the ledger (and the
-  stack tour, every requested target cell found and the target count verified, ws.grid_warnings); finish(success=true)
+  stack tour, every requested target cell found and the target count verified, ws.grid_warnings; a box of a wall
+  layout recorded no_label is handled, like an unreadable label); finish(success=true)
   is refused while the plan or the tour still has work.
 """
 from __future__ import annotations
@@ -19,7 +21,7 @@ import traceback
 
 from pydantic import ValidationError
 
-from .registry import TASK_TOOLS, TOOLS
+from .registry import TASK_TOOLS, TOOLS, task_tools
 
 
 class Harness:
@@ -37,6 +39,9 @@ class Harness:
         self.barcodes_ended = set()
         self.last_approach = None                  # result of the last approach(root_target): phase-1 arrival info
         toolbox.task = task                        # the toolbox reads the running task's config (Toolbox._c1/_c2)
+        # the episode's tools: a wall-layout episode (Toolbox.set_wall_layout, called before the Harness is built) also
+        # gets the layout-only tools
+        self.tools = task_tools(task, toolbox)
 
     def over_budget(self) -> str | None:
         if self.n_calls >= self.budget["max_tool_calls"]:
@@ -58,7 +63,7 @@ class Harness:
             res = {"status": "fail", "data": {}, "reason": stop, "budget_exhausted": True}
         elif name not in TOOLS:
             res = {"status": "fail", "data": {}, "reason": f"unknown tool {name!r}", "rejected": True}
-        elif name not in TASK_TOOLS[self.task]:
+        elif name not in self.tools:
             res = {"status": "fail", "data": {}, "reason": f"tool {name!r} is not part of task {self.task}", "rejected": True}
         else:
             try:
@@ -234,6 +239,14 @@ class Harness:
             bc = ws.barcodes.get(ws.current_barcode_id) if ws.current_barcode_id else None
             if bc is not None and bc.status in ("scanned", "duplicate", "unreadable"):
                 self._end_barcode(bc.id, bc.status)
+        elif name == "search_cell":
+            # labels added to the plan (a second label in the box) get their per-barcode budget like planned ones
+            per = self.base_budget.get("per_barcode")
+            if d.get("added") and per is not None:
+                for k, v in per.items():
+                    self.budget[k] += len(d["added"]) * v
+            if d.get("barcode_status") == "no_label":
+                self._end_barcode(d["barcode_id"], "no_label")
 
     def _finish(self, a):
         fin = dict(a)
@@ -252,9 +265,11 @@ class Harness:
             # target spec every requested cell found (a cell without a label is never silently dropped)
             fin.update(claimed_success=a["success"],
                        # a label verified unreadable at close range (no code decodable in full view) is a result, not a
-                       # failure of the robot; failed / unreachable / pending are not
+                       # failure of the robot; so is a box of a wall layout whose whole face was seen without a label
+                       # (no_label: user decision 2026-11-19 Q2, the evaluator catches a detector miss);
+                       # failed / unreachable / pending are not
                        success=any(s == "scanned" for s in task)
-                       and all(s in ("scanned", "unreadable") for s in task) and self.tb._next_face() is None
+                       and all(s in ("scanned", "unreadable", "no_label") for s in task) and self.tb._next_face() is None
                        and not ws.missing_cells() and not ws.grid_warnings(),
                        scanned=[dict(e) for e in ws.scanned], plan_status=statuses)
             if ws.target_grid is not None:

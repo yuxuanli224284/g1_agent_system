@@ -7,7 +7,9 @@ python scripts/run_task.py --scenario t2_L0_0000 --mode rule [--task 3] [--run_d
 Task-3 subset scenarios: "scan_targets" (the target in robot terms, e.g. columns 1-2 from the left, rows 2-3 from the top,
 order rows) is the task instruction given to the agent; "target_boxes" (GT box ids) goes to the evaluator only.
 "head_views" ("upright": no lean-back head views; absent = the camera model's default) and "phase1_view" ("start_pose" |
-"obs_pose"; absent = start_pose) are task parameters for the agent (Toolbox.set_head_views / set_phase1_view).
+"obs_pose"; absent = start_pose) are task parameters for the agent (Toolbox.set_head_views / set_phase1_view);
+"wall_layout" ({"columns", "rows", "box_w", "box_h", "base": "floor"}, absent = none) gives the agent the wall layout
+(Toolbox.set_wall_layout; the evaluator then orders by box, order_unit "box"), recorded in result.json when given.
 result.json records the commit, branch and dirty flag of the agent and the simulator repositories (provenance).
 Needs the sim server (scripts/start_sim_server.sh) and, for agent modes, the VLM server (scripts/start_vllm.sh).
 Per episode: tool_calls.jsonl, llm.jsonl, stages.jsonl, images/, result.json (incl. stage states, full stage log + scan log), final.png,
@@ -50,10 +52,15 @@ def git_provenance(path: str) -> dict:
 
 
 def subset_eval_args(sc: dict, task: int) -> dict:
-    """Evaluator arguments of a task-3 subset scenario: the GT target box ids and the order rule of its target spec."""
+    """Evaluator arguments of a task-3 subset scenario: the GT target box ids and the order rule of its target spec; with
+    a wall layout the order unit "box" (the agent plans one entry per layout cell; absent otherwise, so the evaluation
+    of every other scenario is the one it was)."""
     if task != 3:
         return {}
-    return {"target_boxes": sc.get("target_boxes"), "order_rule": (sc.get("scan_targets") or {}).get("order", "columns")}
+    out = {"target_boxes": sc.get("target_boxes"), "order_rule": (sc.get("scan_targets") or {}).get("order", "columns")}
+    if "wall_layout" in sc:
+        out["order_unit"] = "box"
+    return out
 
 
 def make_episode_runner(device=None):
@@ -111,6 +118,10 @@ def make_episode_runner(device=None):
                 tb.set_head_views(sc["head_views"])
             if "phase1_view" in sc:
                 tb.set_phase1_view(sc["phase1_view"])
+            # after the target spec and the phase-1 view: set_wall_layout validates against both (and before the
+            # Harness, whose tool list includes the layout-only tools)
+            if "wall_layout" in sc:
+                tb.set_wall_layout(sc["wall_layout"])
         tcfg = cfg[f"task{task}"]
         h = Harness(tb, task, tcfg["budget"], log, cfg["robot"]["limits"])
         # tasks 1/2 work on the scenario's left/right target box; task 3 covers every box (task3.yaml selector_default)
@@ -155,6 +166,7 @@ def make_episode_runner(device=None):
                "robot_variant": tb.info["robot_variant"], "head_camera_model": tb.info["head_camera_model"],
                "target_boxes": sc.get("target_boxes"), "scan_targets": sc.get("scan_targets"),
                "head_views": sc.get("head_views"), "phase1_view": sc.get("phase1_view"),
+               **({"wall_layout": sc["wall_layout"]} if "wall_layout" in sc else {}),
                "provenance": provenance,
                "robot_init": sc.get("robot_init"), "harness_finish": h.finished,
                "orchestrator_error": err, "tool_calls": h.n_calls, "explore_steps": tb.ws.explore_steps,

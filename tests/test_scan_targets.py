@@ -892,3 +892,100 @@ def test_four_box_prompt_texts_are_unchanged_and_the_upright_task_never_mentions
     assert "leaned back" not in everything
     assert "compute_obs_pose -> approach" in system and "upright head views only" in start
     assert "all columns" in start and "rows 2, 3, 4 from the bottom" in start
+
+
+# ------------------------------------------------------------------ order rule "serpentine" (wall-layout suite)
+def test_serpentine_order_matches_evaluator_copy_and_rule():
+    """Rule "serpentine" (user decision 2026-11-19): the rows of rule "rows", the top row left to right, the next right
+    to left, alternating over the rows that hold items. The evaluator's copy gives the same order on random input;
+    rows / columns are unchanged (row_order's default direction is the old one)."""
+    from g1agent.eval import scan_order as ev
+    rng = np.random.default_rng(7)
+    for _ in range(300):
+        items = []
+        for k in range(int(rng.integers(1, 9))):
+            y, z = float(rng.uniform(-0.6, 0.6)), float(rng.uniform(0.2, 1.3))
+            w, h = float(rng.uniform(0.04, 0.2)), float(rng.uniform(0.02, 0.08))
+            items.append({"key": f"k{k}", "y_lo": y - w / 2, "y_hi": y + w / 2, "z_lo": z - h / 2, "z_hi": z + h / 2, "z": z})
+        assert so.order_items(items, "serpentine") == ev.order_items(items, "serpentine")
+        for d in (True, False):
+            assert so.row_order(items, d) == ev.row_order(items, d)
+        assert so.row_order(items) == so.row_order(items, True)
+        # serpentine = the rows of rule "rows" (same sets, same row sequence), every second row reversed (the random
+        # lateral centres are distinct, so reversing a row equals sorting it right to left)
+        rows = so._overlap_groups(items, "z_lo", "z_hi")
+        assert so.order_items(items, "serpentine") == \
+            [k for i, r in enumerate(rows) for k in (so.row_order(r) if i % 2 == 0 else so.row_order(r)[::-1])]
+    it = lambda k, y, z: {"key": k, "y_lo": y - 0.05, "y_hi": y + 0.05, "z_lo": z - 0.02, "z_hi": z + 0.02, "z": z}
+    grid = [it("a", 0.4, 1.0), it("b", 0.2, 1.01), it("c", 0.4, 0.7), it("d", 0.2, 0.69), it("e", 0.4, 0.4), it("f", 0.2, 0.41)]
+    assert so.order_items(grid, "serpentine") == ["a", "b", "d", "c", "e", "f"]
+    assert so.order_items(grid, "rows") == ["a", "b", "c", "d", "e", "f"]
+    assert so.order_items(grid, "columns") == ["a", "c", "e", "b", "d", "f"]
+    t = so.parse_targets({"columns": "all", "rows_from_bottom": [2, 3, 4], "order": "serpentine"})
+    assert t["order"] == "serpentine" and so.ORDER_RULES == ("columns", "rows", "serpentine")
+    assert "the next right to left, alternating" in so.order_rule_text("serpentine")
+    assert so.order_rule_text("rows") == ("rows of overlapping vertical label extents, top to bottom; left to right inside "
+                                          "a row as seen facing this side")
+
+
+def test_serpentine_order_by_cells_r234_wall():
+    """Rows 2-4 x all columns by box cells: R4 left to right, R3 right to left, R2 left to right; a fragment inside a
+    cell stays in its cell; the result does not depend on the edge the rows are counted from; without a grid (or a
+    label without a cell) the label rule."""
+    t = so.parse_targets(dict(SPEC_R234, order="serpentine"))
+    items = _wall_items(drop=0.035) + [_sliver(3, 4)]
+    edges, centres = _wall_evidence()
+    g = so.resolve_grid(items, t, edges, centres, bounds=FLOOR)
+    sel = [it for it in items if it["key"] in g["selected"]]
+    expect = ([f"C{c}R4" for c in range(1, 7)] + [f"C{c}R3" for c in range(6, 0, -1)]
+              + [f"C{c}R2" for c in range(1, 7)])
+    order = so.order_by_cells(sel, g["cell_of"], g, "serpentine")
+    assert [k for k in order if k != "sliver"] == expect and order.index("sliver") in (2, 3)
+    g_top = {"columns": g["columns"], "rows": [{**s, "index": 5 - s["index"]} for s in g["rows"]]}
+    cells_top = {k: {"column": c["column"], "row": 5 - c["row"]} for k, c in g["cell_of"].items()}
+    assert so.order_by_cells(sel, cells_top, g_top, "serpentine") == order
+    cells = dict(g["cell_of"], sliver={"column": 3, "row": None})
+    assert so.order_by_cells(sel, cells, g, "serpentine") == so.order_items(sel, "serpentine")
+    assert so.order_by_cells(sel, g["cell_of"], None, "serpentine") == so.order_items(sel, "serpentine")
+    # the alternation counts the rows that hold labels: without the R3 labels, R2 runs right to left
+    sel2 = [it for it in sel if not it["key"].endswith("R3")]
+    assert so.order_by_cells(sel2, g["cell_of"], g, "serpentine")[-6:] == [f"C{c}R2" for c in range(6, 0, -1)]
+    # rows / columns by cells are unchanged by the new rule (pinned by test_r234_cell_order_ignores_duplicates...)
+    assert [k for k in so.order_by_cells(sel, g["cell_of"], g, "rows") if k != "sliver"] == \
+        [f"C{c}R{r}" for r in (4, 3, 2) for c in range(1, 7)]
+
+
+def test_serpentine_order_by_cells_reverses_labels_inside_a_cell_with_its_row():
+    """Two labels side by side in one box (C2R3, a right-to-left row): they are read right to left, as the row."""
+    t = so.parse_targets(dict(SPEC_R234, order="serpentine"))
+    items = _wall_items(drop=0.035)
+    items = [x for x in items if x["key"] != "C2R3"]
+    y = COLS6[1]
+    items += [{"key": "C2R3a", "y_lo": y + 0.01, "y_hi": y + 0.07, "z_lo": 0.69, "z_hi": 0.73, "z": 0.71},
+              {"key": "C2R3b", "y_lo": y - 0.07, "y_hi": y - 0.01, "z_lo": 0.69, "z_hi": 0.73, "z": 0.71}]
+    edges, centres = _wall_evidence()
+    g = so.resolve_grid(items, t, edges, centres, bounds=FLOOR)
+    sel = [it for it in items if it["key"] in g["selected"]]
+    order = so.order_by_cells(sel, g["cell_of"], g, "serpentine")
+    r3 = [k for k in order if "R3" in k]
+    assert r3 == ["C6R3", "C5R3", "C4R3", "C3R3", "C2R3b", "C2R3a", "C1R3"]          # a is on the left of b
+    assert so.order_in_cell([x for x in sel if x["key"].startswith("C2R3")], "serpentine", False) == ["C2R3b", "C2R3a"]
+    assert so.order_in_cell([x for x in sel if x["key"].startswith("C2R3")], "serpentine", True) == ["C2R3a", "C2R3b"]
+    assert so.order_in_cell([x for x in sel if x["key"].startswith("C2R3")], "rows", False) == ["C2R3a", "C2R3b"]
+
+
+def test_order_lattice_rules():
+    """The layout cells themselves (column 1 = leftmost, row 1 = top): rows, columns, serpentine; the serpentine
+    alternation counts the rows that hold cells; each cell reports its row's direction (for order_in_cell)."""
+    cells = [{"key": f"C{c}R{r}", "column": c, "row": r} for r in (2, 3, 4) for c in range(1, 4)][::-1]   # shuffled
+    keys = lambda rule: [x["key"] for x in so.order_lattice(cells, rule)]
+    assert keys("rows") == [f"C{c}R{r}" for r in (2, 3, 4) for c in (1, 2, 3)]
+    assert keys("columns") == [f"C{c}R{r}" for c in (1, 2, 3) for r in (2, 3, 4)]
+    assert keys("serpentine") == ["C1R2", "C2R2", "C3R2", "C3R3", "C2R3", "C1R3", "C1R4", "C2R4", "C3R4"]
+    snake = so.order_lattice(cells, "serpentine")
+    assert [x["left_to_right"] for x in snake] == [True] * 3 + [False] * 3 + [True] * 3
+    assert all(x["left_to_right"] for x in so.order_lattice(cells, "rows"))
+    gap = [c for c in cells if c["row"] != 3]                       # rows 2 and 4 only: row 4 is the second row
+    assert [x["key"] for x in so.order_lattice(gap, "serpentine")] == ["C1R2", "C2R2", "C3R2", "C3R4", "C2R4", "C1R4"]
+    with pytest.raises(ValueError):
+        so.order_lattice(cells, "spiral")

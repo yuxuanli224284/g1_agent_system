@@ -19,6 +19,10 @@ target spec says so); next_barcode walks the plan and clears the per-barcode slo
 ws.current_barcode_id and to the face copy stored with the barcode; scan dedupes by decoded content into the ws.scanned
 ledger. A target spec in robot terms (set_scan_targets: columns / rows of the box wall counted from an edge) is resolved
 on the label grid of the first plan of a side; the labels outside the requested cells stay in the plan as not_targeted.
+A task with a given wall layout (set_wall_layout, approach A) plans boxes instead of labels: plan_scans registers the
+wall (plane, side edges, floor) and plans one entry of kind "cell" per requested box in the lattice order; each box is
+visited with the hand-camera search (compute_wrist_target -> plan_stance -> approach -> search_cell), which turns the
+entry into its label or records no_label (see "task 3: wall layout" below). Every layout branch is gated on wall_layout.
 """
 from __future__ import annotations
 
@@ -34,11 +38,11 @@ from ..kinematics.fk import Kinematics
 from ..kinematics.ik import ArmIK
 from ..perception import geometry as geo
 from ..perception.barcode_detector import decode_symbol_polygons, detect_barcodes, detect_label_dino
-from ..perception.plane_fit import fit_front_face
+from ..perception.plane_fit import fit_front_face, fit_support_plane, wall_extent
 from .scan_order import (adaptive_standoff, cell_targeted, describe_targets, grid_cell, grid_conflict, hfov_from_intrinsics,
-                         order_by_cells, order_items,
-                         order_items_in_frame, order_rule_text as scan_order_text, parse_targets, quad_width,
-                         resolve_grid)
+                         order_by_cells, order_in_cell, order_items,
+                         order_items_in_frame, order_lattice, order_rule_text as scan_order_text, parse_targets,
+                         quad_width, resolve_grid)
 
 
 def R3(x):
@@ -94,6 +98,12 @@ def move_summary(r: dict) -> dict:
 
 
 class Toolbox:
+    # task parameter: the given wall layout (set_wall_layout; None = no layout, every branch below is gated on it).
+    # Class-level defaults so that every Toolbox, also one built without __init__ (tests), has them
+    wall_layout = None
+    _layout_edges = None              # wall side edges / extent seen in phase 1 (odom points), _layout_view_points
+    _look_cache = None                # look-pose search results per (face size, delta, e), _search_view
+
     def __init__(self, robot, box_detector=None, device: str | None = None):
         from ..perception.box_detector import BoxDetector
         self.robot = robot
@@ -735,7 +745,10 @@ class Toolbox:
         - Vertical otherwise (rows from the top, or no row key): today's corners raised to the known stack top; "all"
           rows also need the bottom edge: from the floor up to that top.
         Also returns the pose reference point: the region's lateral middle (not the middle of the faces fitted in this
-        view, which after a walk may be a part of the region), at the plane and height of _faces_reference."""
+        view, which after a walk may be a part of the region), at the plane and height of _faces_reference.
+        With a wall layout: _layout_view_points."""
+        if self.wall_layout is not None:
+            return self._layout_view_points(faces)
         center, nh = self._faces_reference(faces)
         lat = np.array([-nh[1], nh[0], 0.0])
         C = np.vstack([np.asarray(f["corners"], float) for f in faces])
@@ -1149,8 +1162,12 @@ class Toolbox:
         """Localise every label on every fitted face in one head image and fix the scan order (scan_order.py). Once the
         plan is being executed, a call from another viewpoint UPDATES it instead: labels already in the plan (same
         place on the face) are kept as they are, labels seen for the first time are added as pending and ordered with
-        the other pending ones by the same rule in the planning frame; scanned / failed entries never move."""
+        the other pending ones by the same rule in the planning frame; scanned / failed entries never move.
+        With a wall layout (set_wall_layout): the wall is registered and one entry per requested box planned
+        (_plan_layout); once that plan exists a call changes nothing (no capture)."""
         ws = self.ws
+        if self.wall_layout is not None and ws.wall is not None:
+            return ok({"updated": True, "added": []}, "the cells are fixed by the wall layout")
         # an internal update looks from the view it was called in (a squat / lean of the extra looks, the stance)
         r = self.detect_boxes(view="keep" if _update else "auto")
         if r["status"] != "ok":
@@ -1176,6 +1193,8 @@ class Toolbox:
                 del faces[bid]
         if ws.stack is not None:
             self._stack_add_faces(cur, list(faces.values()))
+        if self.wall_layout is not None:
+            return self._plan_layout(h, faces, skipped)
         face_entries = [b for b in ws.scan_plan if ws.barcodes[b].face_id == cur]
         updating = _update if _update is not None else bool(face_entries)
         if self.scan_targets is not None:
@@ -1251,7 +1270,7 @@ class Toolbox:
         side = [b for b in ws.scan_plan if ws.barcodes[b].face_id == cur]
         out = [{"id": b, "box_id": ws.barcodes[b].box_id, "order_index": ws.barcodes[b].order_index,
                 "corners_px": ws.barcodes[b].corners_px, "center_odom": ws.barcodes[b].center,
-                "width_m": ws.barcodes[b].width_m, "standoff_m": self._standoff(ws.barcodes[b]), "status": ws.barcodes[b].status,
+                "width_m": ws.barcodes[b].width_m, "standoff_m": self._standoff_or_none(ws.barcodes[b]), "status": ws.barcodes[b].status,
                 "face_id": cur, **({"cell": ws.barcodes[b].grid_cell} if targets is not None else {})}
                for b in side]
         n = sum(o["status"] == "pending" for o in out)
@@ -1270,6 +1289,771 @@ class Toolbox:
                   f"no barcode label on the {self.TOUR[cur]} side ({len(faces)} face(s) fitted"
                   f"{', also looked from a squat' if low and low.get('height_cmd') is not None else ''}): this side "
                   f"has nothing to scan; call next_barcode to move on"), diag)
+
+    # ------------------------------------------------------------------ task 3: wall layout (approach A)
+    # The task gives the wall layout (columns x rows of equal boxes of box_w x box_h standing on the floor; user decision
+    # 2026-11-19). The robot registers the wall once from the observation pose (front plane from the box face fits, both
+    # side edges from the head depth, floor = odom z 0 cross-checked against the depth floor) and plans one entry of kind
+    # "cell" per requested box in the lattice order of the task's rule. At each box: a stance for the hand-camera view of
+    # the whole box face (compute_wrist_target / plan_stance), search_cell (re-register the wall from the head, aim the
+    # D405 at the face, find the label inside it), then the g1_v2 final-pose path. Head label detection is not used.
+    # Stored layout geometry lives in the WALL frame (WorldState.wall T_odom_wall: x = right along the wall, y = into the
+    # wall, z = up, origin = the bottom-left corner of the front face as seen by the robot); odometry is trusted only
+    # between two registrations (user decision 2026-11-19: real-robot odometry is unreliable).
+    LAYOUT_KEYS = ("columns", "rows", "box_w", "box_h", "base")
+    LAYOUT_BASES = ("floor",)        # row 1 stands on the floor, at odom z 0 (the D3 rule of _grid_evidence)
+
+    def set_wall_layout(self, layout):
+        """Scenario field wall_layout (task instruction): {"columns", "rows" (integers >= 1), "box_w", "box_h" (m, > 0),
+        "base": "floor"}. Needs the target spec (set_scan_targets) and the obs_pose phase 1 (set_phase1_view) first; a
+        multi-face task is refused, and so is a requested column / row beyond the layout."""
+        if not isinstance(layout, dict):
+            raise ValueError(f"wall_layout must be a dict, got {type(layout).__name__}")
+        missing = [k for k in self.LAYOUT_KEYS if k not in layout]
+        unknown = sorted(set(layout) - set(self.LAYOUT_KEYS))
+        if missing or unknown:
+            raise ValueError(f"wall_layout keys: missing {missing}, unknown {unknown} (known: {list(self.LAYOUT_KEYS)})")
+        for k in ("columns", "rows"):
+            v = layout[k]
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(f"wall_layout {k} must be an integer >= 1, got {v!r}")
+        for k in ("box_w", "box_h"):
+            v = layout[k]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v <= 0:
+                raise ValueError(f"wall_layout {k} must be a positive number (m), got {v!r}")
+        if layout["base"] not in self.LAYOUT_BASES:
+            raise ValueError(f"wall_layout base must be one of {self.LAYOUT_BASES}, got {layout['base']!r}")
+        if self.scan_targets is None:
+            raise ValueError("a wall layout needs the task's target spec (set_scan_targets first)")
+        if self.phase1_view != "obs_pose":
+            raise ValueError("a wall layout is registered from the observation pose: phase1_view must be 'obs_pose' "
+                             "(set_phase1_view first)")
+        if self.multi_face:
+            raise ValueError("a wall layout describes one wall: a task over every side of a stack cannot use it")
+        for dim in ("columns", "rows"):
+            d = self.scan_targets[dim]
+            if d is not None and d.get("index") and max(d["index"]) > layout[dim]:
+                raise ValueError(f"the target spec asks for {dim} {d['index']} from the {d['from']}, the wall layout has "
+                                 f"{layout[dim]} {dim}")
+        self.wall_layout = {"columns": int(layout["columns"]), "rows": int(layout["rows"]),
+                            "box_w": float(layout["box_w"]), "box_h": float(layout["box_h"]), "base": layout["base"]}
+        self.ws.wall = None
+        self._layout_edges = {}
+        self._look_cache = {}
+
+    # ---- wall frame
+    @staticmethod
+    def _wall_frame(origin, right, normal) -> np.ndarray:
+        """T_odom_wall from the front face's bottom-left corner, its right axis and its normal (toward the robot)."""
+        T = np.eye(4)
+        T[:3, 0], T[:3, 1], T[:3, 2], T[:3, 3] = right, -np.asarray(normal, float), [0.0, 0.0, 1.0], origin
+        return T
+
+    def _wall_T(self) -> np.ndarray:
+        return np.asarray(self.ws.wall["T_odom_wall"], float)
+
+    def _wall_axes(self) -> dict:
+        T = self._wall_T()
+        return {"origin": T[:3, 3].copy(), "right": T[:3, 0].copy(), "up": T[:3, 2].copy(), "normal": -T[:3, 1]}
+
+    def _rect_face(self, x0, x1, z0, z1) -> dict:
+        """A rectangle of the wall's front plane (wall-frame x in [x0, x1], z in [z0, z1]) as a face dict (odom, current
+        registration)."""
+        T = self._wall_T()
+        C = apply(T, np.array([[x0, 0.0, z1], [x1, 0.0, z1], [x1, 0.0, z0], [x0, 0.0, z0]]))
+        ax = self._wall_axes()
+        return {"center": C.mean(axis=0), "normal": ax["normal"], "right": ax["right"], "up": ax["up"], "corners": C,
+                "size": [float(x1 - x0), float(z1 - z0)], "t": self.ws.wall["t"], "rect_w": [x0, x1, z0, z1]}
+
+    def _cell_rect(self, c, r, grow_lat=0.0, grow_v=0.0) -> list:
+        """Wall-frame rectangle [x0, x1, z0, z1] of layout cell (column c from the left, row r from the bottom, 1-based),
+        grown by grow_lat laterally and grow_v vertically."""
+        L = self.wall_layout
+        return [(c - 1) * L["box_w"] - grow_lat, c * L["box_w"] + grow_lat,
+                (r - 1) * L["box_h"] - grow_v, r * L["box_h"] + grow_v]
+
+    def _cell_face(self, c, r) -> dict:
+        return dict(self._rect_face(*self._cell_rect(c, r)), layout_cell=[int(c), int(r)])
+
+    def _search_grow(self):
+        """Growth of a box face for the hand-camera search: delta_lat (the registration's lateral uncertainty) laterally
+        and e = robot.yaml arm_motion.correction_tol (the placement error the arm loop accepts) on every side."""
+        return float(self.ws.wall["delta_lat"]), float(self.cfg["robot"]["arm_motion"]["correction_tol"])
+
+    def _sync_layout(self, bc):
+        """Odometry fields of a layout entry from its wall-frame geometry (current registration)."""
+        T, w = self._wall_T(), bc.wall
+        bc.face = self._cell_face(*w["cell"])
+        bc.center = apply(T, w["center"])
+        bc.normal = rotate(T, w["normal"])
+        bc.corners_odom = None if w["corners"] is None else apply(T, w["corners"])
+        bc.bar_dir = None if w["bar_dir"] is None else rotate(T, w["bar_dir"])
+
+    def _store_layout(self, bc):
+        """Wall-frame geometry of a layout entry from its odometry fields (a measurement made now)."""
+        Ti = inv_T(self._wall_T())
+        bc.wall.update(center=apply(Ti, bc.center), normal=rotate(Ti, bc.normal),
+                       corners=None if bc.corners_odom is None else apply(Ti, bc.corners_odom),
+                       bar_dir=None if bc.bar_dir is None else rotate(Ti, bc.bar_dir))
+
+    def _sync_layout_all(self):
+        for bc in self.ws.barcodes.values():
+            if bc.wall is not None:
+                self._sync_layout(bc)
+
+    # ---- registration
+    @staticmethod
+    def _wall_plane(faces) -> dict:
+        """Front plane of the wall from the box face fits: the mean horizontal normal (the layout boxes stand on the
+        floor, their fronts are vertical) and the median of the face centres along it (a few bad fits do not move it).
+        right = up x normal (the robot's right, as plane_fit)."""
+        nhs = []
+        for f in faces:
+            n = np.asarray(f["normal"], float)
+            nhs.append(np.array([n[0], n[1], 0.0]) / np.linalg.norm(n[:2]))
+        nh = np.sum(nhs, axis=0)
+        nh /= np.linalg.norm(nh)
+        off = float(np.median([float(np.asarray(f["center"], float) @ nh) for f in faces]))
+        return {"normal": nh, "right": np.cross([0.0, 0.0, 1.0], nh), "point": off * nh, "offset": off,
+                "n_faces": len(faces)}
+
+    def _wall_extent(self, h, plane) -> dict:
+        """Side edges and lateral extent of the wall on a plane in head frame h (plane_fit.wall_extent)."""
+        return wall_extent(h["depth"], h["K"], h["T_root_cam"], h["T_odom_root"], plane, self.cfg["perception"]["plane_fit"],
+                           sigma_coeff=h["depth_sigma_coeff"], min_structure_px=self._min_structure_px(),
+                           fov_margin_frac=self.cfg["perception"]["fov_margin_frac"])
+
+    def _floor_height(self, h, base_pt, plane) -> dict | None:
+        """Cross-check of the odometry floor: the support plane (plane_fit.fit_support_plane, the plane-fit parameters)
+        of the head depth points IN FRONT of the wall plane (signed distance >= the point's plane tolerance: the floor
+        between the robot and the wall; with the wall in the sample, ~70 % of the points at the observation pose, the
+        RANSAC draws almost never hit three floor points), its height at base_pt (odom x, y). None when no support
+        plane has min_inliers."""
+        c = self.cfg["perception"]["plane_fit"]
+        z = np.asarray(h["depth"], float)
+        vs, us = np.mgrid[0:z.shape[0]:c["stride"], 0:z.shape[1]:c["stride"]]
+        zz = z[vs, us]
+        lo, hi = c["depth_valid"]
+        m = np.isfinite(zz) & (zz > lo) & (zz < hi)
+        if m.sum() < c["min_inliers"]:
+            return None
+        P = apply(h["T_odom_root"] @ h["T_root_cam"], geo.backproject(h["K"], us[m], vs[m], zz[m]))
+        tol = np.maximum(c["inlier_dist"], c["inlier_sigmas"] * h["depth_sigma_coeff"] * zz[m] ** 2)
+        front = (P - np.asarray(plane["point"], float)) @ np.asarray(plane["normal"], float) >= tol
+        P, tol = P[front], tol[front]
+        if len(P) < c["min_inliers"]:
+            return None
+        sp = fit_support_plane(P, tol, c, np.random.default_rng(c["seed"]))
+        if sp["mask"] is None or sp["count"] < c["min_inliers"]:
+            return None
+        a, n = sp["point"], sp["normal"]
+        x, y = float(base_pt[0]), float(base_pt[1])
+        return {"z": float(a[2] - (n[0] * (x - a[0]) + n[1] * (y - a[1])) / n[2]), "n_inliers": int(sp["count"])}
+
+    def _layout_view_points(self, faces):
+        """Observation-pose region of a wall-layout task (the _spec_view_points contract): on the front plane
+        (_wall_plane), laterally the wall's place as far as the edges seen in phase 1 tell it (self._layout_edges, odom
+        points: phase 1 walks ~1 m, ~2 cm drift): [s_L, s_L + W] with the left edge seen, [s_R - W, s_R] with the right
+        one, else [s_max - W, s_min + W] (every placement consistent with the extent seen; the face-fit extents only
+        without any wall component in view; a seen extent wider than W fits no placement: [s_min, s_max]); vertically the bottom row, [0, box_h] above the odom floor (in an upright
+        head view the wall's lateral coverage is widest at its lowest points, and the floor line is in view for the
+        floor cross-check)."""
+        L = self.wall_layout
+        W = L["columns"] * L["box_w"]
+        plane = self._wall_plane(faces)
+        center, _ = self._faces_reference(faces)
+        p0, right = plane["point"], plane["right"]
+        mem = self._layout_edges if self._layout_edges is not None else {}
+        self._layout_edges = mem
+        ext = self._wall_extent(self.head, plane)
+        for side in ("left", "right"):
+            if ext[side] is not None:
+                mem[side] = p0 + ext[side]["s"] * right
+        if ext["seen"] is not None:
+            mem["seen"] = np.vstack([mem.get("seen", np.zeros((0, 3))), [p0 + v * right for v in ext["seen"]]])
+        s_of = lambda P: np.atleast_2d(np.asarray(P, float) - p0) @ right
+        if "left" in mem:
+            lo = float(s_of(mem["left"])[0])
+            hi = lo + W
+        elif "right" in mem:
+            hi = float(s_of(mem["right"])[0])
+            lo = hi - W
+        else:
+            S = s_of(mem["seen"]) if "seen" in mem else s_of(np.vstack([np.asarray(f["corners"], float) for f in faces]))
+            if float(S.max() - S.min()) > W:               # more than the layout's width seen (no placement of the wall
+                lo, hi = float(S.min()), float(S.max())    # holds it: the seen extent is too wide): hold all of it
+            else:
+                lo, hi = float(S.max()) - W, float(S.min()) + W
+        z_lo, z_hi = 0.0, L["box_h"]
+        up = np.array([0.0, 0.0, 1.0])
+        P = lambda sv, zv: p0 + sv * right + zv * up
+        corners = np.array([P(hi, z_hi), P(lo, z_hi), P(lo, z_lo), P(hi, z_lo)])
+        ref = P(0.5 * (lo + hi), float(np.asarray(center, float)[2]))
+        return corners, {"layout": True, "lateral": [lo, hi], "z_range": [z_lo, z_hi],
+                         "edges_seen": {sd: sd in mem for sd in ("left", "right")}, "seen": ext["seen"]}, ref
+
+    def _register_wall(self, h, faces):
+        """Initial registration of the wall frame from head frame h (wall-layout plan_scans): plane (_wall_plane), both
+        side edges (_wall_extent; both are required: no unverified one-edge anchoring), the lateral anchor a = (s_L +
+        s_R) / 2 (a symmetric stereo fattening of the edges cancels in a and shows in the width residual r = s_R - s_L -
+        W), the floor cross-check. Halfway rules: |r| >= box_w / 2 (a wrong column count or a coplanar neighbour gives
+        |r| >= box_w) and a depth floor >= box_h / 2 from the odom floor (row indices off by one) are failures. Returns
+        (None (registered: ws.wall) or the tool failure, the log-only diagnostics)."""
+        L = self.wall_layout
+        W, H = L["columns"] * L["box_w"], L["rows"] * L["box_h"]
+        plane = self._wall_plane(faces)
+        ext = self._wall_extent(h, plane)
+        diag = {"plane": plane, "extent": ext}
+        missing = [sd for sd in ("left", "right") if ext[sd] is None]
+        if missing:
+            def why(sd):
+                rj = ext["rejected"][sd]
+                if ext["seen"] is None:
+                    return "no wall surface found on the plane"
+                return "cut by the image border" if rj["cut"] >= rj["front"] else "occluded"
+            what = " and the ".join(f"{sd} side edge ({why(sd)})" for sd in missing)
+            return with_diagnostics(fail(f"the {what} of the wall {'is' if len(missing) == 1 else 'are'} not in the head view: "
+                                         "call compute_obs_pose and approach again (they plan the view from the edges "
+                                         "seen so far), then plan_scans",
+                                         {"edges": {sd: ext[sd] for sd in ("left", "right")}, "seen": ext["seen"]}), diag), diag
+        sL, sR = ext["left"]["s"], ext["right"]["s"]
+        W_meas = sR - sL
+        r = W_meas - W
+        if abs(r) >= L["box_w"] / 2:
+            return with_diagnostics(fail(f"the wall seen is {W_meas:.2f} m wide, the layout says {W:.2f} m: the wall does "
+                                         "not match the layout", {"W_meas": W_meas, "W": W}), diag), diag
+        right, nh = plane["right"], plane["normal"]
+        origin = plane["point"] + (0.5 * (sL + sR) - W / 2) * right
+        zf = self._floor_height(h, origin + (W / 2) * right, plane)
+        diag["floor"] = zf
+        if zf is not None and abs(zf["z"]) >= L["box_h"] / 2:
+            return with_diagnostics(fail(f"the floor seen is {zf['z']:.2f} m from the odometry floor: row indices would be "
+                                         "off by one", {"z_floor_depth": zf["z"]}), diag), diag
+        self.ws.wall = {"T_odom_wall": self._wall_frame(origin, right, nh), "W": W, "H": H, "columns": L["columns"],
+                        "rows": L["rows"], "box_w": L["box_w"], "box_h": L["box_h"], "delta_lat": abs(r) / 2,
+                        "t": h["t"], "anchor_root_xy": np.asarray(h["T_odom_root"], float)[:2, 3].copy(),
+                        "registration": {"s_L": sL, "s_R": sR, "W_meas": W_meas, "r": r, "mad_L": ext["left"]["mad"],
+                                         "mad_R": ext["right"]["mad"], "n_rows_L": ext["left"]["n_rows"],
+                                         "n_rows_R": ext["right"]["n_rows"],
+                                         "z_floor_depth": None if zf is None else zf["z"],
+                                         "z_floor_note": None if zf is not None else
+                                         "no support plane in the head depth: the odometry floor is used unchecked",
+                                         "plane_offset": plane["offset"], "n_faces": plane["n_faces"], "t": h["t"]},
+                        "history": []}
+        return None, diag
+
+    def _requested_cells(self) -> list:
+        """Requested layout cells [(c, r)] (column from the left, row from the bottom, 1-based): "all" / an absent
+        dimension -> every index; *_from_left / *_from_bottom i -> i; *_from_right / *_from_top i -> n + 1 - i."""
+        t, L = self.scan_targets, self.wall_layout
+
+        def idx(dim, n):
+            d = t[dim]
+            if d is None or d.get("all"):
+                return list(range(1, n + 1))
+            return sorted(i if d["from"] in ("left", "bottom") else n + 1 - i for i in d["index"])
+        return [(c, r) for c in idx("columns", L["columns"]) for r in idx("rows", L["rows"])]
+
+    def _spec_cell(self, c, r) -> dict:
+        """Layout cell -> the target-grid cell in the spec's counting ({"column", "row"}; None for a dimension the spec
+        does not name; "all" counts from the left / top, as parse_targets)."""
+        t, L = self.scan_targets, self.wall_layout
+
+        def one(dim, k, n):
+            d = t[dim]
+            if d is None:
+                return None
+            return k if d["from"] in ("left", "bottom") else n + 1 - k
+        return {"column": one("columns", c, L["columns"]), "row": one("rows", r, L["rows"])}
+
+    def _plan_layout(self, h, faces, skipped):
+        """plan_scans of a wall-layout task: register the wall (_register_wall), then one entry of kind "cell" per
+        requested box, ordered by the lattice itself (scan_order.order_lattice: the task's rule on the cells, no label
+        extents). No head label detection, no extra looks, no grid resolution: the grid is the layout."""
+        ws = self.ws
+        boxes = [{"id": k, "bbox": b.bbox} for k, b in ws.boxes.items()]
+        if not faces:
+            return fail("no box face fitted from here", {"boxes": boxes, "skipped": skipped})
+        failed, reg_diag = self._register_wall(h, list(faces.values()))
+        if failed is not None:
+            return failed
+        L, wall = self.wall_layout, ws.wall
+        rule = self._order_rule()
+        cells = self._requested_cells()
+        order = order_lattice([{"key": f"c{c}_r{r}", "column": c, "row": L["rows"] + 1 - r} for c, r in cells], rule)
+        by_key = {f"c{c}_r{r}": (c, r) for c, r in cells}
+        T_ref = np.asarray(h["T_odom_root"], float)
+        for o in order:
+            c, r = by_key[o["key"]]
+            k = len(ws.barcodes)
+            while f"bc{k}" in ws.barcodes:
+                k += 1
+            bid = f"bc{k}"
+            face = self._cell_face(c, r)
+            bc = BarcodeEstimate(bid, f"layout_c{c}_r{r}", face["center"].copy(), face["normal"].copy(), None, "layout",
+                                 h["t"], face=face, corners_odom=face["corners"].copy(), status="pending",
+                                 order_index=len(ws.scan_plan), plan_center=face["center"].copy(), face_id=0,
+                                 grid_cell=self._spec_cell(c, r), kind="cell")
+            bc.wall = {"cell": [c, r], "left_to_right": bool(o["left_to_right"]), "corners": None, "bar_dir": None}
+            self._store_layout(bc)
+            ws.barcodes[bid] = bc
+            ws.scan_plan.append(bid)
+        ws.scan_ref_T = T_ref.copy()
+        ws.scan_ref_Ts[0] = ws.scan_ref_T
+        if ws.stack is not None:
+            ws.stack.setdefault("planned", []).append(0)
+            if ws.root_target is not None and 0 in ws.stack["faces"]:
+                ws.stack["faces"][0]["d_obs"] = float(ws.root_target["d_obs"])
+        ws.current_barcode_id = None
+        self._clear_barcode_slots()
+        # target grid of the layout (WorldState.missing_cells / grid_warnings and the Harness work unchanged): slots in
+        # the planning frame, every requested cell present by construction
+        T_fo = inv_T(T_ref)
+        slots = {}
+        for dim, n in (("columns", L["columns"]), ("rows", L["rows"])):
+            out = []
+            for k in range(1, n + 1):
+                rect = self._cell_rect(k, 1) if dim == "columns" else self._cell_rect(1, k)
+                if dim == "columns":
+                    rect = [rect[0], rect[1], 0.0, wall["H"]]
+                else:
+                    rect = [0.0, wall["W"], rect[2], rect[3]]
+                C = apply(T_fo, self._rect_face(*rect)["corners"])
+                a = C[:, 1] if dim == "columns" else C[:, 2]
+                sc = self._spec_cell(k, 1)["column"] if dim == "columns" else self._spec_cell(1, k)["row"]
+                out.append({"index": k if sc is None else sc, "lo": float(a.min()), "hi": float(a.max()),
+                            "center": float(a.mean()), "box": True, "inserted": False})
+            slots[dim] = sorted(out, key=lambda sl: sl["index"])
+        ws.target_grid = {"targets": self.scan_targets, "edges_seen": [], "face_centres": [], "fitted_faces": [],
+                          "faces": {0: {"columns": slots["columns"], "rows": slots["rows"],
+                                        "requested": [self._spec_cell(c, r) for c, r in cells], "missing": [],
+                                        "anchored": {"left": True, "right": True, "bottom": True}, "warnings": [],
+                                        "notes": [f"the cells come from the given wall layout ({L['columns']} x {L['rows']} "
+                                                  f"boxes of {L['box_w']} x {L['box_h']} m) registered to the wall seen "
+                                                  "from here"],
+                                        "evidence": "layout", "bounds": {"bottom": 0.0}}}}
+        targets = self._targets_report(0)
+        reg = wall["registration"]
+        out = [{"id": b, "kind": ws.barcodes[b].kind, "cell": ws.barcodes[b].grid_cell,
+                "center_odom": ws.barcodes[b].center, "status": ws.barcodes[b].status, "face_id": 0} for b in ws.scan_plan
+               if ws.barcodes[b].wall is not None]
+        data = {"n": len(out), "barcodes": out, "boxes": boxes, "skipped": skipped, "face_id": 0, "face": self.TOUR[0],
+                "first_for_face": True, "order_rule": scan_order_text(rule), "targets": targets,
+                "registration": {"W_meas": reg["W_meas"], "r": reg["r"],
+                                 "edges": [{"side": "left", "s": reg["s_L"], "n_rows": reg["n_rows_L"]},
+                                           {"side": "right", "s": reg["s_R"], "n_rows": reg["n_rows_R"]}],
+                                 "z_floor_depth": reg["z_floor_depth"]}}
+        diag = {"registration": dict(reg, delta_lat=wall["delta_lat"], T_odom_wall=wall["T_odom_wall"]), **reg_diag}
+        return with_diagnostics(ok(data, f"{len(out)} box(es) planned from the wall layout for {targets['description']}; "
+                                         "call next_barcode"), diag)
+
+    # ---- hand-camera look pose
+    def _hand_view(self):
+        """HandView (perception/look_view.py) of the variant's hand camera: its K and size from the robot info, its pose
+        on the scanner tip and the occluder boxes (robot info hand_cameras[name]["occluders"], link frames) through the
+        URDF. Built once: the camera is rigid on the bracket."""
+        if getattr(self, "_hand_view_model", None) is None:
+            import pinocchio as pin
+            from ..perception.look_view import HandView
+            hc = self.cfg["robot"]["hand_camera"]
+            if hc["source"] != "hand_camera":
+                raise ValueError("the wall-layout look pose needs a separate hand camera (robot variant hand_camera "
+                                 "source 'hand_camera')")
+            cam = (self.info.get("hand_cameras") or {}).get(hc["name"])
+            if cam is None or "occluders" not in cam:
+                raise ValueError(f"robot info hand_cameras[{hc['name']!r}] has no 'occluders': the wall-layout look pose "
+                                 "needs the robot's parts in front of the hand camera")
+            q = pin.neutral(self.kin.model)
+            T_cam = self.kin.pose(q, hc["frame"])
+            T_tip = self.kin.pose(q, self.cfg["robot"]["wrist_point_frame"])
+            occ = [dict(o, T_cam_box=inv_T(T_cam) @ self.kin.pose(q, o["link"])) for o in cam["occluders"]]
+            self._hand_view_model = HandView(cam["K"], cam["size"], inv_T(T_tip) @ T_cam, self.ik.img_x_in_tip, occ,
+                                             self.cfg["perception"]["fov_margin_frac"])
+        return self._hand_view_model
+
+    def _search_view(self, face_w, face_h, delta, e) -> dict:
+        """look_view.search_view for this episode (cached per face size, delta and e): stand-off from the scanner's
+        standoff.min_m upward in steps of e (the placement tolerance), up to the farthest viewing distance of the task
+        (d_obs_range upper end; beyond it is a geometry error)."""
+        if self._look_cache is None:
+            self._look_cache = {}
+        key = (float(face_w), float(face_h), float(delta), float(e))
+        if key not in self._look_cache:
+            from ..perception.look_view import search_view
+            self._look_cache[key] = search_view(self._hand_view(), face_w, face_h, delta, e, e,
+                                                float(self._c2()["standoff"]["min_m"]), float(self._c1()["d_obs_range"][1]))
+        return self._look_cache[key]
+
+    def _look_target(self, bc) -> dict:
+        """Wrist target of the hand-camera view of the whole box face of a cell entry (current registration): the
+        minimum tip stand-off s with the face grown by delta_lat laterally and e all round in the free view (e: the
+        placement slack; search_cell verifies the face grown by delta_lat only from the pose reached), one
+        alternative per quarter roll that reaches it (their tie is decided by plan_stance: reachability, manipulability).
+        long_axis = L_k (look_view.roll_axis), signed: the side of the scan axis the camera sits on matters."""
+        from ..perception.look_view import roll_axis
+        L = self.wall_layout
+        dl, e = self._search_grow()
+        sv = self._search_view(L["box_w"], L["box_h"], dl, e)
+        f = self._cell_face(*bc.wall["cell"])
+        ctr, n, right, up = (np.asarray(f[k], float) for k in ("center", "normal", "right", "up"))
+        alts = [{"pos": ctr + cd["h"] * right + cd["v"] * up + sv["s"] * n, "long_axis": roll_axis(cd["roll_deg"], right, up),
+                 "roll_signed": True, "roll_deg": cd["roll_deg"], "h": cd["h"], "v": cd["v"]} for cd in sv["candidates"]]
+        return {"purpose": "look", "barcode_id": bc.id, "offset": float(sv["s"]), "forward": -n, "bar_dir": None,
+                "alternatives": alts, "pos": alts[0]["pos"], "long_axis": alts[0]["long_axis"], "roll_signed": True,
+                "face_size": [L["box_w"], L["box_h"]], "delta_lat": dl, "grow_e": e, "cell": list(bc.wall["cell"])}
+
+    @staticmethod
+    def _roll_kw(t) -> dict:
+        """IK keyword for a target whose roll axis is directed (a look pose); none for every other target, so their
+        IK calls are the calls they were."""
+        return {"roll_signed": True} if t.get("roll_signed") else {}
+
+    # ---- stance re-registration and the search
+    def _reregister_at_stance(self) -> dict:
+        """Re-register the wall frame from the head at a stance (arm home): fit_front_face on the bbox of the projected
+        wall rectangle; the frame is rotated about the vertical axis through the CURRENT ROOT by the yaw between the
+        stored and the refitted normal and shifted along the new normal onto the refit (the plane gives two of the three
+        planar degrees of freedom; the lateral one stays as odometry predicts it, and the sim's heading drift acts on the
+        root). A side edge in view (_wall_extent) re-anchors the lateral position (both edges: their middle). Every
+        record is appended to ws.wall["history"]; a failed refit changes nothing."""
+        wall = self.ws.wall
+        h = self._capture_head()
+        rec = {"t": h["t"], "refit": False}
+        C = self._rect_face(0.0, wall["W"], 0.0, wall["H"])["corners"]
+        uv, z = self._project_odom(h, C)
+        if np.any(z <= 0):
+            rec["note"] = "a wall corner lies behind the head camera: no refit"
+            wall["history"].append(rec)
+            return rec
+        Hh, Ww = h["depth"].shape
+        x0, y0 = np.clip(uv.min(axis=0), 0, [Ww, Hh])
+        x1, y1 = np.clip(uv.max(axis=0), 0, [Ww, Hh])
+        r = fit_front_face(h["depth"], h["K"], h["T_root_cam"], [x0, y0, x1, y1], sigma_coeff=h["depth_sigma_coeff"],
+                           min_structure_px=self._min_structure_px())
+        if r["status"] != "ok":
+            rec["note"] = f"refit failed: {r['reason']}"
+            wall["history"].append(rec)
+            return rec
+        To = np.asarray(h["T_odom_root"], float)
+        c_new = apply(To, r["center"])
+        n_new = rotate(To, r["normal"])
+        n_new = np.array([n_new[0], n_new[1], 0.0]) / np.linalg.norm(n_new[:2])
+        ax = self._wall_axes()
+        n_old = ax["normal"]
+        dpsi = math.atan2(n_old[0] * n_new[1] - n_old[1] * n_new[0], float(n_old[:2] @ n_new[:2]))
+        cz, sz = math.cos(dpsi), math.sin(dpsi)
+        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+        root = To[:3, 3]
+        origin = ax["origin"].copy()
+        origin[:2] = root[:2] + Rz[:2, :2] @ (origin[:2] - root[:2])
+        right, normal = Rz @ ax["right"], Rz @ n_old
+        dd = float((c_new - origin) @ normal)
+        origin = origin + dd * normal
+        ext = self._wall_extent(h, {"normal": normal, "right": right, "point": origin})
+        el, er = ext["left"], ext["right"]
+        ds = None
+        if el is not None and er is not None:
+            ds = 0.5 * (el["s"] + er["s"]) - wall["W"] / 2
+        elif el is not None:
+            ds = el["s"]
+        elif er is not None:
+            ds = er["s"] - wall["W"]
+        net = float((root[:2] - np.asarray(wall["anchor_root_xy"], float)) @ right[:2])
+        if ds is not None:
+            origin = origin + ds * right
+            wall["anchor_root_xy"] = root[:2].copy()
+        wall["T_odom_wall"] = self._wall_frame(origin, right, normal)
+        rec.update(refit=True, dpsi_deg=math.degrees(dpsi), dd_m=dd, ds_m=ds,
+                   anchored=[sd for sd, e_ in (("left", el), ("right", er)) if e_ is not None],
+                   net_lateral_since_anchor_m=net)
+        wall["history"].append(rec)
+        self._sync_layout_all()
+        return rec
+
+    def _view_coverage(self, w, corners_odom) -> dict:
+        """The face (4 corners, odom) in the hand camera's free view from the pose of frame w (FK of the joints
+        reached): look_view.HandView.covered; plus the fraction of a sample grid of the face inside the free view (log)."""
+        hv = self._hand_view()
+        C = np.asarray(corners_odom, float)
+        uv, z = self._project_odom(w, C)
+        cov = bool(hv.covered(uv[None], z[None])[0])
+        a = np.linspace(0.0, 1.0, 21)
+        A, B = np.meshgrid(a, a)
+        G = C[0] + A.ravel()[:, None] * (C[1] - C[0]) + B.ravel()[:, None] * (C[3] - C[0])
+        guv, gz = self._project_odom(w, G)
+        u, v = np.round(guv[:, 0]).astype(int), np.round(guv[:, 1]).astype(int)
+        inside = (gz > 0) & (u >= 0) & (u < hv.W) & (v >= 0) & (v < hv.H)
+        frac = float(np.mean(inside & hv.free[np.clip(v, 0, hv.H - 1), np.clip(u, 0, hv.W - 1)]))
+        return {"covered": cov, "free_frac": frac}
+
+    def _cell_detections(self, w, rect_w) -> list:
+        """Labels on a wall rectangle (wall-frame [x0, x1, z0, z1]) in hand-camera frame w: the rectified detector
+        (_labels_on_rectified_face) on that crop; each with its label rectangle and centre in the wall frame and "cut":
+        its centre is the centre of the visible part only, because its rectified label box lies within one rectified
+        pixel of the crop border (pixel quantisation of the crop; "cut_crop") or its label box, grown by one hand-camera
+        pixel, leaves the hand camera's free view (image border, in-view margin, the scanner body: HandView.whole;
+        "hidden")."""
+        Ti = inv_T(self._wall_T())
+        x0, x1, z0, z1 = rect_w
+        hv = self._hand_view()
+        out = []
+        for rec, est in self._labels_on_rectified_face(w, self._rect_face(*rect_w)):
+            px = float(rec["rectified"]["px_per_m"])
+            Cw = apply(Ti, est["corners"])
+            tol = 1.0 / px
+            cut_crop = bool(Cw[:, 0].min() <= x0 + tol or Cw[:, 0].max() >= x1 - tol
+                            or Cw[:, 2].min() <= z0 + tol or Cw[:, 2].max() >= z1 - tol)
+            uv, zc = self._project_odom(w, est["corners"])
+            hidden = not hv.whole(uv, zc)
+            out.append({"rec": rec, "est": est, "center_w": apply(Ti, est["center"]), "px_per_m": px,
+                        "rect_w": [float(Cw[:, 0].min()), float(Cw[:, 0].max()), float(Cw[:, 2].min()), float(Cw[:, 2].max())],
+                        "cut": cut_crop or hidden, "cut_crop": cut_crop, "hidden": hidden})
+        return out
+
+    def _look_view(self, t, see_w, crop_w) -> dict:
+        """Move the scanner tip to look target t (IK + closed-loop correction, _reach), capture the hand camera, test the
+        rectangle see_w (wall frame: the region the view has to show) for coverage from the pose reached and, when
+        covered, detect labels on the crop crop_w (see_w grown by the placement tolerance e the look pose was planned
+        with: a label of the box reaching the face edge stays clear of the crop border; what of it lies outside the
+        free view is caught by the cut test)."""
+        rr = self._reach(t, float(t["offset"]), self.side)
+        if rr["ik_fail"]:
+            return {"ik_fail": True, "reason": rr["reason"]}
+        w = self._capture_wrist()
+        cov = self._view_coverage(w, self._rect_face(*see_w)["corners"])
+        dets = self._cell_detections(w, crop_w) if cov["covered"] else []
+        return {"ik_fail": False, "covered": cov["covered"], "coverage": cov, "dets": dets, "frame": w,
+                "residual": rr["history"][-1] if rr["history"] else None, "see_w": list(see_w), "rect_w": list(crop_w)}
+
+    def _search_round(self, bc, st) -> dict:
+        """One search of the cell from the current registration: the look pose of the stance's alternative (its roll and
+        in-plane offset, on the re-registered cell), coverage of the cell grown by delta_lat (the face that has to be
+        seen: the look pose was planned for it grown by e more on every side, so an arm placement error up to e =
+        correction_tol, what _reach accepts, keeps it covered) and detection on the cell grown by delta_lat + e, one
+        extra view (same roll and stand-off) centred on the visible part of each cut detection that overlaps the cell,
+        then the assignment: uncut detections whose centre lies in the (ungrown) cell rectangle, duplicates across views
+        merged (_same_face_label). outcome: found | none (covered, nothing assigned, nothing unresolved) | uncovered | cut
+        (a cut detection not seen whole in its own centred view) | ik."""
+        t = self._look_target(bc)
+        alt = t["alternatives"][int(st.get("look_alt") or 0)]
+        ta = dict(t, pos=alt["pos"], long_axis=alt["long_axis"])
+        self.ws.wrist_target = ta
+        dl, e = self._search_grow()
+        c, r = bc.wall["cell"]
+        cell = self._cell_rect(c, r)
+        see = self._cell_rect(c, r, dl, 0.0)
+        grown = self._cell_rect(c, r, dl + e, e)
+        v = self._look_view(ta, see, grown)
+        views = [v]
+        if v["ik_fail"]:
+            return {"outcome": "ik", "reason": v["reason"], "views": views}
+        if not v["covered"]:
+            return {"outcome": "uncovered", "views": views}
+        ax = self._wall_axes()
+        cx, cz = 0.5 * (cell[0] + cell[1]), 0.5 * (cell[2] + cell[3])
+        overlaps = lambda a: a[0] < cell[1] and cell[0] < a[1] and a[2] < cell[3] and cell[2] < a[3]
+        unresolved = []
+        for d in [d for d in v["dets"] if d["cut"] and overlaps(d["rect_w"])]:
+            dx, dz = float(d["center_w"][0] - cx), float(d["center_w"][2] - cz)
+            t2 = dict(ta, pos=np.asarray(ta["pos"], float) + dx * ax["right"] + dz * ax["up"])
+            shift = lambda a: [a[0] + dx, a[1] + dx, a[2] + dz, a[3] + dz]
+            v2 = self._look_view(t2, shift(see), shift(grown))
+            v2["extra_for"] = d["center_w"]
+            views.append(v2)
+            whole = [] if v2["ik_fail"] or not v2["covered"] else \
+                [d2 for d2 in v2["dets"] if not d2["cut"] and _same_face_label(d2["est"]["corners"], d["est"]["corners"],
+                                                                                ax["normal"], _label_width(d2["est"]))]
+            if not whole:
+                unresolved.append(d)
+        assigned = []
+        for vv in views:
+            for d in ([] if vv["ik_fail"] or not vv["covered"] else vv["dets"]):
+                x, z = float(d["center_w"][0]), float(d["center_w"][2])
+                if d["cut"] or not (cell[0] <= x <= cell[1] and cell[2] <= z <= cell[3]):
+                    continue
+                if any(_same_face_label(d["est"]["corners"], a["est"]["corners"], ax["normal"],
+                                        max(_label_width(d["est"]), _label_width(a["est"]))) for a in assigned):
+                    continue
+                d["frame"] = vv["frame"]
+                assigned.append(d)
+        outcome = "found" if assigned else "cut" if unresolved else "none"
+        return {"outcome": outcome, "views": views, "assigned": assigned, "unresolved": unresolved}
+
+    def _set_label(self, b, d):
+        """A layout entry becomes the label of detection d (search_cell): kind label, centre / corners = the label box,
+        width = the stand-off width (cv2 symbol quad, else the label box): an upper bound of the symbol ("hand_label",
+        the _standoff clamp keeps the scanner at least at offset_m), bar direction on the plane."""
+        est, rec, w = d["est"], d["rec"], d["frame"]
+        face = self._cell_face(*b.wall["cell"])
+        b.kind, b.source, b.t = "label", "hand", w["t"]
+        b.center = np.asarray(est["center"], float).copy()
+        b.plan_center = b.center.copy()
+        b.corners_odom = np.asarray(est["corners"], float).copy()
+        b.normal = np.asarray(face["normal"], float).copy()
+        b.bar_dir = None if est["bar_dir"] is None else np.asarray(est["bar_dir"], float).copy()
+        b.label_width_m = quad_width(est["corners"])
+        b.width_m, b.width_source, b.width_support = float(est["width"]), "hand_label", 0
+        b.face = face
+        b.pixel = np.asarray(rec["center"], float).tolist()
+        b.corners_px = np.asarray(rec["corners"], float).tolist()
+        b.detection = _detection_info(rec)
+        self._store_layout(b)
+
+    def _record_failed_stance(self, bc, st):
+        self._failed_stances.add((bc.id, tuple(st["target_pos"]), st["face_dist"], st["lateral_offset"], st["level_index"]))
+
+    def search_cell(self, barcode_id: str | None = None):
+        """Wall-layout task: find the label of the current box (an entry of kind "cell") with the hand camera, at the
+        stance plan_stance planned for its look pose (reached), arm home.
+        1. Re-register the wall from the head (_reregister_at_stance).
+        2. Look pose of the stance's roll alternative on the re-registered cell; IK + closed loop (_reach).
+        3. Coverage from the pose reached (FK): the cell grown by delta_lat in the hand camera's free view (the look pose
+           was planned for it grown by e = correction_tol more: the placement slack of the arm loop).
+        4-6. Detection on the cell grown by delta_lat + e, cut detections, assignment (_search_round).
+        Nothing found with the face covered: the arm goes home, the wall is re-registered once more and the cell
+        searched again (user decision 2026-11-19); still nothing -> "no_label" (a result: the whole face was seen and
+        holds no label centre). A label found: the entry becomes that label (kind label, width_source hand_label), further
+        labels of the box become new entries right after it, and its wrist target is computed. Not covered / a cut label
+        not resolved: partial (never no_label), the stance recorded as failed so that a re-plan picks another one."""
+        if self.wall_layout is None or self.ws.wall is None:
+            return fail("search_cell is for a task with a wall layout, after plan_scans registered the wall")
+        if (nc := self._not_current(barcode_id)) is not None:
+            return fail(nc)
+        bc = self._current(barcode_id)
+        if bc is None:
+            return fail("no current box: call next_barcode")
+        if bc.kind != "cell":
+            return fail(f"{bc.id} is a label entry (its label is found): compute_wrist_target -> plan_stance -> "
+                        "approach -> move_arm('pre') -> refine_with_wrist ..., no search_cell")
+        if bc.status != "pending":
+            return fail(f"{bc.id} is already recorded {bc.status}: call next_barcode")
+        st = self.ws.stance_target
+        if st is None or st.get("barcode_id") != bc.id or st.get("purpose") != "look":
+            return fail(f"no hand-camera view stance planned for {bc.id}: call compute_wrist_target, plan_stance, then "
+                        "approach('stance_target')")
+        if getattr(self, "_stance_reached", None) is not st:
+            return fail("the robot is not at the planned stance: call approach('stance_target') first")
+        if not self.arm_at_home:
+            return fail("the arm must be at home (the wall is re-registered from the head): call move_arm('home')")
+        self._stance_attempted.add(bc.id)
+        rounds = []
+        for k in range(2):
+            if k == 1:                                    # the second search re-registers with the arm out of the view
+                hm = self.move_arm("home")
+                if hm["status"] != "ok":
+                    return fail(f"arm home before the second search: {hm['reason']}")
+            rr = self._reregister_at_stance()
+            res = self._search_round(bc, st)
+            res["reregistration"] = rr
+            rounds.append(res)
+            if res["outcome"] != "none":
+                break
+        last = rounds[-1]
+        n_views = sum(len(rd["views"]) for rd in rounds)
+        rereg = [rd["reregistration"] for rd in rounds]
+
+        def view_log(v):
+            if v["ik_fail"]:
+                return {"ik_fail": v["reason"]}
+            return {"covered": v["covered"], "coverage": v["coverage"], "residual": v["residual"], "see_w": v["see_w"],
+                    "rect_w": v["rect_w"],
+                    "detections": [{"center_w": d["center_w"], "rect_w": d["rect_w"], "cut": d["cut"],
+                                    "cut_crop": d["cut_crop"], "hidden": d["hidden"],
+                                    "score": d["rec"].get("score"), "kind": d["rec"].get("kind"), "px_per_m": d["px_per_m"]}
+                                   for d in v["dets"]]}
+        diag = {"rounds": [{"outcome": rd["outcome"], "reregistration": rd["reregistration"],
+                            "views": [view_log(v) for v in rd["views"]]} for rd in rounds]}
+        base = {"barcode_id": bc.id, "views": n_views, "reregistration": rereg}
+        if last["outcome"] == "ik":
+            self._record_failed_stance(bc, st)
+            return with_diagnostics(fail("hand-camera view not reachable from this stance: move_arm('home'), "
+                                         "compute_wrist_target, plan_stance, approach", dict(base, ik=last["reason"])), diag)
+        if last["outcome"] == "found":
+            added = self._convert_cell(bc, last["assigned"])
+            tr = self.compute_wrist_target(bc.id)
+            if tr["status"] != "ok":
+                return with_diagnostics(fail(f"label found, wrist target: {tr['reason']}", base), diag)
+            return with_diagnostics(ok(dict(base, converted=True, added=added,
+                                            label={"center_odom": bc.center, "label_width_m": bc.label_width_m,
+                                                   "cell": bc.grid_cell},
+                                            wrist_target_odom=tr["data"]["wrist_target_odom"], offset=tr["data"]["offset"]),
+                                       "label found in the box face; call move_arm('final')"
+                                       + (f" ({len(added)} more label(s) in this box added as the next entries)" if added else "")),
+                                    diag)
+        if last["outcome"] == "none":
+            dl, _ = self._search_grow()
+            bc.status = "no_label"
+            bc.fail_reason = (f"the whole box face (grown by {dl:.3f} m laterally) was in the hand-camera view and no "
+                              f"label centre lies in it ({len(rounds)} searches)")
+            return with_diagnostics(ok(dict(base, barcode_status="no_label"),
+                                       "no label in this box: move_arm('home'), next_barcode"), diag)
+        self._record_failed_stance(bc, st)
+        why = ("the box face was not fully in the hand-camera view from the pose reached" if last["outcome"] == "uncovered"
+               else "a label at the border of the box face was not seen whole, also not from a view centred on it")
+        return with_diagnostics(partial(f"{why}: move_arm('home'), compute_wrist_target -> plan_stance -> approach -> "
+                                        "search_cell again (once), then next_barcode", dict(base, outcome=last["outcome"])),
+                                diag)
+
+    def _convert_cell(self, bc, assigned) -> list:
+        """The cell entry becomes the first of its labels in the within-cell order of the task's rule
+        (scan_order.order_in_cell, in the row direction of the cell for "serpentine"); the others become new label
+        entries right after it (same cell). Returns the added ids."""
+        ws = self.ws
+        items = [{"key": i, "y_lo": -d["rect_w"][1], "y_hi": -d["rect_w"][0], "z_lo": d["rect_w"][2],
+                  "z_hi": d["rect_w"][3], "z": float(d["center_w"][2])} for i, d in enumerate(assigned)]
+        order = order_in_cell(items, self._order_rule(), bc.wall["left_to_right"])
+        self._set_label(bc, assigned[order[0]])
+        added = []
+        at = ws.scan_plan.index(bc.id)
+        for j, i in enumerate(order[1:]):
+            k = len(ws.barcodes)
+            while f"bc{k}" in ws.barcodes:
+                k += 1
+            nb = BarcodeEstimate(f"bc{k}", bc.box_id, None, None, None, "hand", 0.0, status="pending", face_id=0,
+                                 grid_cell=dict(bc.grid_cell), kind="label")
+            nb.wall = {"cell": list(bc.wall["cell"]), "left_to_right": bc.wall["left_to_right"]}
+            self._set_label(nb, assigned[i])
+            ws.barcodes[nb.id] = nb
+            ws.scan_plan.insert(at + 1 + j, nb.id)
+            added.append(nb.id)
+        for i, b in enumerate(ws.scan_plan):
+            ws.barcodes[b].order_index = i
+        return added
+
+    def _detect_wrist_cell(self, bc):
+        """refine_with_wrist detector of a layout entry: the search_cell detector on the cell crop grown by delta_lat + e
+        (rectified; cut detections, i.e. cut by the crop border or not whole in the hand camera's free view (the image
+        border, the in-view margin, the scanner body: _cell_detections), and centres outside the cell dropped); the one
+        nearest to the current estimate. Returns (frame, rec, est, n_hidden) or (frame, None, None, n_hidden); n_hidden:
+        the labels centred in the cell dropped only because part of them lies outside the free view."""
+        w = self._capture_wrist()
+        dl, e = self._search_grow()
+        c, r = bc.wall["cell"]
+        cell = self._cell_rect(c, r)
+        keep, n_hidden = [], 0
+        for d in self._cell_detections(w, self._cell_rect(c, r, dl + e, e)):
+            x, z = float(d["center_w"][0]), float(d["center_w"][2])
+            if not (cell[0] <= x <= cell[1] and cell[2] <= z <= cell[3]):
+                continue
+            if d["cut"]:
+                n_hidden += int(d["hidden"] and not d["cut_crop"])
+                continue
+            keep.append(d)
+        if not keep:
+            return w, None, None, n_hidden
+        d = min(keep, key=lambda d_: float(np.linalg.norm(np.asarray(d_["est"]["center"]) - np.asarray(bc.center))))
+        return w, d["rec"], d["est"], n_hidden
+
+    def _layout_refusal(self, bc, scanning: bool = False):
+        """Tools of the label path refused for a box whose label is not found yet (the scanner would read a neighbour
+        into the cell), and scan for a box recorded no_label."""
+        if bc is None or self.wall_layout is None:
+            return None
+        if scanning and bc.status == "no_label":
+            return fail(f"{bc.id} holds no label (search_cell recorded no_label): move_arm('home'), then next_barcode")
+        if bc.kind == "cell":
+            return fail(f"the label of {bc.id} is not found yet: call search_cell")
+        return None
 
     # ------------------------------------------------------------------ task 3: target grid (robot-terms target spec)
     def _order_rule(self) -> str:
@@ -1612,7 +2396,10 @@ class Toolbox:
             cpx, _ = self._project_odom(h, corners)
             ctr, _ = self._project_odom(h, center[None])
             spx = None if sym is None else self._project_odom(h, sym)[0]
+            # rec is a detection in the SOURCE image: its bar direction too (the detector's is in rectified pixels; a
+            # caller that maps rec["bar_dir"] through the source camera, refine_with_wrist, would turn it otherwise)
             rec = dict(l, corners=cpx, center=ctr[0], label_corners=cpx, label_center=ctr[0], symbol_corners=spx,
+                       bar_dir=None if bar is None else _image_direction(h, center, bar),
                        rectified={"px_per_m": s, "size": [Wr, Hr]})
             out.append((rec, {"center": center, "bar_dir": bar, "corners": corners,
                               "width": quad_width(corners if sym is None else sym)}))
@@ -1641,7 +2428,8 @@ class Toolbox:
             closed = {"id": prev, "status": "failed"}
         self._clear_barcode_slots()
         cur = 0 if ws.stack is None else ws.stack["current"]
-        update = self._plan_update_from_here() if self.task == 3 and prev is not None else None
+        # wall layout: the cells are fixed by the layout, no plan update from here
+        update = self._plan_update_from_here() if self.task == 3 and prev is not None and self.wall_layout is None else None
         diag = None if update is None else {"plan_update": update.pop("diagnostics")}     # logged, not shown (D11)
         nxt = next((b for b in ws.scan_plan if ws.barcodes[b].status == "pending" and ws.barcodes[b].face_id == cur), None)
         ws.current_barcode_id = nxt
@@ -1656,9 +2444,11 @@ class Toolbox:
             return with_diagnostics(ok(dict(base, done=True), "every planned barcode has been handled"), diag)
         bc = ws.barcodes[nxt]
         remaining = sum(ws.barcodes[b].status == "pending" for b in ws.scan_plan) - 1
-        return with_diagnostics(ok(dict(base, done=False, barcode_id=nxt, index=bc.order_index, box_id=bc.box_id,
-                                        remaining=remaining, width_m=bc.width_m, standoff_m=self._standoff(bc)),
-                                   f"current barcode: {nxt}"), diag)
+        data = dict(base, done=False, barcode_id=nxt, index=bc.order_index, box_id=bc.box_id, remaining=remaining,
+                    width_m=bc.width_m, standoff_m=self._standoff_or_none(bc))
+        if self.wall_layout is not None:
+            data["kind"] = bc.kind
+        return with_diagnostics(ok(data, f"current barcode: {nxt}"), diag)
 
     def _plan_update_from_here(self) -> dict:
         """Look again from where the robot is now (closer to the side than the observation pose) before choosing the
@@ -1883,6 +2673,10 @@ class Toolbox:
             d = max(d, float(c2["offset_m"]))
         return d
 
+    def _standoff_or_none(self, bc):
+        """The stand-off of a label entry; None for a wall-layout cell entry (no label width before search_cell)."""
+        return None if bc.kind == "cell" else self._standoff(bc)
+
     def _pre_gap(self):
         """Pre-pose gap behind the stand-off: the one plan_stance found reachable for the current barcode (stance
         "pre_gap"), else the configured pre - final gap (task2.yaml 0.30 - 0.20)."""
@@ -1904,6 +2698,19 @@ class Toolbox:
         if bc is None or bc.center is None:
             return fail("no barcode pose (call estimate_barcode_pose / plan_scans + next_barcode)")
         ignored = None
+        if bc.kind == "cell":
+            # wall layout, a box whose label is not found yet: the hand-camera view of the whole box face (search_cell);
+            # a caller's offset is ignored as for labels
+            t = self._look_target(bc)
+            self.ws.wrist_target = t
+            self.ws.wrist_target_refined = None
+            self._marker("wrist_target", "blue", "pose", t["pos"], dir=t["forward"])
+            return with_diagnostics(
+                ok({"barcode_id": bc.id, "kind": "cell", "offset_ignored": None if offset is None else float(offset),
+                    "look": {"offset": t["offset"], "rolls": [a["roll_deg"] for a in t["alternatives"]],
+                             "face_size": t["face_size"], "delta_lat": t["delta_lat"]}},
+                   "hand-camera view of the whole box face planned; call plan_stance"),
+                {"alternatives": [{k: a[k] for k in ("pos", "roll_deg", "h", "v")} for a in t["alternatives"]]})
         if offset is not None and self._c2()["standoff"]["mode"] == "adaptive":
             # task 3: the stand-off is computed from the label width; an offset from the caller is ignored, not refused
             # (2026-11-07: the LLM invented offsets and scanned from 0.14 m; refusing them instead made it skip to
@@ -2034,7 +2841,14 @@ class Toolbox:
         c2 = self._c2()
         S3 = c2["standoff"]
         gap0 = float(c2["pre_offset_m"] - c2["offset_m"])
-        if S3["mode"] == "adaptive" and bc.width_source == "head":
+        look = t.get("purpose") == "look"
+        if look:
+            # wall layout, the hand-camera view of a box face (search_cell): the look pose only, approached from home
+            # (no pre-pose); its quarter-roll alternatives tie geometrically, reachability decides (the largest
+            # manipulability, the planner's posture criterion)
+            finals, pre_dists = [float(t["offset"])], []
+        elif S3["mode"] == "adaptive" and bc.width_source != "wrist":
+            # head / hand_label width: an upper bound of the symbol
             finals = [float(S3["min_m"])]
             pre_dists = list(np.arange(t["offset"] + gap0, float(S3["min_m"]) - 1e-9, -S["step"]))
         else:
@@ -2052,7 +2866,9 @@ class Toolbox:
         # stances that already failed placement for this barcode and this exact wrist target (check_wrist_placement):
         # the planner is deterministic (per-candidate IK seeds), so identical inputs would give the identical stance and
         # the identical failure (2026-11-19 scanroom: the same stance 4 times, ~600 s). A changed target is a new problem.
-        tpos = _stance_target_key(t["pos"])
+        # a look target is recomputed on every re-registration of the wall: its identity is the box (the barcode id)
+        tpos = ("look",) if look else _stance_target_key(t["pos"])
+        alts = [dict(t, pos=a["pos"], long_axis=a["long_axis"]) for a in t["alternatives"]] if look else [t]
         failed = {(d_, l_, li_) for (b_, tp_, d_, l_, li_) in self._failed_stances if b_ == bc.id and tp_ == tpos}
         restarts = self.ik.cfg["restarts"]
         self.ik.cfg["restarts"] = 1
@@ -2082,15 +2898,22 @@ class Toolbox:
                             if any(horizontal_distance_to_face(np.r_[pw, 0.0], f) < S["min_face_dist_m"] - 1e-9 for f in obstacles):
                                 continue
                         Tc = T_from_xy_yaw(p[0], p[1], yaw, T0[2, 3]) if lv is None else body.T_root(p[0], p[1], yaw, lv)
-                        jobs.append({"Tc": Tc, "q_lv": q_lv, "t": t, "finals": finals, "pre_dists": pre_dists, "stall": stall,
-                                     "seed": [int(self.ik.cfg["seed"]), li, len(jobs)]})
-                        meta.append((p, pw, d, l, Tc))
+                        ji = []
+                        for ta in alts:                       # one job per grid point (per look alternative)
+                            ji.append(len(jobs))
+                            jobs.append({"Tc": Tc, "q_lv": q_lv, "t": ta, "finals": finals, "pre_dists": pre_dists,
+                                         "stall": stall, "seed": [int(self.ik.cfg["seed"]), li, len(jobs)]})
+                        meta.append((p, pw, d, l, Tc, ji))
                 # reach prefilter + IK of the required poses + posture, per grid point (tools/stance_eval.py), in the
                 # planning process pool when configured (identical results: per-candidate IK seeds)
-                for (p, pw, d, l, Tc), ev in zip(meta, self._eval_stance_jobs(jobs, body)):
-                    if ev["status"] != "ok":
-                        rejected[ev["status"]] += 1
+                evs = self._eval_stance_jobs(jobs, body)
+                for (p, pw, d, l, Tc, ji) in meta:
+                    oks = [j for j in ji if evs[j]["status"] == "ok"]
+                    if not oks:
+                        rejected["reach" if all(evs[j]["status"] == "reach" for j in ji) else "ik"] += 1
                         continue
+                    j = max(oks, key=lambda j_: evs[j_]["man"])  # the alternative with the best posture (one: itself)
+                    ev, ai, ta = evs[j], ji.index(j), alts[ji.index(j)]
                     sols, gap, m, man = ev["sols"], ev["gap"], ev["margin"], ev["man"]
                     travel = float(np.hypot(pw[0] - T0[0, 3], pw[1] - T0[1, 3]))
                     # arm posture: the position manipulability sqrt(det(Jp Jp^T)) of the scanner-tip Jacobian over the
@@ -2099,7 +2922,7 @@ class Toolbox:
                     # off) and the folded arm (then chosen by "least extension": elbow up beside the head, joints at
                     # their limits, unnatural and the arm correction diverged) -> the most manipulable pose wins
                     cost = (-gap, -man, travel)              # the preferred pre gap first, then posture, walk
-                    cands.append((cost, p, pw, d, l, m, travel, None, gap, Tc, q_lv, sols, man))
+                    cands.append((cost, p, pw, d, l, m, travel, None, gap, Tc, q_lv, sols, man, ta, ai))
                 # The cost does not depend on the clearances or on robustness, so the candidates are taken in cost order
                 # and the (expensive) checks run only until the first one passes: the same stance as checking every
                 # candidate and picking the cheapest passing one (2026-11-07: the arm-vs-legs check of every
@@ -2108,7 +2931,7 @@ class Toolbox:
                 # stance_robust_*), so the stance is re-checked displaced by it (2026-11-06: a stance at the joint-limit
                 # bound became unreachable by 3 mm after the real walk + squat).
                 for cand in sorted(cands, key=lambda c_: c_[0]):
-                    cost, p, pw, d, l, m, travel, _, gap, Tc, q_lv, sols, man = cand
+                    cost, p, pw, d, l, m, travel, _, gap, Tc, q_lv, sols, man, ta, ai = cand
                     clear = None
                     if body is not None:
                         fc = min(body.face_clearance(s_["q_full"], Tc, obstacles, poly) for s_ in sols)
@@ -2120,13 +2943,13 @@ class Toolbox:
                             rejected["self_clearance"] += 1
                             continue
                         sh = (Tc @ self.kin.pose(q_lv, body.shoulder_frame))[:3, 3]
-                        tip = np.asarray(t["pos"], float) + (finals[0] - t["offset"]) * (-np.asarray(t["forward"], float))
+                        tip = np.asarray(ta["pos"], float) + (finals[0] - ta["offset"]) * (-np.asarray(ta["forward"], float))
                         clear = {"face_m": fc, "arm_leg_m": sc, "arm_extension": round(float(np.linalg.norm(tip - sh) / body.arm_reach), 2),
                                  "manipulability": round(man, 4)}
-                    cand = (cost, p, pw, d, l, m, travel, clear, gap, Tc, q_lv)
+                    cand = (cost, p, pw, d, l, m, travel, clear, gap, Tc, q_lv, ai)
                     if fallback is None:
                         fallback = (cand, lv)
-                    rb = self._stance_robust(t, Tc, q_lv, finals, t["offset"] + gap)
+                    rb = self._stance_robust(ta, Tc, q_lv, finals, None if look else t["offset"] + gap)
                     rejected["not_robust"] += not rb
                     if rb:
                         best, chosen, chosen_li = cand, lv, li
@@ -2165,13 +2988,16 @@ class Toolbox:
             bc.status, bc.fail_reason = "unreachable", reason
             return fail(reason, {"unreachable": True, "barcode_id": bc.id, "label_z_m": z, "rejected": rejected,
                                  "levels_tried": len(levels), "exact_stop_only": fallback is not None})
-        _, p, pw, d, l, m, travel, clear, gap, _, _ = best
+        _, p, pw, d, l, m, travel, clear, gap, _, _, ai = best
         self.ws.stance_target = {"pos": [float(pw[0]), float(pw[1])], "yaw": yaw, "face_dist": float(d), "lateral_offset": float(l),
                                  "barcode_id": bc.id, "travel_m": travel,
                                  "base_height": None if chosen is None else float(chosen["height_cmd"]),
                                  "pelvis_pos": [float(p[0]), float(p[1])],
                                  "pelvis_z": None if chosen is None else float(chosen["pelvis_z"]), "pre_gap": gap,
                                  "level_index": chosen_li, "target_pos": list(tpos)}
+        if look:                                     # only look stances carry these keys (other logs unchanged)
+            self.ws.stance_target.update(purpose="look", look_alt=int(ai),
+                                         look_roll_deg=float(t["alternatives"][ai]["roll_deg"]))
         self._marker("stance", "red", "root", [pw[0], pw[1], 0.0], yaw=yaw)
         squat = chosen is not None and chosen is not levels[0]
         return ok({"stance_odom": self.ws.stance_target, "joint_limit_margin_rad": m, "clearance": clear,
@@ -2224,22 +3050,26 @@ class Toolbox:
         return float(math.sqrt(max(np.linalg.det(J @ J.T), 0.0)))
 
     def _stance_robust(self, t, Tc, q_lv, finals, pre_dist) -> bool:
-        """Every required pose (finals + the chosen pre-pose distance) is still reachable with the stance displaced by
-        the robot's move tolerance: +-pos along the stance's x and y, +-yaw about the pelvis."""
+        """Every required pose (finals + the chosen pre-pose distance; None = no pre-pose, a look pose) is still
+        reachable with the stance displaced by the robot's move tolerance: +-pos along the stance's x and y, +-yaw about
+        the pelvis."""
         B = self.cfg["robot"]["body"]
         dp, dy = B["stance_robust_pos_m"], math.radians(B["stance_robust_yaw_deg"])
         stall = (int(self.ik.cfg["plan_stall_window"]), float(self.ik.cfg["plan_stall_eps_m"]))
         for ex, ey, eyaw in ((dp, 0, 0), (-dp, 0, 0), (0, dp, 0), (0, -dp, 0), (0, 0, dy), (0, 0, -dy)):
             Tp = Tc @ T_from_xy_yaw(ex, ey, eyaw, 0.0)
-            for off in list(finals) + [pre_dist]:
+            for off in list(finals) + ([] if pre_dist is None else [pre_dist]):
                 pr, dr = self._target_in_root(t, Tp, off)
-                if not self.ik.solve(q_lv, pr, dr, stall, self._roll_in_root(t, Tp))["ok"]:
+                if not self.ik.solve(q_lv, pr, dr, stall, self._roll_in_root(t, Tp), **self._roll_kw(t))["ok"]:
                     return False
         return True
 
     def _known_faces(self):
         """Every fitted face the harness knows: the boxes of the last detection and the face copies of all barcodes
-        (box ids are re-assigned by detect_boxes, the barcode copies survive it)."""
+        (box ids are re-assigned by detect_boxes, the barcode copies survive it). With a registered wall layout: the wall
+        rectangle (the authoritative geometry; the per-box fits are stale odometry copies)."""
+        if self.wall_layout is not None and self.ws.wall is not None:
+            return [self._rect_face(0.0, self.ws.wall["W"], 0.0, self.ws.wall["H"])]
         faces = [b.face for b in self.ws.boxes.values() if b.face is not None]
         st = self.ws.stack
         cur = None if st is None or not st.get("multi_face") else st["current"]
@@ -2250,6 +3080,8 @@ class Toolbox:
 
     def move_arm(self, pose: str = "pre", side: str | None = None):
         """See _move_arm; records the last arm command (pose, barcode, result) for the placement check's guidance."""
+        if pose != "home" and (rf := self._layout_refusal(self._current())) is not None:
+            return rf
         r = self._move_arm(pose, side)
         t = self.ws.wrist_target
         self._last_arm = {"pose": pose, "barcode_id": None if t is None else t.get("barcode_id"), "status": r["status"]}
@@ -2282,20 +3114,50 @@ class Toolbox:
         if t is None:
             return fail("no wrist target")
         off = t["offset"] if pose == "final" else self._pre_offset(t["offset"])
+        rr = self._reach(t, off, side)
+        if rr["ik_fail"]:
+            return fail(rr["reason"], {"iters": rr["iters"]})
+        hist = rr["history"]
+        data = {"pose": pose, "offset": off, "barcode_id": t.get("barcode_id"), "history": hist}
+        if hist[-1]["pos_err_m"] >= A["correction_tol"]:
+            # "partial" only while the scan / refine can still recover: the label centre must lie inside the wrist
+            # camera's view cone from the pose reached (2026-11-07 stack4f_L0_0002: a raised arm stopped 0.21 m / 23 deg
+            # off, "partial: go on" was reported and the scan could not read). Outside it the pose is not reachable
+            # from this stance, which the caller handles as an IK failure (re-plan the stance).
+            view = self._label_view(t, off)
+            data["view"] = view
+            lat, half = view["label_lateral_m"], view["view_half_width_m"]
+            if not view["in_view"]:
+                return fail(f"IK: target not reachable from this stance (residual {hist[-1]['pos_err_m']:.3f} m / "
+                            f"{hist[-1]['angle_err_deg']:.1f} deg after {len(hist)} correction(s): the label centre is "
+                            f"{lat:.3f} m off the scanner axis, outside its view half-width {half:.3f} m)", data)
+            # the closed-loop corrections did not converge (2026-11-06 stack scene: the raised, nearly straight arm
+            # stayed 9 cm off); reported, not hidden behind "ok"
+            return partial(f"arm reached the target with a residual {hist[-1]['pos_err_m']:.3f} m / {hist[-1]['angle_err_deg']:.1f} deg "
+                           f"after {len(hist)} correction(s); this is not a failure: go on (pre: refine_with_wrist; final: "
+                           "check_wrist_placement, then scan, which retries by itself)", data)
+        return ok(data)
+
+    def _reach(self, t, off, side) -> dict:
+        """IK on the current joint state to wrist target t at distance off, set_arm_joints, then closed-loop corrections
+        of the commanded target (arm PD sag) using FK (move_arm and search_cell's look poses). Returns {"ik_fail",
+        "history"} (+ "reason", "iters" when IK found no solution for the first command)."""
+        A = self.cfg["robot"]["arm_motion"]
         p_goal, d_goal = self._target_in_root(t, offset=off)
         p_cmd = p_goal.copy()
         hist = []
         best = None                                   # (error, q_arm) of the best command sent so far
         for it in range(1 + A["correction_iters"]):
             q = self._q()
-            sol = self.ik.solve(q, p_cmd, d_goal, roll_axis=self._roll_in_root(t))
+            sol = self.ik.solve(q, p_cmd, d_goal, roll_axis=self._roll_in_root(t), **self._roll_kw(t))
             if not sol["ok"]:
                 if best is not None:                  # a correction left the reachable set: keep the best pose reached
                     self.robot.set_arm_joints(side, best[1], A["duration_s"])
                     self.robot.stand(A["settle_s"])
                     hist.append({"reverted_to_best": True, "pos_err_m": best[0], "angle_err_deg": best[2]})
                     break
-                return fail(f"IK: target not reachable (residual {sol['pos_err']:.3f} m / {sol['angle_err_deg']:.1f} deg)", {"iters": it})
+                return {"ik_fail": True, "iters": it, "history": hist,
+                        "reason": f"IK: target not reachable (residual {sol['pos_err']:.3f} m / {sol['angle_err_deg']:.1f} deg)"}
             self.robot.set_arm_joints(side, sol["q_arm"], A["duration_s"])
             self.arm_at_home = False
             self.robot.stand(A["settle_s"])
@@ -2320,25 +3182,7 @@ class Toolbox:
             if e < A["correction_tol"]:
                 break
             p_cmd = p_cmd + err
-        data = {"pose": pose, "offset": off, "barcode_id": t.get("barcode_id"), "history": hist}
-        if hist[-1]["pos_err_m"] >= A["correction_tol"]:
-            # "partial" only while the scan / refine can still recover: the label centre must lie inside the wrist
-            # camera's view cone from the pose reached (2026-11-07 stack4f_L0_0002: a raised arm stopped 0.21 m / 23 deg
-            # off, "partial: go on" was reported and the scan could not read). Outside it the pose is not reachable
-            # from this stance, which the caller handles as an IK failure (re-plan the stance).
-            view = self._label_view(t, off)
-            data["view"] = view
-            lat, half = view["label_lateral_m"], view["view_half_width_m"]
-            if not view["in_view"]:
-                return fail(f"IK: target not reachable from this stance (residual {hist[-1]['pos_err_m']:.3f} m / "
-                            f"{hist[-1]['angle_err_deg']:.1f} deg after {len(hist)} correction(s): the label centre is "
-                            f"{lat:.3f} m off the scanner axis, outside its view half-width {half:.3f} m)", data)
-            # the closed-loop corrections did not converge (2026-11-06 stack scene: the raised, nearly straight arm
-            # stayed 9 cm off); reported, not hidden behind "ok"
-            return partial(f"arm reached the target with a residual {hist[-1]['pos_err_m']:.3f} m / {hist[-1]['angle_err_deg']:.1f} deg "
-                           f"after {len(hist)} correction(s); this is not a failure: go on (pre: refine_with_wrist; final: "
-                           "check_wrist_placement, then scan, which retries by itself)", data)
-        return ok(data)
+        return {"ik_fail": False, "history": hist}
 
     def _label_view(self, t, off, label_width: float | None = None) -> dict:
         """Where the wrist target's label centre lies relative to the SCANNER's view cone from the current arm pose
@@ -2398,11 +3242,25 @@ class Toolbox:
         if (nc := self._not_current(barcode_id)) is not None:
             return fail(nc)
         bc = self._current(barcode_id)
+        if (rf := self._layout_refusal(bc)) is not None:
+            return rf
         if bc is None or bc.center is None:
             return fail("no barcode estimate")
         if self.ws.wrist_target is None or self.ws.wrist_target.get("barcode_id") != bc.id:
             return fail(f"no wrist target for {bc.id} (call compute_wrist_target)")
         face = bc.face
+        layout = bc.wall is not None
+        est = None
+        n_hidden = 0
+
+        def detect():
+            # wall layout: the label only inside the box's cell (search_cell's detector), never the whole-image pick
+            # (2026-11-19 run call 41: it returned the R3 label 0.25 m below the R4 target)
+            nonlocal est, n_hidden
+            if layout:
+                w_, rec_, est, n_hidden = self._detect_wrist_cell(bc)
+                return w_, rec_
+            return self._detect_wrist(bc.center)
         h = self._capture_head()
         uv, z = self._project_odom(h, face["corners"])
         refit = None
@@ -2413,7 +3271,7 @@ class Toolbox:
                 T = h["T_odom_root"]
                 refit = {"center": apply(T, r["center"]), "normal": rotate(T, r["normal"])}
         plane = refit or {"center": face["center"], "normal": face["normal"]}
-        w, rec = self._detect_wrist(bc.center)
+        w, rec = detect()
         tried = []
         S = self._c2()["refine"]
         if rec is None:
@@ -2423,12 +3281,19 @@ class Toolbox:
                 saved, self.ws.wrist_target = self.ws.wrist_target, shifted
                 self.move_arm("pre")
                 self.ws.wrist_target = saved
-                w, rec = self._detect_wrist(bc.center)
+                w, rec = detect()
                 tried.append([du, dv])
                 if rec is not None:
                     break
         if rec is None:
             reach = max(abs(v) for o in S["search_offsets_m"] for v in o)
+            if n_hidden:
+                # wall layout: a label of the box is in the image but partly outside the hand camera's free view (behind
+                # the scanner body at a close stand-off, or at the image border): its centre would be that of the
+                # visible part; say so instead of "not found"
+                return partial(f"the label of the box is only partly in the hand-camera view (hidden by the scanner body "
+                               f"or the image border; searched +-{reach * 100:.0f} cm); keeping the current estimate",
+                               {"searched": tried, "label_partly_hidden": True})
             return partial(f"barcode not found in the hand-camera image (searched +-{reach * 100:.0f} cm); keeping the head "
                            "estimate", {"searched": tried})
         c = self._pixel_on_face(w, rec["center"], plane)
@@ -2450,7 +3315,10 @@ class Toolbox:
                                                         "id": near.id, "status": near.status, "center_odom": near.center,
                                                         "dist_m": float(np.linalg.norm(np.asarray(near.center) - np.asarray(c)))}})
         bc.center, bc.normal, bc.source = c, np.asarray(plane["normal"], float), "wrist"
-        if rec.get("bar_dir") is not None:
+        if layout:
+            if est["bar_dir"] is not None:                 # the rectified detector's bar direction on the plane
+                bc.bar_dir = np.asarray(est["bar_dir"], float)
+        elif rec.get("bar_dir") is not None:
             # bar direction from the wrist image (close, sharp): a second pixel along the bars mapped onto the plane
             c2 = self._pixel_on_face(w, np.asarray(rec["center"], float) + 10.0 * np.asarray(rec["bar_dir"], float), plane)
             if c2 is not None and np.linalg.norm(c2 - c) > 1e-6:
@@ -2471,6 +3339,8 @@ class Toolbox:
                 width["rejected"] = f"{width['n_outlines']} outline(s) < {bc.width_support} of the kept wrist width"
             else:
                 bc.width_m, bc.width_source, bc.width_support = width["width_m"], "wrist", int(width["n_outlines"])
+        if layout:
+            self._store_layout(bc)                         # the measurement, kept in the wall frame
         tr = self.compute_wrist_target(bc.id, refined=True)
         return ok({"barcode_id": bc.id, "center_odom": c, "plane_refit": refit is not None, "kind": rec["kind"], "searched": tried,
                    "symbol_width": width, "width_m": bc.width_m, "width_source": bc.width_source, "offset": tr["data"]["offset"]})
@@ -2529,6 +3399,8 @@ class Toolbox:
         """shift the wrist ~4 cm along the face, triangulate the barcode centre from the two hand-camera
         views (FK poses), compare with refine_with_wrist."""
         bc = self._current(barcode_id)
+        if (rf := self._layout_refusal(bc)) is not None:
+            return rf
         if bc is None or bc.source != "wrist" or self._wrist_detection is None or self._wrist_detection["barcode_id"] != bc.id:
             return fail("call refine_with_wrist first")
         face = bc.face
@@ -2564,9 +3436,13 @@ class Toolbox:
             return partial(f"stereo centre {jump:.2f} m from the estimate (> label width {bc.width_m:.2f} m): triangulation "
                            "rejected, estimate kept", {"barcode_id": bc.id, "rejected_center_odom": point})
         bc.center, bc.source = np.asarray(point, float), "stereo"
+        if bc.wall is not None:
+            self._store_layout(bc)
         return self.compute_wrist_target(bc.id, refined=True)
 
     def check_wrist_placement(self):
+        if (rf := self._layout_refusal(self._current())) is not None:
+            return rf
         C = self._c2()["check"]
         t = self.ws.wrist_target_refined or self.ws.wrist_target
         bc = None if t is None else self.ws.barcodes.get(t.get("barcode_id"))
@@ -2622,6 +3498,8 @@ class Toolbox:
         """Trigger the scanner (see _scan_once). No read with a wrist target: up to scan.retries_on_no_read retries of
         refine_with_wrist -> move_arm final -> scan inside the tool (2026-11-07: the agent_full LLM skipped the
         prompt's retry after a 2 cm miss; rule mode did it), every step recorded in data["retries"]."""
+        if (rf := self._layout_refusal(self._current(), scanning=True)) is not None:
+            return rf
         if self.ws.current_barcode_id is not None:
             self._stance_attempted.add(self.ws.current_barcode_id)      # a scan attempt also counts as attempted
         r = self._scan_once()
@@ -2753,6 +3631,17 @@ def _stance_target_key(pos) -> tuple:
     """Identity of a wrist target position for the failed-stance record: the exact floats (an unchanged estimate gives
     bit-identical numbers through compute_wrist_target, so no tolerance)."""
     return tuple(float(v) for v in np.asarray(pos, float))
+
+
+def _image_direction(frame, X, d) -> list:
+    """Image direction (unit, px) of a step along d (odom) at point X (odom) in a captured frame: the derivative of the
+    pinhole projection, no finite step."""
+    T = inv_T(frame["T_odom_root"] @ frame["T_root_cam"])
+    q = apply(T, X)
+    dq = rotate(T, d)
+    K = np.asarray(frame["K"], float)
+    g = np.array([K[0, 0] * (dq[0] * q[2] - q[0] * dq[2]), K[1, 1] * (dq[1] * q[2] - q[1] * dq[2])]) / q[2] ** 2
+    return (g / np.linalg.norm(g)).tolist()
 
 
 def _label_width(est) -> float:

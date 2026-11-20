@@ -7,6 +7,11 @@ evaluator never imports algorithm code:
   Columns go left to right, inside a column labels go top to bottom (descending z).
 - Order rule "rows" (a property of the task's target spec, scenario scan_targets.order): rows are the connected groups
   of overlapping vertical extents (z); rows go top to bottom, inside a row labels go left to right.
+- Order rule "serpentine" (scenario scan_targets.order, user decision 2026-11-19): the rows of rule "rows", top to
+  bottom; the top row (of the rows that hold expected labels) left to right, the next right to left, alternating.
+- Order unit "box" (scenarios with a wall layout, order_boxes_in_frame): the rule is applied to the GT boxes of the
+  labels (their labelled faces), grouped into rows / columns by centre containment; labels of one box by the label
+  rule (serpentine: in the direction of the box's row).
 - Adaptive stand-off: d = label_width / (2 tan(hfov / 2)) / fill, clamped to [d_min, d_max].
 """
 from __future__ import annotations
@@ -26,7 +31,8 @@ def hfov_from_intrinsics(fx: float, width: float) -> float:
     return 2.0 * math.atan(width / 2.0 / fx)
 
 
-ORDER_RULES = ("columns", "rows")
+ORDER_RULES = ("columns", "rows", "serpentine")
+ORDER_UNITS = ("label", "box")
 
 
 def _overlap_groups(items: list[dict], lo: str, hi: str) -> list[list[dict]]:
@@ -57,12 +63,28 @@ def column_order(items: list[dict]) -> list:
     return out
 
 
-def row_order(items: list[dict]) -> list:
+def _in_row(row: list[dict], left_to_right: bool) -> list:
+    """Keys of one row: by lateral centre in the given direction (left = +y), ties by descending z, then key."""
+    s = -1.0 if left_to_right else 1.0
+    return [it["key"] for it in sorted(row, key=lambda it: (s * (it["y_lo"] + it["y_hi"]) / 2, -it["z"], str(it["key"])))]
+
+
+def row_order(items: list[dict], left_to_right: bool = True) -> list:
     """items: [{"key", "y_lo", "y_hi", "z_lo", "z_hi", "z"}]. Rows = connected groups of overlapping vertical extents,
-    top to bottom; inside a row left to right (descending lateral centre), ties by descending z, then key."""
+    top to bottom; inside a row left to right (descending lateral centre; right to left with left_to_right=False), ties
+    by descending z, then key."""
     out = []
     for row in _overlap_groups(items, "z_lo", "z_hi"):         # already top to bottom
-        out += [it["key"] for it in sorted(row, key=lambda it: (-(it["y_lo"] + it["y_hi"]) / 2, -it["z"], str(it["key"])))]
+        out += _in_row(row, left_to_right)
+    return out
+
+
+def serpentine_order(items: list[dict]) -> list:
+    """items as row_order. The rows of row_order, top to bottom; the k-th row (k = 0 at the top, counted over the rows
+    that hold items) left to right when k is even, right to left when k is odd."""
+    out = []
+    for k, row in enumerate(_overlap_groups(items, "z_lo", "z_hi")):
+        out += _in_row(row, k % 2 == 0)
     return out
 
 
@@ -71,6 +93,8 @@ def order_items(items: list[dict], rule: str = "columns") -> list:
         return column_order(items)
     if rule == "rows":
         return row_order(items)
+    if rule == "serpentine":
+        return serpentine_order(items)
     raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
 
 
@@ -83,9 +107,8 @@ def label_corners(center, normal, up, size) -> np.ndarray:
     return np.array([c + sx * w * r + sy * h * u for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
 
 
-def order_labels_in_frame(labels: list[dict], T_world_frame, rule: str = "columns") -> list:
-    """labels: [{"key", "center", "normal", "up", "size"}] in world; T_world_frame: 4x4 reference (root) frame.
-    Returns the keys in scan order (order rule `rule`)."""
+def _frame_items(labels: list[dict], T_world_frame) -> list[dict]:
+    """Order items ({"key", "y_lo", "y_hi", "z_lo", "z_hi", "z"}) of GT labels in a reference frame."""
     T_fw = np.linalg.inv(np.asarray(T_world_frame, float))
     items = []
     for lb in labels:
@@ -94,7 +117,106 @@ def order_labels_in_frame(labels: list[dict], T_world_frame, rule: str = "column
         zc = float((T_fw[:3, :3] @ np.asarray(lb["center"], float) + T_fw[:3, 3])[2])
         items.append({"key": lb["key"], "y_lo": float(cf[:, 1].min()), "y_hi": float(cf[:, 1].max()),
                       "z_lo": float(cf[:, 2].min()), "z_hi": float(cf[:, 2].max()), "z": zc})
-    return order_items(items, rule)
+    return items
+
+
+def order_labels_in_frame(labels: list[dict], T_world_frame, rule: str = "columns") -> list:
+    """labels: [{"key", "center", "normal", "up", "size"}] in world; T_world_frame: 4x4 reference (root) frame.
+    Returns the keys in scan order (order rule `rule`)."""
+    return order_items(_frame_items(labels, T_world_frame), rule)
+
+
+# ---------------------------------------------------------------------------------------------- order unit "box"
+def yaw_only(T) -> np.ndarray:
+    """The 4x4 frame with T's origin and heading (yaw of its x axis) and a vertical z axis."""
+    T = np.asarray(T, float)
+    yaw = math.atan2(T[1, 0], T[0, 0])
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = np.eye(4)
+    out[:3, :3] = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+    out[:3, 3] = T[:3, 3]
+    return out
+
+
+def box_face(box: dict, normal) -> dict:
+    """The side face of a GT box (I2 "boxes" entry {"pos", "size": [d (x), w (y), h (z)], "quat_wxyz" yaw-only})
+    whose outward normal best matches `normal` (argmax of the dot product over the four side faces): {"center",
+    "normal", "corners" (4x3)}, world frame."""
+    w, x, y, z = box["quat_wxyz"]
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    c, s = math.cos(yaw), math.sin(yaw)
+    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    h = np.asarray(box["size"], float) / 2
+    sides = [(a, sg) for a in (0, 1) for sg in (-1.0, 1.0)]
+    a, sg = sides[int(np.argmax([sg * (R[:, a] @ np.asarray(normal, float)) for a, sg in sides]))]
+    b = 1 - a                                                # the other horizontal axis
+    pos = np.asarray(box["pos"], float)
+    centre = pos + R[:, a] * sg * h[a]
+    corners = np.array([centre + R[:, b] * sb * h[b] + R[:, 2] * sz * h[2] for sb, sz in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
+    return {"center": centre, "normal": R[:, a] * sg, "corners": corners}
+
+
+def _containment_groups(items: list[dict], lo: str, hi: str, c: str) -> list[list[dict]]:
+    """Connected groups of the relation 'either item's centre c lies strictly inside the other's extent (lo, hi)',
+    from the highest mean centre down. For boxes of one size this equals strict extent overlap, but it does not depend
+    on whether two touching extents overlap by float noise after a frame transform."""
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i, p in enumerate(items):
+        for j in range(i + 1, len(items)):
+            q = items[j]
+            if p[lo] < q[c] < p[hi] or q[lo] < p[c] < q[hi]:
+                parent[find(i)] = find(j)
+    groups = {}
+    for i, it in enumerate(items):
+        groups.setdefault(find(i), []).append(it)
+    return sorted(groups.values(), key=lambda g: (-float(np.mean([it[c] for it in g])), min(str(it["key"]) for it in g)))
+
+
+def order_boxes_in_frame(labels: list[dict], boxes: dict, T_world_frame, rule: str = "columns") -> list:
+    """Order unit "box": labels [{"key", "center", "normal", "up", "size", "box_id"}] (world), boxes {id: GT box},
+    T_world_frame: 4x4 reference frame (the evaluator passes a yaw-only frame). Each label's order item is the face of
+    its box that carries it (box_face with the label normal), in the frame. Boxes are grouped into rows (centre z
+    strictly inside the other's z extent, connected groups, top to bottom) and columns (the same on y, left = +y, left
+    to right). Rule "rows": rows from the top, columns from the left inside a row; "columns": columns from the left,
+    rows from the top inside a column; "serpentine": rows from the top, the k-th row (k = 0 at the top, over the rows
+    holding labels) left to right when k is even, right to left when k is odd. Labels of one box: the label rule in the
+    same frame (serpentine: row_order in the direction of the box's row). Returns the keys in scan order."""
+    if rule not in ORDER_RULES:
+        raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
+    T_fw = np.linalg.inv(np.asarray(T_world_frame, float))
+    faces = {}
+    for lb in labels:
+        f = box_face(boxes[lb["box_id"]], lb["normal"])
+        if lb["box_id"] in faces and not np.allclose(faces[lb["box_id"]]["normal"], f["normal"]):
+            raise ValueError(f"box {lb['box_id']} carries labels on two faces: order unit 'box' is defined on one face")
+        faces[lb["box_id"]] = f
+    items = []
+    for bid, f in faces.items():
+        cf = (T_fw[:3, :3] @ f["corners"].T).T + T_fw[:3, 3]
+        cc = T_fw[:3, :3] @ f["center"] + T_fw[:3, 3]
+        items.append({"key": bid, "y_lo": float(cf[:, 1].min()), "y_hi": float(cf[:, 1].max()), "y": float(cc[1]),
+                      "z_lo": float(cf[:, 2].min()), "z_hi": float(cf[:, 2].max()), "z": float(cc[2])})
+    row = {it["key"]: k for k, g in enumerate(_containment_groups(items, "z_lo", "z_hi", "z")) for it in g}
+    col = {it["key"]: k for k, g in enumerate(_containment_groups(items, "y_lo", "y_hi", "y")) for it in g}
+    rows = sorted(set(row.values()))
+    l2r = {b: rule != "serpentine" or rows.index(row[b]) % 2 == 0 for b in row}
+    yc = {it["key"]: it["y"] for it in items}
+
+    def key(b):
+        c = col[b] if l2r[b] else -col[b]
+        return ((col[b], row[b]) if rule == "columns" else (row[b], c)), (-yc[b] if l2r[b] else yc[b]), str(b)
+    litems = {it["key"]: it for it in _frame_items(labels, T_world_frame)}
+    out = []
+    for b in sorted(faces, key=key):
+        mine = [litems[lb["key"]] for lb in labels if lb["box_id"] == b]
+        out += row_order(mine, l2r[b]) if rule == "serpentine" else order_items(mine, rule)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------- multi-face stacks

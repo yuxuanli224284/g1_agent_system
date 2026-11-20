@@ -65,7 +65,8 @@ def manipulability(kin, ik, q) -> float:
 
 def eval_candidate(kin, ik, shoulder, reach, job) -> dict:
     """job: {"Tc", "q_lv", "t", "finals", "pre_dists", "stall", "seed"}. Returns {"status": "reach" | "ik" | "ok"}; ok
-    adds "sols" (required finals then the chosen pre-pose), "gap", "margin", "man"."""
+    adds "sols" (required finals then the chosen pre-pose), "gap", "margin", "man". pre_dists [] = no pre-pose (a
+    wall-layout look pose, approached from home): gap 0. A target with "roll_signed" solves its roll with the sign."""
     t, Tc, q_lv = job["t"], job["Tc"], job["q_lv"]
     rng = np.random.default_rng(job["seed"])
     if reach is not None:
@@ -75,16 +76,17 @@ def eval_candidate(kin, ik, shoulder, reach, job) -> dict:
         if min(np.linalg.norm(q_ - sh) for q_ in pts) > reach:
             return {"status": "reach"}
     roll = roll_in_root(t, Tc)
+    kw = {"roll_signed": True} if t.get("roll_signed") else {}     # other targets: the calls they were
     sols = []
     for off in job["finals"]:                         # required: stop at the first unreachable one
         pr, dr = target_in_root(t, Tc, off)
-        sols.append(ik.solve(q_lv, pr, dr, job["stall"], roll, rng=rng))
+        sols.append(ik.solve(q_lv, pr, dr, job["stall"], roll, rng=rng, **kw))
         if not sols[-1]["ok"]:
             return {"status": "ik"}
-    gap = None
+    gap = None if job["pre_dists"] else 0.0
     for dp in job["pre_dists"]:                       # farthest reachable pre-pose
         pr, dr = target_in_root(t, Tc, dp)
-        sp = ik.solve(q_lv, pr, dr, job["stall"], roll, rng=rng)
+        sp = ik.solve(q_lv, pr, dr, job["stall"], roll, rng=rng, **kw)
         if sp["ok"]:
             gap = float(dp - t["offset"])
             sols.append(sp)

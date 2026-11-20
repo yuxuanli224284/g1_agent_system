@@ -1,6 +1,9 @@
 """Left-arm IK for the scanner tip: position (3) + scan direction (2) and, with a roll axis, the roll about the scan axis
 (the scanner image's horizontal axis parallel to the barcode's long axis, sign free: 6 constraints); 7 arm joints,
 damped least squares on the pinocchio model (the same task the simulator's aim controller uses, solved offline).
+With roll_signed=True the roll axis is a direction, not a line: the image's horizontal axis must point along +roll_axis
+(a hand-camera look pose, where the side of the scan axis the camera sits on matters; a code reads the same both ways
+round, so scan poses keep the default sign-free roll).
 
 xr_teleoperate's IK was the obvious candidate; that solver targets the Dex3/Inspire hand frames of its own
 URDF, while this robot carries a scanner (g1_v1: held by a Dex1 gripper; g1_v2: bolted to a left-wrist bracket), so the
@@ -54,34 +57,37 @@ class ArmIK:
         R_tc = np.linalg.inv(self.kin.pose(q_n, self.frame))[:3, :3] @ self.kin.pose(q_n, rc["scanner_cam_frame"])[:3, :3]
         self.img_x_in_tip = R_tc[:, 0] / np.linalg.norm(R_tc[:, 0])
 
-    def roll_target(self, R, d_t, roll_axis):
+    def roll_target(self, R, d_t, roll_axis, signed=False):
         """Target rotation of the scanner-tip frame: x along d_t, image horizontal along the roll axis made orthogonal to
-        d_t, sign chosen nearest to the current orientation R (a code reads the same both ways round)."""
+        d_t, sign chosen nearest to the current orientation R (a code reads the same both ways round). signed=True keeps
+        the given sign (the image horizontal points along +roll_axis whatever R is)."""
         L = np.asarray(roll_axis, float) - (np.asarray(roll_axis, float) @ d_t) * d_t
         L /= np.linalg.norm(L)
-        if (R @ self.img_x_in_tip) @ L < 0:
+        if not signed and (R @ self.img_x_in_tip) @ L < 0:
             L = -L
         ex, c = np.array([1.0, 0.0, 0.0]), self.img_x_in_tip
         return np.column_stack([d_t, L, np.cross(d_t, L)]) @ np.column_stack([ex, c, np.cross(ex, c)]).T
 
-    def roll_error_deg(self, R, d_t, roll_axis) -> float:
-        """Angle (deg, 0-90) between the scanner image's horizontal axis and the barcode's long axis about the scan axis."""
+    def roll_error_deg(self, R, d_t, roll_axis, signed=False) -> float:
+        """Angle (deg, 0-90) between the scanner image's horizontal axis and the barcode's long axis about the scan axis;
+        signed=True: the angle (deg, 0-180) to the directed axis +roll_axis."""
         L = np.asarray(roll_axis, float) - (np.asarray(roll_axis, float) @ d_t) * d_t
         L /= np.linalg.norm(L)
         x = R @ self.img_x_in_tip
         x = x - (x @ d_t) * d_t
         x /= np.linalg.norm(x)
-        return float(np.degrees(np.arccos(min(1.0, abs(float(x @ L))))))
+        c = float(x @ L)
+        return float(np.degrees(np.arccos(max(-1.0, min(1.0, c)) if signed else min(1.0, abs(c)))))
 
     def error(self, q, p_target, d_target):
         T = self.kin.pose(q, self.frame)
         a = T[:3, 0]
         return T, p_target - T[:3, 3], rotation_vector(a, d_target), a
 
-    def _solve_from(self, q, p_t, d_t, stall=None, roll_axis=None):
+    def _solve_from(self, q, p_t, d_t, stall=None, roll_axis=None, roll_signed=False):
         """stall = (window, eps): give up when the weighted error (position + aim_weight * angle) improved by less than
         eps over the last `window` iterations (planning only, see robot.yaml ik.plan_stall_*). roll_axis: also align the
-        scanner image's horizontal axis with it (full orientation target, see roll_target)."""
+        scanner image's horizontal axis with it (full orientation target, see roll_target; roll_signed: with its sign)."""
         from scipy.spatial.transform import Rotation
         c, w = self.cfg, self.cfg["aim_weight"]
         hist = []
@@ -89,7 +95,7 @@ class ArmIK:
             T, ep, er, a = self.error(q, p_t, d_t)
             ang = np.degrees(np.linalg.norm(er))
             if roll_axis is not None:
-                er = Rotation.from_matrix(self.roll_target(T[:3, :3], d_t, roll_axis) @ T[:3, :3].T).as_rotvec()
+                er = Rotation.from_matrix(self.roll_target(T[:3, :3], d_t, roll_axis, roll_signed) @ T[:3, :3].T).as_rotvec()
                 ang = np.degrees(np.linalg.norm(er))      # full orientation error (aim and roll)
             if np.linalg.norm(ep) < c["tol_pos"] and ang < c["tol_angle_deg"]:
                 return q, True, it
@@ -109,9 +115,10 @@ class ArmIK:
             q[self.qi] = np.clip(q[self.qi] + dq, self.lo, self.hi)
         return q, False, c["max_iters"]
 
-    def solve(self, q_now, p_target, d_target, stall=None, roll_axis=None, rng=None) -> dict:
+    def solve(self, q_now, p_target, d_target, stall=None, roll_axis=None, rng=None, roll_signed=False) -> dict:
         """q_now: full pinocchio configuration (other joints held). Returns {"ok", "q_arm", "pos_err", "angle_err_deg",
-        "iters", "start"}; ok=False -> best attempt (unreachable or not converged)."""
+        "iters", "start"}; ok=False -> best attempt (unreachable or not converged). roll_signed: the roll axis is
+        directed (roll_target signed=True; roll_err_deg then 0-180)."""
         d_target = np.asarray(d_target, float) / np.linalg.norm(d_target)
         p_target = np.asarray(p_target, float)
         best = None
@@ -121,11 +128,12 @@ class ArmIK:
             s[self.qi] = (self.rng if rng is None else rng).uniform(self.lo, self.hi)
             starts.append(s)
         for k, s in enumerate(starts):
-            q, ok, it = self._solve_from(s, p_target, d_target, stall, roll_axis)
+            q, ok, it = self._solve_from(s, p_target, d_target, stall, roll_axis, roll_signed)
             T, ep, er, _ = self.error(q, p_target, d_target)
             r = {"ok": ok, "q_arm": q[self.qi].copy(), "q_full": q, "pos_err": float(np.linalg.norm(ep)),
                  "angle_err_deg": float(np.degrees(np.linalg.norm(er))), "iters": it, "start": k,
-                 "roll_err_deg": None if roll_axis is None else self.roll_error_deg(T[:3, :3], d_target, roll_axis),
+                 "roll_err_deg": None if roll_axis is None else self.roll_error_deg(T[:3, :3], d_target, roll_axis,
+                                                                                    roll_signed),
                  "limit_margin_min": float(np.min(np.minimum(q[self.qi] - self.lo, self.hi - q[self.qi])))}
             score = r["pos_err"] + self.cfg["aim_weight"] * np.radians(r["angle_err_deg"] + (r["roll_err_deg"] or 0.0))
             if best is None or (r["ok"] and not best["ok"]) or (r["ok"] == best["ok"] and score < best["_score"]):

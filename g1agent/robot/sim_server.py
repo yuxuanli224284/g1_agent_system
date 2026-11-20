@@ -545,6 +545,24 @@ def head_obs(env, depth: bool = False) -> dict:
     return out
 
 
+def hand_camera_occluders(boxes, cam) -> list:
+    """The robot's parts that can stand in front of a hand camera (CAD knowledge, like get_robot_geometry): the
+    clearance boxes (robot_variants.yaml clearance_boxes, link frame) on the camera's parent link that do not contain
+    the camera's optical centre (the bracket and the camera's own housing enclose it: it looks out of them). g1_v2
+    left_d405: scanner_head and scanner_handle. Format {name, link, center, size} in the link frame."""
+    import numpy as np
+    out = []
+    for b in boxes:
+        if b["link"] != cam["parent_link"]:
+            continue
+        p = np.asarray(cam["pos"], float)
+        c, sz = np.asarray(b["center"], float), np.asarray(b["size"], float)
+        if np.all(np.abs(p - c) <= sz / 2):
+            continue
+        out.append({"name": b["name"], "link": b["link"], "center": c.tolist(), "size": sz.tolist()})
+    return out
+
+
 def robot_info(env):
     """What the robot is (its kinematics, cameras, hands): the agent chooses its model from it (robot_variant)."""
     from g1_barcode_sim.arm import ARM_JOINTS
@@ -558,7 +576,8 @@ def robot_info(env):
             "hand_cameras": {n: {"side": h["parent_link"].split("_")[0], "parent_link": h["parent_link"],
                                  "K": env.hand_cams[n].data.intrinsic_matrices[0].cpu().numpy().astype(float),
                                  "size": [h["height"], h["width"]], "hfov_deg": float(h["hfov_deg"]),
-                                 "depth": "distance_to_image_plane" in h["data_types"]}
+                                 "depth": "distance_to_image_plane" in h["data_types"],
+                                 "occluders": hand_camera_occluders(rc.get("clearance_boxes") or [], h)}
                              for n, h in (rc.get("hand_cameras") or {}).items()},
             "grippers": {s: bool(rc["gripper"]["joints"][s]) for s in ("left", "right")},
             "scanner": {"parent_link": rc["scanner_mount"]["parent_link"], "held_by": held},

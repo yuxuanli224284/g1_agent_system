@@ -215,28 +215,47 @@ class Task2:
             r = h.call("set_base_height", {"height": bh})
             if r["status"] != "ok":
                 return end(False, False, f"squat to {bh}: {r['reason']}")
-        r = h.call("move_arm", {"pose": "pre"})
-        if r["status"] == "fail":                     # partial: reached with a residual, the wrist camera still looks
-            if not _replanned and r["reason"].startswith("IK"):
-                # the pose became unreachable after the real walk / squat: stand up, plan again from here once
-                self._stand_up()
-                return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
-            return end(False, False, f"pre-pose: {r['reason']}")
-        r = h.call("refine_with_wrist", dict(bid))
-        if r["status"] == "ok":
-            s = h.call("stereo_check_wrist", dict(bid))
-            if _stereo_disagrees(s):
-                h.call("move_arm", {"pose": "pre"})
-                r2 = h.call("refine_with_wrist", dict(bid))
-                s2 = h.call("stereo_check_wrist", dict(bid)) if r2["status"] == "ok" else s
-                if _stereo_disagrees(s2):
-                    h.tb.adopt_stereo(barcode_id, s2["data"]["triangulated_odom"])   # trust the motion stereo
+        cur = h.tb.ws.barcodes.get(h.tb.ws.current_barcode_id)
+        searched = cur is not None and cur.kind == "cell"
+        if searched:
+            # wall layout, a box whose label is not found yet: the hand-camera search at the look stance; a found label
+            # goes straight to the final pose from this stance (the search replaces the pre-pose and the first refine)
+            r = h.call("search_cell", dict(bid))
+            if r["status"] == "fail":
+                return end(False, False, f"search_cell: {r['reason']}")
+            if r["status"] == "partial":
+                if not _replanned:
+                    self._stand_up()
+                    return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
+                return end(False, False, f"search_cell: {r['reason']}")
+            if r["data"].get("barcode_status") == "no_label":
+                return end(False, False, "no label in the box")
+        if not searched:
+            r = h.call("move_arm", {"pose": "pre"})
+            if r["status"] == "fail":                 # partial: reached with a residual, the wrist camera still looks
+                if not _replanned and r["reason"].startswith("IK"):
+                    # the pose became unreachable after the real walk / squat: stand up, plan again from here once
+                    self._stand_up()
+                    return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
+                return end(False, False, f"pre-pose: {r['reason']}")
+            r = h.call("refine_with_wrist", dict(bid))
+            if r["status"] == "ok":
+                s = h.call("stereo_check_wrist", dict(bid))
+                if _stereo_disagrees(s):
+                    h.call("move_arm", {"pose": "pre"})
+                    r2 = h.call("refine_with_wrist", dict(bid))
+                    s2 = h.call("stereo_check_wrist", dict(bid)) if r2["status"] == "ok" else s
+                    if _stereo_disagrees(s2):
+                        h.tb.adopt_stereo(barcode_id, s2["data"]["triangulated_odom"])   # trust the motion stereo
         for k in range(c["place"]["max_iters"] + 1):
             r = h.call("move_arm", {"pose": "final"})
             if r["status"] == "fail":                 # partial = reached with a residual: refine / check / scan decide
                 bc = h.tb.ws.barcodes.get(h.tb.ws.current_barcode_id)
-                if not _replanned and r["reason"].startswith("IK") and bc is not None and bc.width_source == "wrist":
-                    # the stance was planned on the head width; the measured stand-off is out of reach from it:
+                looked = (h.tb.ws.stance_target or {}).get("purpose") == "look"
+                if not _replanned and r["reason"].startswith("IK") and bc is not None \
+                        and (bc.width_source == "wrist" or looked):
+                    # the stance was planned on the head width (or, wall layout, for the hand-camera view, without the
+                    # label); the measured stand-off is out of reach from it:
                     # stand up and plan the stance once more on the measured width
                     self._stand_up()
                     return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
@@ -244,6 +263,10 @@ class Task2:
             if k == c["place"]["max_iters"]:
                 break
             before = h.tb.ws.wrist_target_refined
+            if before is None and searched:
+                # wall layout: the search replaced the pre-pose refine, so the final pose just reached is the unrefined
+                # label target; a refine that moves it goes to the final pose again (final -> refine -> final)
+                before = h.tb.ws.wrist_target
             rr = h.call("refine_with_wrist", dict(bid))
             if rr["status"] != "ok" or before is None:
                 break
@@ -279,7 +302,9 @@ class Task3:
     The scenario's left/right selector is not used: task 3 observes and scans every box. With a target spec in robot
     terms (Toolbox.scan_targets) only the targeted labels count, and phase 1 stays near the start pose (_stay_stage;
     phase1_view "start_pose", the default) or walks to the observation pose compute_obs_pose plans from the spec
-    (phase1_view "obs_pose": the task-1 stage, Toolbox.set_phase1_view)."""
+    (phase1_view "obs_pose": the task-1 stage, Toolbox.set_phase1_view). With a wall layout (Toolbox.set_wall_layout)
+    every planned box is searched with search_cell at its look stance (place_and_scan), no plan update in phase 2, and
+    a box recorded no_label counts as handled."""
 
     def __init__(self, h, cfg, selector, explore_policy=None, recovery_policy=None):
         self.h, self.cfg = h, cfg
@@ -330,18 +355,23 @@ class Task3:
                     break
                 h.call("plan_scans", {})
                 continue
+            # a wall layout fixes the cells: no plan update before standing up
             results.append(self.t2.place_and_scan(nb["data"]["barcode_id"], home_after=True,
-                                                  before_stand_up=lambda: h.call("plan_scans", {})))
+                                                  before_stand_up=None if h.tb.wall_layout is not None
+                                                  else lambda: h.call("plan_scans", {})))
         if h.finished is not None:
             return {"status": "ok"}
         ws = h.tb.ws
         plan = [b for b in ws.scan_plan if ws.targeted(b)]           # not_targeted labels are not part of the task
         n_ok = sum(ws.barcodes[b].status == "scanned" for b in plan)
         n_unr = sum(ws.barcodes[b].status == "unreadable" for b in plan)
+        n_nol = sum(ws.barcodes[b].status == "no_label" for b in plan)     # wall layout: a box seen whole without label
         missing, warn = ws.missing_cells(), ws.grid_warnings()
-        return h.call("finish", {"task": h.task, "success": n_ok > 0 and n_ok + n_unr == len(plan) and not missing and not warn,
+        return h.call("finish", {"task": h.task,
+                                 "success": n_ok > 0 and n_ok + n_unr + n_nol == len(plan) and not missing and not warn,
                                  "summary": f"scanned {n_ok} of {len(plan)} planned barcodes"
                                             + (f", {n_unr} label(s) without a readable code" if n_unr else "")
+                                            + (f", {n_nol} box(es) without a label" if n_nol else "")
                                             + (f", requested cells not found: {missing}" if missing else "")
                                             + (f", target count not verified: {warn}" if warn else "")
                                             + ("" if not h.over_budget() else f" ({h.over_budget()})")})

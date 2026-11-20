@@ -7,11 +7,7 @@ Rules:
 - Every number (positions, distances, poses, stand-offs) is computed by the tools. Never invent coordinates; only choose
   which tool to call, exploration directions, and what to do after a failure.
 {phase1_rules}
-- Phase 2: you never choose the order. Repeat for each barcode:
-  next_barcode -> compute_wrist_target (never pass an offset: the stand-off is adaptive) -> plan_stance ->
-  move_arm("home") -> approach(target="stance_target") -> move_arm("pre") -> refine_with_wrist -> move_arm("final") ->
-  check_wrist_placement -> scan -> move_arm("home") -> plan_scans (adds labels seen for the first time from this
-  closer / lower view).{final_refine_note}
+{phase2_loop}
   plan_stance chooses the body height (low barcodes need a squat); approach(stance_target) squats to it on arrival and
   every walking tool stands the robot up first, so you do not call set_base_height yourself.
   move_arm or check_wrist_placement returning "partial" (reached with a small residual / placement a little outside

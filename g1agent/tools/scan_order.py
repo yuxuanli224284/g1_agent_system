@@ -9,6 +9,9 @@ tests/test_no_gt_leak.py); tests/test_task3_logic.py checks that both give the s
 - Order rule "rows" (a property of the task's target spec, user decision 2026-11-19 for the 4-box scanroom test): rows
   are the connected groups of overlapping vertical extents (z), the same rule on the other axis; rows go top to bottom,
   inside a row labels go left to right (descending lateral centre).
+- Order rule "serpentine" (user decision 2026-11-19, the wall-layout suite): the rows of rule "rows", top to bottom;
+  the top row (of the rows that hold labels to scan) left to right, the next right to left, alternating, so the robot
+  starts each row where it ended the previous one. Ties inside a row as in rule "rows" (by descending z, then key).
 - Target grid (task instruction in robot terms, e.g. "columns 1-2 from the left, rows 2-3 from the top of the box
   wall", or "all columns, rows 2-4 from the bottom"): box rows / columns from the box faces seen whole (labels go to the
   nearest box slot holding their centre; label overlap groups only where no box was seen whole), counted from the
@@ -16,6 +19,8 @@ tests/test_no_gt_leak.py); tests/test_task3_logic.py checks that both give the s
   grid_cell).
 - Scan order inside a resolved grid (order_by_cells): the order rule applied to the box cells of the labels, so a
   duplicate or a fragment inside a cell never forms a row / column of its own.
+- Scan order of a given wall layout (order_lattice): the order rule applied to the layout cells themselves (no label
+  extents); several labels inside one cell: order_in_cell.
 - Adaptive stand-off (user requirement 5): d = label_width / (2 tan(hfov / 2)) / fill, clamped to [d_min, d_max].
 """
 from __future__ import annotations
@@ -36,7 +41,7 @@ def adaptive_standoff(label_width_m: float, hfov_rad: float, fill: float, d_min:
     return float(min(max(d, d_min), d_max))
 
 
-ORDER_RULES = ("columns", "rows")
+ORDER_RULES = ("columns", "rows", "serpentine")
 
 
 def _overlap_groups(items: list[dict], lo: str, hi: str) -> list[list[dict]]:
@@ -67,12 +72,28 @@ def column_order(items: list[dict]) -> list:
     return out
 
 
-def row_order(items: list[dict]) -> list:
+def _in_row(row: list[dict], left_to_right: bool) -> list:
+    """Keys of one row: by lateral centre in the given direction (left = +y), ties by descending z, then key."""
+    s = -1.0 if left_to_right else 1.0
+    return [it["key"] for it in sorted(row, key=lambda it: (s * (it["y_lo"] + it["y_hi"]) / 2, -it["z"], str(it["key"])))]
+
+
+def row_order(items: list[dict], left_to_right: bool = True) -> list:
     """items: [{"key", "y_lo", "y_hi", "z_lo", "z_hi", "z"}]. Rows = connected groups of overlapping vertical extents,
-    top to bottom; inside a row left to right (descending lateral centre), ties by descending z, then key."""
+    top to bottom; inside a row left to right (descending lateral centre; right to left with left_to_right=False), ties
+    by descending z, then key."""
     out = []
     for row in _overlap_groups(items, "z_lo", "z_hi"):         # already top to bottom
-        out += [it["key"] for it in sorted(row, key=lambda it: (-(it["y_lo"] + it["y_hi"]) / 2, -it["z"], str(it["key"])))]
+        out += _in_row(row, left_to_right)
+    return out
+
+
+def serpentine_order(items: list[dict]) -> list:
+    """items as row_order. The rows of row_order, top to bottom; the k-th row (k = 0 at the top, counted over the rows
+    that hold items) left to right when k is even, right to left when k is odd."""
+    out = []
+    for k, row in enumerate(_overlap_groups(items, "z_lo", "z_hi")):
+        out += _in_row(row, k % 2 == 0)
     return out
 
 
@@ -82,7 +103,35 @@ def order_items(items: list[dict], rule: str = "columns") -> list:
         return column_order(items)
     if rule == "rows":
         return row_order(items)
+    if rule == "serpentine":
+        return serpentine_order(items)
     raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
+
+
+def order_in_cell(items: list[dict], rule: str, left_to_right: bool = True) -> list:
+    """Scan order of several labels inside ONE box cell (items as order_items): the label rule of the task; for rule
+    "serpentine" the rows of labels inside the cell top to bottom, each in the lateral direction of the cell's row
+    (left_to_right: that row's direction, see order_lattice), so the robot keeps walking the same way."""
+    if rule == "serpentine":
+        return row_order(items, left_to_right)
+    return order_items(items, rule)
+
+
+def order_lattice(cells: list[dict], rule: str = "columns") -> list[dict]:
+    """Scan order of the cells of a given wall layout (cells: [{"key", "column": 1 = leftmost, "row": 1 = top}], the
+    lattice itself, no label extents). Rule "rows": rows from the top, columns from the left inside a row; "columns":
+    columns from the left, rows from the top inside a column; "serpentine": rows from the top, the k-th row (k = 0 at
+    the top, counted over the rows that hold cells) left to right when k is even, right to left when k is odd.
+    Returns [{"key", "left_to_right": the lateral direction of the cell's row (order_in_cell)}] in scan order."""
+    if rule not in ORDER_RULES:
+        raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
+    rank = {r: k for k, r in enumerate(sorted({c["row"] for c in cells}))}
+    l2r = {c["key"]: rule != "serpentine" or rank[c["row"]] % 2 == 0 for c in cells}
+
+    def key(c):
+        col = c["column"] if l2r[c["key"]] else -c["column"]
+        return ((c["column"], c["row"]) if rule == "columns" else (c["row"], col)), str(c["key"])
+    return [{"key": c["key"], "left_to_right": l2r[c["key"]]} for c in sorted(cells, key=key)]
 
 
 def order_items_in_frame(labels: list[dict], T_odom_frame) -> list[dict]:
@@ -166,7 +215,9 @@ def order_rule_text(rule: str) -> str:
     return {"columns": "columns of overlapping lateral label extents, left to right as seen facing this side; "
                        "top to bottom inside a column",
             "rows": "rows of overlapping vertical label extents, top to bottom; left to right inside a row as seen "
-                    "facing this side"}[rule]
+                    "facing this side",
+            "serpentine": "rows of overlapping vertical label extents, top to bottom; the top row left to right as seen "
+                          "facing this side, the next right to left, alternating"}[rule]
 
 
 _OPP = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
@@ -469,14 +520,26 @@ def order_by_cells(items: list[dict], cells: dict, grid: dict | None, rule: str 
     """Scan order of labels by their box cells in a resolved grid (items: order items, cells: {key: {"column", "row"}},
     grid: {"columns": slots, "rows": slots} of resolve_grid). Rule "rows": row slots from the top, inside a row column
     slots from the left; rule "columns": column slots from the left, inside a column row slots from the top (slot
-    position = its centre, so the result does not depend on the edge the indices are counted from). Labels of one cell
-    keep the order of order_items. Without a grid, or when a label has no cell in either dimension, order_items."""
+    position = its centre, so the result does not depend on the edge the indices are counted from); rule "serpentine":
+    row slots from the top, the k-th of the rows holding labels (k = 0 at the top) left to right when k is even, right
+    to left when k is odd. Labels of one cell keep the order of order_items (serpentine: of row_order in their row's
+    direction). Without a grid, or when a label has no cell in either dimension, order_items."""
     base = order_items(items, rule)
     keys = [it["key"] for it in items]
     if grid is None or any(cells[k]["column"] is None or cells[k]["row"] is None for k in keys):
         return base
     rank = {k: i for i, k in enumerate(base)}
     pos = {a: {g["index"]: (g["lo"] + g["hi"]) / 2 for g in grid[dim]} for dim, a in (("columns", "column"), ("rows", "row"))}
+    if rule == "serpentine":
+        rows = sorted({cells[k]["row"] for k in keys}, key=lambda i: -pos["row"][i])          # top first
+        l2r = {i: k % 2 == 0 for k, i in enumerate(rows)}
+        rank_dir = {d: {k: i for i, k in enumerate(row_order(items, d))} for d in (True, False)}
+
+        def skey(k):
+            d = l2r[cells[k]["row"]]
+            c = pos["column"][cells[k]["column"]]
+            return (-pos["row"][cells[k]["row"]], -c if d else c, rank_dir[d][k])
+        return sorted(keys, key=skey)
 
     def key(k):
         r, c = -pos["row"][cells[k]["row"]], -pos["column"][cells[k]["column"]]      # top first, left first

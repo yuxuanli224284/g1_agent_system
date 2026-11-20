@@ -12,7 +12,8 @@ import yaml
 from ..common import config
 from ..common.transforms import angle_between, apply, wrap
 from ..perception import geometry as geo
-from .scan_order import FACE_TOUR, ORDER_RULES, adaptive_standoff, hfov_from_intrinsics, labelled_faces, order_labels_in_frame
+from .scan_order import (FACE_TOUR, ORDER_RULES, ORDER_UNITS, adaptive_standoff, hfov_from_intrinsics, labelled_faces,
+                         order_boxes_in_frame, order_labels_in_frame, yaw_only)
 
 
 def _world_pose2(T_world_odom, pos, yaw):
@@ -118,7 +119,8 @@ def _decoded_contents(decoded) -> list:
     return [d["content"] if isinstance(d, dict) else d for d in (decoded or [])]
 
 
-def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, target_boxes=None, order_rule="columns") -> dict:
+def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, target_boxes=None, order_rule="columns",
+           order_unit="label") -> dict:
     """Merged task (find the boxes, then scan every GT barcode once, left to right then top to bottom).
     Subset task (target_boxes = the scenario's GT box ids, evaluation only; order_rule = the scenario's scan_targets
     order, the rule the agent was told): the expected set is the barcodes of those boxes, ordered by order_rule;
@@ -136,10 +138,18 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
       contiguous and no foreign content (_tour_metrics; face_order_ok is reported, not gating);
     - success = every expected barcode read, in the expected order, and no foreign content read. The task-1 phase
       (arrival accuracy) is reported separately in "task1" / "t1_success" and does not gate success: the task-1 phase
-      ends early by design (fast end) and the scan phase plans its own stances (user decision 2026-11-06)."""
+      ends early by design (fast end) and the scan phase plans its own stances (user decision 2026-11-06).
+    - order_unit "box" (scenarios with a wall layout: the agent plans one entry per layout cell): the expected order
+      is the rule applied to the GT boxes of the expected labels (scan_order.order_boxes_in_frame, in the yaw-only
+      frame of the reference root pose; boxes grouped by centre containment), labels of one box by the label rule;
+      output key "order_unit" only then. A plan entry recorded "no_label" (search_cell saw the whole box face and
+      found no label) is listed in "reported_no_label"; it never excuses an expected label: an unread GT label still
+      fails the scan count."""
     out = {}
     if order_rule not in ORDER_RULES:
         raise ValueError(f"unknown order rule {order_rule!r} (known: {ORDER_RULES})")
+    if order_unit not in ORDER_UNITS:
+        raise ValueError(f"unknown order unit {order_unit!r} (known: {ORDER_UNITS})")
     t1 = stages.get("task1_end")
     if t1 is None:
         out["task1"] = {"success": False, "failure": "the run never reached the task1_end stage"}
@@ -184,9 +194,16 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
     # otherwise (one labelled face, or a legacy GT without "faces") the single-face rule in the task1_end root frame
     groups = labelled_faces(labels, gt["faces"], order_rule) if gt.get("faces") else []
     multi = len(groups) > 1
+    if multi and order_unit == "box":
+        raise ValueError("order unit 'box' is defined for one labelled wall face, the GT has several labelled faces")
     if multi:
         order = [k for _, keys in groups for k in keys]
         out["order_frame"] = "faces"
+    elif order_unit == "box":
+        boxes = {b["id"]: b for b in gt["boxes"]}
+        order = order_boxes_in_frame([dict(lb, box_id=b["box_id"]) for lb, b in zip(labels, exp)], boxes,
+                                     yaw_only(T_ref), order_rule)
+        out["order_unit"] = "box"
     else:
         order = order_labels_in_frame(labels, T_ref, order_rule)
     hfov = scanner_hfov_gt()
@@ -241,6 +258,10 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
                 "reported_unreachable": [{"id": p["id"], "center_odom": p.get("center_odom"), "reason": p.get("fail_reason")}
                                          for p in plan if p["status"] == "unreachable"],
                 "ledger_contents": ledger, "ledger_matches_log": ledger == distinct})
+    if any(p["status"] == "no_label" for p in plan):
+        out["reported_no_label"] = [{"id": p["id"], "box_id": p.get("box_id"), "cell": p.get("cell"),
+                                     "center_odom": p.get("center_odom"), "reason": p.get("fail_reason")}
+                                    for p in plan if p["status"] == "no_label"]
     fails = []
     if len(scanned_gt) < len(order):
         fails.append(f"scanned {len(scanned_gt)}/{len(order)} GT barcodes")
@@ -286,11 +307,12 @@ def _tour_metrics(groups: list, scanned_gt: list) -> dict:
 
 
 def evaluate(task: int, gt: dict, actual: dict, ws: dict, stages: dict | None = None, scan_log: list | None = None,
-             target_boxes: list | None = None, order_rule: str = "columns") -> dict:
+             target_boxes: list | None = None, order_rule: str = "columns", order_unit: str = "label") -> dict:
     """ws: harness world-state export {"root_target", "wrist_target", "wrist_target_refined"} (odom frame); task 3 also
     needs "scan_plan" and "scanned" (I4), "task1_end_root_target" (the harness root target snapshotted when the
     task1_end stage fired; required when that stage exists), the eval-port stage states (get_stage_states) and scan
-    log (get_scan_log). Task 3 subset (scenario target_boxes / scan_targets.order): see _task3."""
+    log (get_scan_log). Task 3 subset (scenario target_boxes / scan_targets.order; order_unit "box" for scenarios
+    with a wall layout): see _task3."""
     if task == 1:
         return _task1(gt, actual, ws, config.load("task1")["eval"])
     if task == 2:
@@ -298,5 +320,5 @@ def evaluate(task: int, gt: dict, actual: dict, ws: dict, stages: dict | None = 
     if task == 3:
         if stages is None or scan_log is None:
             raise ValueError("task 3 evaluation needs the stage states and the scan log")
-        return _task3(gt, actual, ws, stages, scan_log, target_boxes, order_rule)
+        return _task3(gt, actual, ws, stages, scan_log, target_boxes, order_rule, order_unit)
     raise ValueError(f"unknown task {task!r}")

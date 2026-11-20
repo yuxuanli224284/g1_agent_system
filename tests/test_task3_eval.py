@@ -395,3 +395,158 @@ def test_r234_gt_order_success_order_failure_and_non_target():
     m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=log, **kw)
     assert m["success"], m.get("failure")
     assert m["non_target_reads"] == [by_box["C1R5"]["content"]] and m["n_wrong_contents"] == 0 and m["scan_recall"] == 1.0
+
+
+# ------------------------------------------------------------------ order rule "serpentine", order unit "box" (wall layout)
+SNAKE234 = ([f"C{c}R4" for c in range(1, 7)] + [f"C{c}R3" for c in range(6, 0, -1)]
+            + [f"C{c}R2" for c in range(1, 7)])
+
+
+def _subset_gt_boxes(sid):
+    """_subset with the GT "boxes" (the simulator's build_gt of the same layout), which order unit "box" reads."""
+    sc, gt, stages = _subset(sid)
+    from g1_barcode_sim.ground_truth import build_gt
+    from g1_barcode_sim.testsuite import load_factors
+    from g1_barcode_sim.testsuite.scenario import to_layout
+    return sc, dict(gt, boxes=build_gt(to_layout(sc, load_factors()))["boxes"]), stages
+
+
+def test_r234_serpentine_gt_order_both_units_and_scoring():
+    """scanroom6x5 rows 2-4 x all columns with rule "serpentine": R4 left to right, R3 right to left, R2 left to right,
+    with label and box units alike (the labels of this scene sit in their box rows); "order_unit" is reported only for
+    the box unit; reads in the snake order succeed, reads in row order fail on the order; the box unit with the rows /
+    columns rule gives the label unit's order (unchanged for this scene)."""
+    sc, gt, stages = _subset_gt_boxes("scanroom6x5_r234_L0_0000")
+    by_box = {b["box_id"]: b for b in gt["barcodes"]}
+    box = {b["content"]: b["box_id"] for b in gt["barcodes"]}
+    ws = {"scan_plan": [], "scanned": []}
+    kw = {"target_boxes": sc["target_boxes"], "order_rule": "serpentine"}
+    lab = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], **kw)
+    bx = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], order_unit="box", **kw)
+    assert [box[c] for c in lab["gt_order"]] == SNAKE234 and bx["gt_order"] == lab["gt_order"]
+    assert "order_unit" not in lab and bx["order_unit"] == "box" and bx["order_rule"] == "serpentine"
+    for rule in ("rows", "columns"):
+        a = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], target_boxes=sc["target_boxes"], order_rule=rule)
+        b = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], target_boxes=sc["target_boxes"], order_rule=rule,
+                               order_unit="box")
+        assert a["gt_order"] == b["gt_order"] and {k: v for k, v in b.items() if k != "order_unit"} == a
+
+    def read(bid, t):
+        b = by_box[bid]
+        d = evaluator.gt_standoff(b["pattern_size"], evaluator.scanner_hfov_gt())
+        return {"t_sim": t, "content": b["content"], "decoded": [b["content"]], "gt": {"hit": None},
+                "T_world_tip": _tip(np.asarray(b["center"]) + d * np.asarray(b["normal"]))}
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[read(b, i) for i, b in enumerate(SNAKE234)],
+                           order_unit="box", **kw)
+    assert m["success"], m.get("failure")
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[read(b, i) for i, b in enumerate(R234)],
+                           order_unit="box", **kw)
+    assert not m["success"] and "order" in m["failure"]
+    with pytest.raises(ValueError):
+        evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[], order_unit="cell", **kw)
+
+
+def _lattice_gt(labels, yaw_deg=0.0, cols=2, rows=2):
+    """A wall of cols x rows boxes 0.20 wide x 0.25 tall x 0.40 deep, front face at x 1.3 (facing -x), columns from
+    the robot's left (+y), box row 1 on the floor; labels [(content, column, row, dy, z)] on the front faces (dy:
+    lateral offset from the box centre, z absolute). The robot reference pose at the origin with yaw yaw_deg."""
+    boxes, bcs = [], []
+    for c in range(1, cols + 1):
+        for r in range(1, rows + 1):
+            boxes.append({"id": f"C{c}R{r}", "size": [0.4, 0.2, 0.25], "pos": [1.5, 0.1 * (cols - 1) - 0.2 * (c - 1),
+                                                                                 0.25 * r - 0.125],
+                          "quat_wxyz": [1.0, 0.0, 0.0, 0.0], "distractor": False})
+    for content, c, r, dy, z in labels:
+        bcs.append({"content": content, "center": [1.2985, 0.1 * (cols - 1) - 0.2 * (c - 1) + dy, z],
+                    "normal": [-1.0, 0.0, 0.0], "up": [0.0, 0.0, 1.0], "size": [0.06, 0.03], "pattern_size": [0.05, 0.02],
+                    "box_id": f"C{c}R{r}", "distractor": False})
+    a = math.radians(yaw_deg)
+    T = np.eye(4)
+    T[:3, :3] = [[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]]
+    T[:3, 3] = [0.03, -0.02, 0.78]
+    gt = {"barcodes": bcs, "boxes": boxes, "robot_init": {"pos": [0.0, 0.0, 0.0], "yaw": 0.0}, "target_face": None}
+    return gt, {"task1_end": {"t_sim": 5.0, "actual": {"T_world_root": T}}}, sorted({b["box_id"] for b in bcs})
+
+
+def _gt_order(gt, stages, target, rule, unit):
+    return evaluator.evaluate(3, gt, {}, {"scan_plan": [], "scanned": []}, stages=stages, scan_log=[],
+                              target_boxes=target, order_rule=rule, order_unit=unit)["gt_order"]
+
+
+def test_box_unit_orders_labels_at_different_heights_by_their_boxes():
+    """Labels anywhere on their box faces: in the top box row the C1 label sits low (0.80) and the C2 label high
+    (0.95), so the label rows split the box row (label rule "rows": C2 first). Order unit "box" orders by the boxes:
+    C1 before C2 in each box row; serpentine reverses the second box row; columns go box column by box column."""
+    gt, stages, target = _lattice_gt([("a", 1, 2, 0.0, 0.80), ("b", 2, 2, 0.0, 0.95),
+                                      ("c", 1, 1, 0.0, 0.20), ("d", 2, 1, 0.0, 0.05)])
+    assert _gt_order(gt, stages, target, "rows", "label") == ["b", "a", "c", "d"]
+    assert _gt_order(gt, stages, target, "rows", "box") == ["a", "b", "c", "d"]
+    assert _gt_order(gt, stages, target, "serpentine", "label") == ["b", "a", "c", "d"]   # rows b | a | c | d
+    assert _gt_order(gt, stages, target, "serpentine", "box") == ["a", "b", "d", "c"]
+    assert _gt_order(gt, stages, target, "columns", "box") == ["a", "c", "b", "d"]
+
+
+def test_box_unit_labels_inside_one_box_follow_the_label_rule_and_the_row_direction():
+    """Two labels side by side in one box (l left of r): rule "rows" reads them left to right; in a serpentine row that
+    runs right to left (the second box row) they are read right to left, with the row."""
+    gt, stages, target = _lattice_gt([("t1", 1, 2, 0.0, 0.9), ("t2", 2, 2, 0.0, 0.9),
+                                      ("l", 1, 1, 0.045, 0.2), ("r", 1, 1, -0.045, 0.2), ("u", 2, 1, 0.0, 0.2)])
+    assert _gt_order(gt, stages, target, "rows", "box") == ["t1", "t2", "l", "r", "u"]
+    assert _gt_order(gt, stages, target, "serpentine", "box") == ["t1", "t2", "u", "r", "l"]
+
+
+def test_box_unit_groups_touching_boxes_by_centre_containment_in_a_yawed_frame():
+    """Adjacent boxes touch exactly; in a yawed reference frame (and with the root's small offset) the transformed
+    extents of touching boxes may overlap by float noise, which would chain rows under strict extent overlap. Centre
+    containment groups the 3 x 3 wall into its rows and columns at any small yaw."""
+    from g1agent.eval import scan_order as ev
+    labels = [(f"C{c}R{r}", c, r, 0.0, 0.25 * r - 0.03) for c in (1, 2, 3) for r in (1, 2, 3)]
+    for yaw in (0.0, 0.7, -2.3, 5.0):
+        gt, stages, target = _lattice_gt(labels, yaw, cols=3, rows=3)
+        assert _gt_order(gt, stages, target, "rows", "box") == [f"C{c}R{r}" for r in (3, 2, 1) for c in (1, 2, 3)]
+        assert _gt_order(gt, stages, target, "serpentine", "box") == \
+            ["C1R3", "C2R3", "C3R3", "C3R2", "C2R2", "C1R2", "C1R1", "C2R1", "C3R1"]
+        assert _gt_order(gt, stages, target, "columns", "box") == [f"C{c}R{r}" for c in (1, 2, 3) for r in (3, 2, 1)]
+    # the grouping rule itself: extents overlapping by 1e-12 are chained by strict overlap, not by centre containment
+    items = [{"key": "top", "z_lo": 0.25 - 1e-12, "z_hi": 0.5, "z": 0.375}, {"key": "low", "z_lo": 0.0, "z_hi": 0.25, "z": 0.125}]
+    assert len(ev._overlap_groups(items, "z_lo", "z_hi")) == 1
+    assert [[it["key"] for it in g] for g in ev._containment_groups(items, "z_lo", "z_hi", "z")] == [["top"], ["low"]]
+    assert np.allclose(ev.yaw_only(stages["task1_end"]["actual"]["T_world_root"])[:3, 2], [0, 0, 1])
+
+
+def test_box_unit_rejects_labels_on_two_faces_and_several_labelled_sides():
+    gt, stages, target = _lattice_gt([("a", 1, 1, 0.0, 0.2)])
+    gt["barcodes"].append(dict(gt["barcodes"][0], content="side", center=[1.5, 0.2985, 0.2], normal=[0.0, 1.0, 0.0]))
+    with pytest.raises(ValueError, match="two faces"):
+        _gt_order(gt, stages, target, "rows", "box")
+    g4, ws4, st4 = _ep4()
+    with pytest.raises(ValueError, match="several labelled faces"):
+        evaluator.evaluate(3, g4, _actual(1.0), ws4, stages=st4, scan_log=[], order_unit="box")
+
+
+def test_no_label_entries_are_reported_and_never_excuse_a_gt_label():
+    """A plan entry recorded no_label (the layout path: the whole box face was seen and held no label) is listed in
+    reported_no_label; when that box has a GT label, the label is unread and success fails on the scan count. Without a
+    no_label entry the key is absent (outputs of other scenarios unchanged)."""
+    gt, stages, target = _lattice_gt([("a", 1, 2, 0.0, 0.9), ("b", 2, 2, 0.0, 0.9)])
+    by = {b["content"]: b for b in gt["barcodes"]}
+
+    def read(c, t):
+        b = by[c]
+        d = evaluator.gt_standoff(b["pattern_size"], evaluator.scanner_hfov_gt())
+        return {"t_sim": t, "content": c, "decoded": [c], "gt": {"hit": None},
+                "T_world_tip": _tip(np.asarray(b["center"]) + d * np.asarray(b["normal"]))}
+    plan = [{"id": "bc0", "box_id": "layout_c1_r1", "status": "scanned", "cell": {"column": 1, "row": 1},
+             "center_odom": [1.3, 0.1, 0.9], "fail_reason": None},
+            {"id": "bc1", "box_id": "layout_c2_r1", "status": "no_label", "cell": {"column": 2, "row": 1},
+             "center_odom": [1.3, -0.1, 0.875], "fail_reason": "no label centre in the face"}]
+    ws = {"scan_plan": plan, "scanned": [{"content": "a"}]}
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[read("a", 1)], target_boxes=target,
+                           order_rule="serpentine", order_unit="box")
+    assert m["reported_no_label"] == [{"id": "bc1", "box_id": "layout_c2_r1", "cell": {"column": 2, "row": 1},
+                                       "center_odom": [1.3, -0.1, 0.875], "reason": "no label centre in the face"}]
+    assert not m["success"] and "scanned 1/2" in m["failure"] and m["plan_status"] == {"no_label": 1, "scanned": 1}
+    ws = {"scan_plan": [dict(plan[0]), dict(plan[1], status="scanned")], "scanned": [{"content": "a"}, {"content": "b"}]}
+    m = evaluator.evaluate(3, gt, {}, ws, stages=stages, scan_log=[read("a", 1), read("b", 2)], target_boxes=target,
+                           order_rule="serpentine", order_unit="box")
+    assert "reported_no_label" not in m and m["success"], m.get("failure")

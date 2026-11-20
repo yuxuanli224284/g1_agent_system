@@ -1356,3 +1356,102 @@ def test_grid_evidence_bounds_the_floor_in_the_planning_frame():
     assert len(faces) == 1 and (faces[0]["z_lo"], faces[0]["z_hi"]) == pytest.approx((0.0, 0.25))
     assert faces[0]["seen"] == {"top": True}
     assert tb._grid_evidence(1, np.eye(4))[3] is None               # no face of that side: no bound
+
+
+# ------------------------------------------------------------------ wall-layout branch (g1v2-scanroom-layout): shared code
+def test_rectified_detection_reports_its_bar_direction_in_source_pixels(monkeypatch):
+    """_labels_on_rectified_face: rec is a detection in the SOURCE image, so is its bar direction (the detector's is in
+    rectified pixels; refine_with_wrist maps rec["bar_dir"] through the source camera). Here the bars run along the
+    rectified x axis = the face's lateral axis, which the head camera (looking along +x) images along its own x."""
+    tb = bare_toolbox(FakeRobot())
+    h = _head_frame()
+    face = _face(0.0, 0.4, x=1.5)
+
+    def fake_dino(rgb, roi, det):
+        Wr = rgb.shape[1]
+        s_ = Wr / 0.4
+        q = np.array([[10, 10], [10 + 0.1 * s_, 10], [10 + 0.1 * s_, 10 + 0.05 * s_], [10, 10 + 0.05 * s_]], float)
+        return [{"kind": "label", "corners": q, "center": q.mean(axis=0), "score": 0.6, "bar_dir": np.array([0.0, 1.0]),
+                 "label_corners": q, "label_center": q.mean(axis=0), "symbol_corners": None, "refined_by_cv2": False}]
+
+    monkeypatch.setattr(tbmod, "detect_label_dino", fake_dino)
+    tb.det = None
+    (rec, est), = tb._labels_on_rectified_face(h, face)
+    assert abs(est["bar_dir"][2]) == pytest.approx(1.0, abs=1e-6)          # vertical bars on the face
+    T = np.linalg.inv(h["T_odom_root"] @ h["T_root_cam"])
+    uv, _ = geo.project(h["K"], T, np.array([est["center"], est["center"] + 0.01 * est["bar_dir"]]))
+    d = (uv[1] - uv[0]) / np.linalg.norm(uv[1] - uv[0])
+    assert np.asarray(rec["bar_dir"]) == pytest.approx(d, abs=1e-3)       # the projected direction, not (0, 1) blindly
+
+
+def test_move_arm_through_reach_and_signed_roll_only_for_look_targets():
+    """move_arm's IK + correction loop is _reach (search_cell uses it for the look pose): the same calls as before for a
+    label target (no roll_signed keyword), roll_signed=True for a look target; a cell entry refuses pre / final."""
+    tb = bare_toolbox(FakeRobot(), task=2)
+    tb.side = "left"
+    tb._odom = lambda: np.eye(4)
+    tb._q = lambda: None
+    tb.robot.set_arm_joints = lambda side, q, dur: {"status": "ok"}
+    tb.robot.stand = lambda s: {"status": "ok"}
+    calls = []
+
+    class IK:
+        def solve(self, q, p, d, roll_axis=None, **kw):
+            calls.append(kw)
+            return {"ok": True, "q_arm": np.zeros(7)}
+    tb.ik = IK()
+    T = np.eye(4)
+    T[:3, 3] = [0.6, 0.0, 1.0]
+    tb.kin = type("K", (), {"pose": lambda self, q, frame: T})()
+    tb._roll_in_root = lambda t: None
+    tb.ws.wrist_target = {"pos": [0.6, 0.0, 1.0], "forward": [1.0, 0.0, 0.0], "offset": 0.2, "barcode_id": "bc0"}
+    assert tb.move_arm("final")["status"] == "ok" and calls == [{}]
+    r = tb._reach(dict(tb.ws.wrist_target, purpose="look", roll_signed=True), 0.2, "left")
+    assert not r["ik_fail"] and calls[-1] == {"roll_signed": True}
+    tb.wall_layout = {"columns": 6, "rows": 5, "box_w": 0.2, "box_h": 0.25, "base": "floor"}
+    plan_of(tb, 1)
+    tb.ws.current_barcode_id = "bc0"
+    tb.ws.barcodes["bc0"].kind = "cell"
+    for pose in ("pre", "final"):
+        assert "call search_cell" in tb.move_arm(pose)["reason"]
+
+
+def test_stance_eval_without_pre_pose_and_with_a_signed_roll():
+    """stance_eval.eval_candidate: pre_dists [] (a look pose, approached from home) gives gap 0 with no extra solve; a
+    target with roll_signed solves its roll with the sign; other targets call the IK as before."""
+    from g1agent.tools import stance_eval as SE
+    seen = []
+
+    class IK:
+        frame, vi = "tip", np.arange(7)
+
+        def solve(self, q, p, d, stall, roll, rng=None, **kw):
+            seen.append(kw)
+            return {"ok": True, "limit_margin_min": 0.1, "q_full": None}
+
+    class Kin:
+        def jacobian(self, q, frame):
+            return np.eye(6, 7)
+    t = {"pos": [0.5, 0, 1.0], "forward": [1.0, 0, 0], "offset": 0.3, "long_axis": [0, 1.0, 0], "roll_signed": True}
+    job = {"Tc": np.eye(4), "q_lv": None, "t": t, "finals": [0.3], "pre_dists": [], "stall": None, "seed": [0, 0, 0]}
+    r = SE.eval_candidate(Kin(), IK(), None, None, job)
+    assert r["status"] == "ok" and r["gap"] == 0.0 and len(r["sols"]) == 1 and seen == [{"roll_signed": True}]
+    seen.clear()
+    t2 = {k: v for k, v in t.items() if k != "roll_signed"}
+    r = SE.eval_candidate(Kin(), IK(), None, None, dict(job, t=t2, pre_dists=[0.4]))
+    assert r["gap"] == pytest.approx(0.1) and seen == [{}, {}]
+
+
+def test_plan_stance_width_upper_bound_includes_the_hand_label_width():
+    """plan_stance's required final distances: a head or a hand-label width (an upper bound of the symbol) plans the
+    clamp min_m and the pre-pose range; only a wrist-measured width plans the stand-off itself."""
+    import inspect
+    src = inspect.getsource(tbmod.Toolbox._plan_stance)
+    assert 'bc.width_source != "wrist"' in src and 'bc.width_source == "head"' not in src
+
+
+def test_harness_registry_layout_tools_leave_the_task_lists_unchanged():
+    from g1agent.harness.registry import LAYOUT_ONLY, TASK2_TOOLS, TOOLS
+    assert LAYOUT_ONLY == ["search_cell"] and "search_cell" in TOOLS
+    assert TASK_TOOLS[3] == [n for n in TOOLS if n != "search_cell"] and "search_cell" not in TASK2_TOOLS
+    assert "no_label" in __import__("g1agent.harness.world_state", fromlist=["x"]).BARCODE_STATUSES

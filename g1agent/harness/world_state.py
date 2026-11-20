@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-BARCODE_STATUSES = ("pending", "scanned", "duplicate", "failed", "unreachable", "unreadable", "not_targeted")
+BARCODE_STATUSES = ("pending", "scanned", "duplicate", "failed", "unreachable", "unreadable", "not_targeted", "no_label")
 
 
 @dataclass
@@ -45,7 +45,8 @@ class BarcodeEstimate:
                                     # face plane), never replaced by a wrist symbol width; the extent every same-label
                                     # test and the wrist consistency gate use (corners_odom is that box)
     detection: dict | None = None   # head detection diagnostics (kind, refined_by_cv2, score, label / symbol corners px)
-    width_source: str = "head"      # head | wrist
+    width_source: str = "head"      # head | wrist | hand_label (wall layout: the hand-camera label box, an upper bound
+                                    # of the symbol like the head width)
     width_support: int = 0          # wrist width: number of decoded outlines (image rotations) it is the median of
     status: str = "pending"         # pending | scanned | duplicate | failed | unreachable
     fail_reason: str | None = None  # why it was not scanned (e.g. unreachable: label height vs the reachable range)
@@ -55,6 +56,12 @@ class BarcodeEstimate:
     order_index: int | None = None  # position in the scan plan
     face_id: int = 0                # stack face it lies on: 0 front, 1 right, 2 back, 3 left (StackModel tour order)
     grid_cell: dict | None = None   # target grid cell {"column", "row"} (1-based from the spec's edges; None = outside)
+    kind: str = "label"             # label | cell (wall layout: one requested box whose label is not found yet; its centre
+                                    # / face / corners are the box face, search_cell turns it into a label entry)
+    wall: dict | None = None        # wall layout: the entry's geometry in the WALL frame (WorldState.wall): {"cell": [c, r]
+                                    # (layout indices: column from the left, row from the bottom), "center", "normal",
+                                    # "corners" (4x3 or None), "bar_dir" (or None), "left_to_right"}; the odom fields
+                                    # above are re-expressed from it after every wall (re-)registration
 
 
 @dataclass
@@ -77,6 +84,10 @@ class WorldState:
                                              #  "visited": [fid], "multi_face": bool}; None before the first plan
     current_barcode_id: str | None = None
     scanned: list = field(default_factory=list)     # [{"content", "barcode_id", "order_index", "t"}], first read only
+    wall: dict | None = None                 # wall layout (Toolbox.set_wall_layout): the registered wall frame
+                                             #  {"T_odom_wall" (x = right along the wall, y = into the wall, z = up; origin
+                                             #  = bottom-left corner of the front face as seen by the robot), "W", "H",
+                                             #  "columns", "rows", "box_w", "box_h", "delta_lat", "registration", "history"}
     target_grid: dict | None = None          # with a target spec: {"targets" (scan_order.parse_targets), "edges_seen":
                                              #  [{"face_id", "edge", "pts" (odom), "clear"}], "face_centres":
                                              #  [{"face_id", "center" (odom)}], "fitted_faces": [{"face_id", "face":
@@ -108,6 +119,8 @@ class WorldState:
                         "width_m": None if b.width_m is None else round(float(b.width_m), 4),
                         "width_source": b.width_source, "status": b.status, "fail_reason": b.fail_reason,
                         "content": b.content, "face_id": int(b.face_id), "cell": b.grid_cell})
+            if b.kind != "label":                    # only wall-layout entries carry it: other exports are unchanged
+                out[-1]["kind"] = b.kind
         return out
 
     def summary(self) -> dict:
