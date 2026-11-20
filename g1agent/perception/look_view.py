@@ -24,18 +24,23 @@ import math
 import numpy as np
 
 
-def roll_rotation(k_deg: float, img_x_in_tip) -> np.ndarray:
-    """Rotation (plane frame) of the scanner-tip frame looking along -normal with its image x axis along L_k (the
-    ArmIK.roll_target construction with the sign kept)."""
-    k = math.radians(k_deg)
-    d = np.array([0.0, 0.0, -1.0])
-    L = np.array([math.cos(k), math.sin(k), 0.0])
+def tip_rotation(d, L, img_x_in_tip) -> np.ndarray:
+    """Rotation of the scanner-tip frame whose scan axis (tip x) points along the unit vector d and whose image x axis
+    points along the unit vector L (orthogonal to d), in the frame d and L are given in (the ArmIK.roll_target
+    construction with the sign kept)."""
+    d, L = np.asarray(d, float), np.asarray(L, float)
     c = np.asarray(img_x_in_tip, float)
     c = c / np.linalg.norm(c)
     ex = np.array([1.0, 0.0, 0.0])
     if abs(float(c @ ex)) > 1e-9:
         raise ValueError("the scanner image x axis must be orthogonal to the scan axis")
     return np.column_stack([d, L, np.cross(d, L)]) @ np.column_stack([ex, c, np.cross(ex, c)]).T
+
+
+def roll_rotation(k_deg: float, img_x_in_tip) -> np.ndarray:
+    """Rotation (plane frame) of the scanner-tip frame looking along -normal with its image x axis along L_k."""
+    k = math.radians(k_deg)
+    return tip_rotation(np.array([0.0, 0.0, -1.0]), np.array([math.cos(k), math.sin(k), 0.0]), img_x_in_tip)
 
 
 def roll_axis(k_deg: float, right, up) -> np.ndarray:
@@ -124,6 +129,13 @@ class HandView:
             inside = np.all(cr >= 0, axis=1) | np.all(cr <= 0, axis=1)   # n x M
             ok[ii] = ~inside.any(axis=1)
         return ok
+
+    def covers(self, T_cam, corners) -> bool:
+        """The quadrilateral `corners` (4 x 3, in order around it) is covered (see covered) from the camera pose T_cam
+        (4 x 4, the optical frame in the frame the corners are given in)."""
+        T = np.asarray(T_cam, float)
+        uv, z = self.project((np.asarray(corners, float) - T[:3, 3]) @ T[:3, :3])
+        return bool(self.covered(uv[None], z[None])[0])
 
     def whole(self, uv, z, px: float = 1.0) -> bool:
         """A detected quadrilateral (4 x 2 corners around it, depths z) is seen whole: the quad grown by px pixels on

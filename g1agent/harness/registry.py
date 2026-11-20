@@ -75,8 +75,10 @@ PLAN_SCANS_LAYOUT_BODY = ("register the wall seen from here to the given layout 
 SEARCH_CELL_TEXT = ("Task 3 with a wall layout: for the current box (an entry of kind cell), stand at the planned stance "
                     "with the arm home, then: re-register the wall from the head, move the hand camera (D405) to the view "
                     "of the whole box face, find the label inside that face and make the entry that label (its wrist "
-                    "target is computed); a second label in the same box is added as the next entry. Records no_label "
-                    "when the whole face was seen and holds none.")
+                    "target is computed); a second label in the same box is added as the next entry. When the "
+                    "label's scan pose is not reachable from this stance the reply says so: the label then gets its own "
+                    "scan stance (compute_wrist_target -> plan_stance -> approach -> move_arm('pre') ...). Records "
+                    "no_label when the whole face was seen and holds none.")
 
 TOOLS = {
     "look_head": (NoArgs, "Capture the head camera image (attached to the reply) and a short state summary."),

@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from g1agent.common import config
-from g1agent.common.transforms import apply, inv_T
+from g1agent.common.transforms import T_from_xy_yaw, apply, inv_T
 from g1agent.harness.guards import Harness
 from g1agent.harness.registry import LAYOUT_ONLY, TASK_TOOLS, openai_tools, task_tools
 from g1agent.harness.world_state import BarcodeEstimate
@@ -426,15 +426,17 @@ def cv2_erode(mask, k):
 class Cam:
     """Fake hand camera + detector for search_cell: the hand camera sits exactly where the tip target puts it (FK of the
     look pose, plus an optional error), the detector returns every label of `labels` (wall-frame rectangles [x0, x1,
-    z0, z1]) clipped to the crop it is given (a label crossing the crop border is seen only in part, as a real crop)."""
+    z0, z1]) clipped to the crop it is given (a label crossing the crop border is seen only in part, as a real crop).
+    scan_here: the result of the scan-pose test at the look stance (_scan_pose_from_here, tested on its own)."""
 
-    def __init__(self, tb, labels, err=None):
+    def __init__(self, tb, labels, err=None, scan_here=True):
         self.tb, self.labels, self.err = tb, [list(map(float, l)) for l in labels], err
-        self.reached, self.crops, self.homes = [], [], 0
+        self.reached, self.crops, self.homes, self.aims = [], [], 0, []
         tb._reach = self.reach
         tb._capture_wrist = self.capture
         tb._labels_on_rectified_face = self.detect
         tb._reregister_at_stance = lambda: {"refit": False, "note": "test"}
+        tb._scan_pose_from_here = lambda t: {"ok": scan_here, "status": "ok" if scan_here else "ik"}
         tb.move_arm = self.home
 
     def home(self, pose="pre", side=None):
@@ -443,8 +445,9 @@ class Cam:
         self.tb.arm_at_home = True
         return tbmod.ok({"pose": "home"})
 
-    def reach(self, t, off, side):
+    def reach(self, t, off, side, aim=None):
         self.reached.append(dict(t))
+        self.aims.append(aim)
         self.tb.arm_at_home = False
         return {"ik_fail": False, "history": [{"pos_err_m": 0.0, "angle_err_deg": 0.0}]}
 
@@ -478,7 +481,7 @@ class Cam:
         return out
 
 
-def search_setup(labels, order="rows", delta=0.0, err=None):
+def search_setup(labels, order="rows", delta=0.0, err=None, scan_here=True):
     """A planned layout toolbox at the first box (C1 R4 for rows), its look stance reached, arm home, a fake camera."""
     tb = kin_toolbox(order=order)
     _planned(tb)
@@ -491,7 +494,7 @@ def search_setup(labels, order="rows", delta=0.0, err=None):
     tb.ws.stance_target = st
     tb._stance_reached = st
     tb.arm_at_home = True
-    return tb, bc, Cam(tb, labels, err)
+    return tb, bc, Cam(tb, labels, err, scan_here)
 
 
 def cell_x(c):          # wall-frame x extent of column c (box_w 0.20)
@@ -727,7 +730,9 @@ def test_harness_success_counts_no_label_as_handled():
 # ------------------------------------------------------------------ 11. rule path
 class LayoutRuleTB(ScriptedTB):
     """ScriptedTB with a wall layout: plan_scans plans cell entries; search_cell per barcode from `outcomes`
-    ("label" | "no_label" | "partial"); move_arm('final') fails as IK the first `final_ik_fails` times."""
+    ("label" | "label_far" (found, its scan pose not reachable from the look stance) | "no_label" | "partial" | "ik"
+    (the look pose not reachable from the stance), or a list of them consumed one per search); move_arm('final') fails
+    as IK the first `final_ik_fails` times."""
 
     def __init__(self, robot, outcomes, final_ik_fails=0):
         super().__init__(robot, plan_n=len(outcomes))
@@ -758,12 +763,20 @@ class LayoutRuleTB(ScriptedTB):
         bc = self._current()
         self.calls.append(("search_cell", bc.id))
         o = self.outcomes[bc.id]
-        if o == "label":
+        if isinstance(o, list):
+            o = o.pop(0)
+        if o in ("label", "label_far"):
             bc.kind = "label"
-            return tbmod.ok({"barcode_id": bc.id, "converted": True, "added": []})
+            self.arm_at_home = False                      # the search leaves the arm at the look pose
+            if o == "label_far":
+                self.ws.stance_target = None
+            return tbmod.ok({"barcode_id": bc.id, "converted": True, "added": [], "scan_from_this_stance": o == "label"})
         if o == "no_label":
             bc.status = "no_label"
             return tbmod.ok({"barcode_id": bc.id, "barcode_status": "no_label"})
+        if o == "ik":
+            return tbmod.fail("hand-camera view not reachable from this stance: move_arm('home'), compute_wrist_target, "
+                              "plan_stance, approach", {"barcode_id": bc.id, "ik": "IK: target not reachable"})
         return tbmod.partial("the box face was not fully in the hand-camera view", {"barcode_id": bc.id})
 
     def move_arm(self, pose="pre", side=None):
@@ -923,3 +936,221 @@ def test_walking_tools_refuse_while_the_arm_is_raised():
     g = tb._walk_guard()
     assert g is not None and g["status"] == "fail" and "move_arm('home')" in g["reason"]
     assert tb._stance_reached is reached                         # a refused walk keeps the reached stance
+
+
+# ------------------------------------------------------------------ 2026-11-19 layout rule run: look-pose aim, scan stance
+def _sagging_arm(tb, sag_deg, joint="wrist_pitch"):
+    """The arm of a fake robot reaches every command with a steady joint offset (a PD / gravity sag of one joint: an
+    orientation error that does not change between nearby commands)."""
+    from g1agent.kinematics.ik import ARM
+    q0 = tb.kin.q_from_state([], [])
+    sag = np.zeros(len(ARM))
+    sag[ARM.index(joint)] = math.radians(sag_deg)
+    cur = {"q": q0.copy()}
+
+    def set_arm(side, q_arm, dur):
+        q = q0.copy()
+        q[tb.ik.qi] = np.asarray(q_arm, float) + sag
+        cur["q"] = q
+        return {"status": "ok"}
+    tb.robot.set_arm_joints = set_arm
+    tb.robot.stand = lambda s: {"status": "ok"}
+    tb._q = lambda: cur["q"].copy()
+    return cur, q0
+
+
+def _look_setup():
+    """The look stance plan_stance chooses for C1 R4 from (0.5, 0) (stance grid: face_dist 0.70, lateral -0.15, roll 270),
+    its look target and the aim of its face view (_look_view): the rectangle planned (grown by delta_lat and e) and the
+    one that has to be seen (grown by delta_lat)."""
+    tb = kin_toolbox()
+    _planned(tb)
+    z = float(tb._lean_levels()[0]["pelvis_z"])
+    tb.next_barcode()
+    bc = tb._current()
+    Tr = T_from_xy_yaw(0.6, 0.35, 0.0, z)
+    tb._odom = lambda: Tr
+    t = tb._look_target(bc)
+    alt = next(a for a in t["alternatives"] if a["roll_deg"] == 270.0)
+    ta = dict(t, pos=alt["pos"], long_axis=alt["long_axis"])
+    dl, e = tb._search_grow()
+    c, r = bc.wall["cell"]
+    aim = {"corners": tb._rect_face(*tb._cell_rect(c, r, dl + e, e))["corners"],
+           "see": tb._rect_face(*tb._cell_rect(c, r, dl, 0.0))["corners"]}
+    return tb, ta, aim, e
+
+
+@pytest.mark.parametrize("joint, sag_deg, tip_loop_covers", [("wrist_pitch", 6.0, False), ("wrist_roll", 5.0, False),
+                                                             ("shoulder_pitch", -5.0, True)])
+def test_look_pose_closed_loop_corrects_the_full_tip_pose_under_a_steady_sag(joint, sag_deg, tip_loop_covers):
+    """2026-11-19 scan room (rule run, cells C3R4 / C4R4): the look pose reached with the tip 8 mm off (below
+    correction_tol, the tip loop stopped) and the scan axis 4.8 deg off left the face uncovered. A fake arm with a
+    steady joint sag: the tip loop (a label target's loop, unchanged) leaves the face uncovered for a wrist-pitch tilt
+    and a roll; the look loop corrects the full tip pose (orientation pre-compensated as the position is) and covers it
+    within the correction budget, without leaving IK reach, also where a camera translation alone needed a step out of
+    reach (shoulder_pitch -5 deg: 6 cm, reverted, uncovered) or could not undo the roll."""
+    tb, ta, aim, e = _look_setup()
+    off = float(ta["offset"])
+    cur, q0 = _sagging_arm(tb, sag_deg, joint)
+    tip = tb._reach(ta, off, tb.side)
+    assert set(tip["history"][-1]) == {"pos_err_m", "angle_err_deg"}
+    assert tb._view_error(ta, off, aim["see"])["covered"] is tip_loop_covers
+    cur["q"] = q0.copy()
+    r = tb._reach(ta, off, tb.side, aim=aim)
+    h = r["history"]
+    A = tb.cfg["robot"]["arm_motion"]
+    assert not r["ik_fail"] and not any(x.get("reverted_to_best") for x in h) and len(h) <= 1 + A["correction_iters"]
+    assert h[0]["view_err_m"] > e and not h[0]["planned_covered"]
+    assert h[-1]["planned_covered"] or h[-1]["view_err_m"] < e
+    assert tb._view_error(ta, off, aim["see"])["covered"]
+    if joint == "wrist_roll":
+        assert h[0]["roll_err_deg"] > 4.0 and h[-1]["roll_err_deg"] < 1.0
+    # no sag: the planned pose itself, one command
+    _sagging_arm(tb, 0.0)
+    r0 = tb._reach(ta, off, tb.side, aim=aim)
+    assert len(r0["history"]) == 1 and r0["history"][0]["planned_covered"] and r0["history"][0]["view_err_m"] < 0.003
+
+
+def test_look_pose_first_command_is_held_to_its_view_not_to_the_ik_tolerance_of_a_scan_pose():
+    """2026-11-19 rule run: every squat look stance failed the first IK of its look pose by 4-7 mm / 0.7-1.4 deg (scan
+    pose tolerance 2 mm / 1 deg) and the box was lost. A look pose's IK attempt that did not converge is sent when its
+    view (FK of the solution) shows the rectangle that has to be seen; one whose view misses it is an IK failure, nothing
+    sent. A label target keeps the IK tolerance."""
+    tb, ta, aim, e = _look_setup()
+    off = float(ta["offset"])
+    cur, q0 = _sagging_arm(tb, 0.0)
+    real = tb.ik.solve
+    sent = []
+    set_arm = tb.robot.set_arm_joints
+    tb.robot.set_arm_joints = lambda side, q, dur: (sent.append(q), set_arm(side, q, dur))[1]
+    tb.ik.solve = lambda *a, **k: dict(real(*a, **k), ok=False)          # converged to ~2 mm, reported not ok
+    r = tb._reach(ta, off, tb.side, aim=aim)
+    assert not r["ik_fail"] and len(sent) == 1 and r["history"][0]["ik_unconverged"]["pos_err_m"] < 0.003
+    assert tb._view_error(ta, off, aim["see"])["covered"]
+    sent.clear()
+    cur["q"] = q0.copy()
+    assert tb._reach(ta, off, tb.side)["ik_fail"] and not sent                # the label loop: IK tolerance
+    tb.ik.solve = lambda *a, **k: dict(real(*a, **k), ok=False, q_full=q0.copy(), q_arm=q0[tb.ik.qi].copy())
+    r = tb._reach(ta, off, tb.side, aim=aim)                                   # an attempt that looks elsewhere
+    assert r["ik_fail"] and r["reason"].startswith("IK: target not reachable") and not sent
+
+
+def _label_target(pos, forward, offset):
+    """A label wrist target as compute_wrist_target makes it (vertical bars: the long axis horizontal on the face)."""
+    f = np.asarray(forward, float) / np.linalg.norm(forward)
+    L = np.cross(-f, [0.0, 0.0, 1.0])
+    return {"pos": np.asarray(pos, float), "forward": f, "offset": offset, "barcode_id": "bc0", "long_axis": L / np.linalg.norm(L)}
+
+
+def test_scan_pose_from_the_look_stance_is_the_stance_test_of_plan_stance():
+    """The logged look stances and label targets of the 2026-11-19 rule run (odometry, pelvis z of the upright level):
+    C1 R4 was scanned from its look stance, from the C3 R4 stance move_arm('final') ended 0.117 m off the scanner axis
+    (the label 0.47 m to the robot's left). The stance test of plan_stance (planning IK of the final pose) tells them
+    apart."""
+    tb = kin_toolbox()
+    tb.body_cmd = None                                     # no body model (collision geometry) in the CPU tests
+    z = 0.746
+    cases = [((0.576, 0.311, 0.032), ([1.006, 0.585, 0.982], [0.999, 0.049, 0.0], 0.266), True),
+             ((0.619, -0.275, 0.061), ([0.991, 0.17, 0.983], [0.998, 0.068, 0.0], 0.3), False)]
+    for (x, y, yaw), (pos, fwd, off), reachable in cases:
+        tb._odom = lambda x=x, y=y, yaw=yaw: T_from_xy_yaw(x, y, yaw, z)
+        r = tb._scan_pose_from_here(_label_target(pos, fwd, off))
+        assert r["ok"] is reachable and r["status"] == ("ok" if reachable else "ik")
+    assert tb.ik.cfg["restarts"] == config.apply_robot_variant(config.load_all(), "g1_v2")["robot"]["ik"]["restarts"]
+
+
+def test_search_cell_label_out_of_reach_of_the_look_stance_gets_its_own_scan_stance():
+    """The label found is not reachable from the look stance: the reply names the label path from plan_stance on, the
+    look stance is dropped (move_arm('final') refuses), and plan_stance plans a scan stance (pre-pose, scan stand-off)
+    for it although the look stance was recorded failed before (its key is the box's look, not the label's target)."""
+    x0, _ = cell_x(1)
+    tb, bc, cam = search_setup([[x0 + 0.01, x0 + 0.11, 0.957, 1.0]], scan_here=False)
+    tb._failed_stances.add((bc.id, ("look",), 0.7, -0.15, 0))      # an earlier partial search at a look stance
+    r = tb.search_cell()
+    assert r["status"] == "ok" and r["data"]["converted"] and r["data"]["scan_from_this_stance"] is False
+    assert "plan its scan stance" in r["reason"] and "move_arm('home'), compute_wrist_target -> plan_stance" in r["reason"]
+    assert "move_arm('pre')" in r["reason"] and tb.ws.stance_target is None and bc.kind == "label"
+    # the label path of the prompt and of rule mode: final -> refine -> final before the placement check
+    assert ("move_arm('final') -> refine_with_wrist -> move_arm('final') -> check_wrist_placement -> scan"
+            in r["reason"])
+    m = tbmod.Toolbox.move_arm(tb, "final")
+    assert m["status"] == "fail" and "no stance planned" in m["reason"]
+    assert tb.ws.wrist_target.get("purpose") is None
+    # the scan stance (planned from the look stance; standing level only, no body model in the CPU tests)
+    z = float(tb._lean_levels()[0]["pelvis_z"])
+    tb.body_cmd = None
+    tb.ik.cfg["plan_workers"] = 0
+    tb._odom = lambda: T_from_xy_yaw(0.6, 0.35, 0.0, z)
+    p = tb.plan_stance()
+    st = tb.ws.stance_target
+    assert p["status"] == "ok" and st.get("purpose") is None and st["target_pos"] != ["look"]
+    assert p["data"]["rejected"]["failed_placement"] == 0
+    # reachable from the look stance: the label is scanned from there
+    tb, bc, cam = search_setup([[x0 + 0.01, x0 + 0.11, 0.957, 1.0]], scan_here=True)
+    r = tb.search_cell()
+    assert r["data"]["scan_from_this_stance"] is True and r["reason"].startswith("label found in the box face; call move_arm")
+    assert tb.ws.stance_target is not None
+
+
+def test_search_cell_look_views_are_commanded_with_their_aim():
+    """Every look view (the face view and the view centred on a cut label) is reached with the aim of its own
+    rectangles: the one planned (the cell grown by delta_lat and e, the loop's stop) and the one to be seen (grown by
+    delta_lat, the first command's test)."""
+    x0, x1 = cell_x(1)
+    tb, bc, cam = search_setup([[x1 - 0.03, x1 + 0.07, 0.96, 0.99]])
+    tb.search_cell()
+    T = tb._wall_T()
+    _, e = tb._search_grow()
+    assert len(cam.aims) >= 2 and all(a is not None for a in cam.aims)
+    planned, see = apply(inv_T(T), cam.aims[0]["corners"]), apply(inv_T(T), cam.aims[0]["see"])
+    assert planned[:, 0].min() == pytest.approx(x0 - e) and planned[:, 0].max() == pytest.approx(x1 + e)
+    assert planned[:, 2].min() == pytest.approx(0.75 - e) and planned[:, 2].max() == pytest.approx(1.0 + e)
+    assert see[:, 0].min() == pytest.approx(x0) and see[:, 0].max() == pytest.approx(x1)
+    assert see[:, 2].min() == pytest.approx(0.75) and see[:, 2].max() == pytest.approx(1.0)
+    second = apply(inv_T(T), cam.aims[1]["see"])
+    assert second[:, 0].max() - second[:, 0].min() == pytest.approx(x1 - x0) and second[:, 0].min() > x0
+
+
+def test_rule_layout_search_retry_and_scan_stance_replan_are_separate():
+    """The 2026-11-19 rule run, C3 R4: a partial search, the search again from a new stance found the label, then
+    move_arm('final') failed (IK) at the look stance and the box was given up (one shared re-plan flag). Now the search
+    retry and the stance re-plan are separate; a label out of reach of the look stance goes to the label path."""
+    cfg = config.load_all()["task3"]
+    tb = LayoutRuleTB(FakeRobot({"bc0": [read("A")]}), {"bc0": ["partial", "label"]}, final_ik_fails=1)
+    h = _layout_harness(tb)
+    rule.Task3(h, cfg, "all").run()
+    assert [c[0] for c in tb.calls].count("search_cell") == 2
+    assert [c for c in tb.calls if c[0] == "plan_stance"] == [("plan_stance", "cell")] * 2 + [("plan_stance", "label")]
+    assert ("move_arm", "pre") in tb.calls and h.finished["success"] is True
+    for outcomes in (["label_far"], ["partial", "label_far"]):
+        tb = LayoutRuleTB(FakeRobot({"bc0": [read("A")]}), {"bc0": list(outcomes)})
+        h = _layout_harness(tb)
+        rule.Task3(h, cfg, "all").run()
+        tools = [r["tool"] for r in h.log.tools]
+        i = len(tools) - 1 - tools[::-1].index("search_cell")
+        # straight to the label path: arm home, then the label's own stance, pre-pose, refine, final
+        assert tools[i + 1:i + 7] == ["move_arm", "compute_wrist_target", "plan_stance", "approach", "move_arm",
+                                      "refine_with_wrist"]
+        k = tb.calls.index(("plan_stance", "label"))
+        assert tb.calls[k - 1] == ("compute_wrist_target", "bc0") and tb.calls[k + 1:k + 3] == [
+            ("approach", "stance_target"), ("move_arm", "pre")]
+        assert [c for c in tb.calls if c[0] == "plan_stance"] == [("plan_stance", "cell")] * len(outcomes) + [("plan_stance", "label")]
+        assert ("move_arm", "pre") in tb.calls and h.finished["success"] is True
+
+
+def test_rule_layout_searches_again_from_a_new_stance_when_the_look_pose_is_not_reachable():
+    """2026-11-19 rule run: search_cell failed with the look pose out of IK reach at every squat stance; the tool
+    recorded the stance as failed and said to re-plan, rule mode gave the box up. Now it re-plans and searches once
+    more, as after a partial search (one shared retry: a second failure ends the box)."""
+    cfg = config.load_all()["task3"]
+    tb = LayoutRuleTB(FakeRobot({"bc0": [read("A")]}), {"bc0": ["ik", "label"]})
+    h = _layout_harness(tb)
+    rule.Task3(h, cfg, "all").run()
+    assert [c for c in tb.calls if c[0] in ("search_cell", "plan_stance")] == [
+        ("plan_stance", "cell"), ("search_cell", "bc0"), ("plan_stance", "cell"), ("search_cell", "bc0")]
+    assert h.finished["success"] is True
+    for outcomes in (["ik", "ik"], ["partial", "ik"], ["ik", "partial"]):
+        tb = LayoutRuleTB(FakeRobot(), {"bc0": list(outcomes)})
+        h = _layout_harness(tb)
+        rule.Task3(h, cfg, "all").run()
+        assert [c[0] for c in tb.calls].count("search_cell") == 2 and h.finished["success"] is False

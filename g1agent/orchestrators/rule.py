@@ -178,10 +178,14 @@ class Task2:
             h.call("set_base_height", {})
 
     def place_and_scan(self, barcode_id: str | None = None, home_after: bool = False, _replanned: bool = False,
-                       before_stand_up=None) -> dict:
+                       before_stand_up=None, _searched_again: bool = False) -> dict:
         """Steps 4-9 for one barcode (default: the current one), then scan (one retry via refine_with_wrist +
         move_arm final on no read) and, with home_after, move the arm home and stand up. The arm goes home and the
         robot stands before any base move; after walking to a squat stance it squats (plan_stance base_height).
+        Wall layout: the search of a box (search_cell) is repeated once from a new stance after a partial search or
+        a look pose not reachable from the look stance (_searched_again), and a label found whose scan pose is not
+        reachable from the look stance gets its scan stance planned as any label entry; the stance re-plan of the label (_replanned: an IK failure of the pre / final
+        pose) is separate from both, once.
         Returns {"placed", "scanned", "summary"}."""
         h, c = self.h, self.cfg
         bid = {"barcode_id": barcode_id} if barcode_id else {}
@@ -221,22 +225,29 @@ class Task2:
             # wall layout, a box whose label is not found yet: the hand-camera search at the look stance; a found label
             # goes straight to the final pose from this stance (the search replaces the pre-pose and the first refine)
             r = h.call("search_cell", dict(bid))
-            if r["status"] == "fail":
+            if r["status"] == "fail" and "ik" not in (r.get("data") or {}):
                 return end(False, False, f"search_cell: {r['reason']}")
-            if r["status"] == "partial":
-                if not _replanned:
+            if r["status"] != "ok":
+                # partial, or the look pose not reachable from this stance (fail with data "ik"; the tool recorded the
+                # stance as failed): as the tool says, a new stance and the search once more
+                if not _searched_again:
                     self._stand_up()
-                    return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
+                    return self.place_and_scan(barcode_id, home_after, _replanned, before_stand_up, _searched_again=True)
                 return end(False, False, f"search_cell: {r['reason']}")
             if r["data"].get("barcode_status") == "no_label":
                 return end(False, False, "no label in the box")
+            if not r["data"]["scan_from_this_stance"]:
+                # the look stance serves the face search; the label found is out of reach from it: the entry is a label
+                # now, so the next pass is the label path (its scan stance with the pre-pose, refine, final)
+                self._stand_up()
+                return self.place_and_scan(barcode_id, home_after, _replanned, before_stand_up, _searched_again)
         if not searched:
             r = h.call("move_arm", {"pose": "pre"})
             if r["status"] == "fail":                 # partial: reached with a residual, the wrist camera still looks
                 if not _replanned and r["reason"].startswith("IK"):
                     # the pose became unreachable after the real walk / squat: stand up, plan again from here once
                     self._stand_up()
-                    return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
+                    return self.place_and_scan(barcode_id, home_after, True, before_stand_up, _searched_again)
                 return end(False, False, f"pre-pose: {r['reason']}")
             r = h.call("refine_with_wrist", dict(bid))
             if r["status"] == "ok":
@@ -258,7 +269,7 @@ class Task2:
                     # label); the measured stand-off is out of reach from it:
                     # stand up and plan the stance once more on the measured width
                     self._stand_up()
-                    return self.place_and_scan(barcode_id, home_after, _replanned=True, before_stand_up=before_stand_up)
+                    return self.place_and_scan(barcode_id, home_after, True, before_stand_up, _searched_again)
                 return end(False, False, f"final pose: {r['reason']}")
             if k == c["place"]["max_iters"]:
                 break

@@ -1815,16 +1815,18 @@ class Toolbox:
         return out
 
     def _look_view(self, t, see_w, crop_w) -> dict:
-        """Move the scanner tip to look target t (IK + closed-loop correction, _reach), capture the hand camera, test the
-        rectangle see_w (wall frame: the region the view has to show) for coverage from the pose reached and, when
-        covered, detect labels on the crop crop_w (see_w grown by the placement tolerance e the look pose was planned
-        with: a label of the box reaching the face edge stays clear of the crop border; what of it lies outside the
-        free view is caught by the cut test)."""
-        rr = self._reach(t, float(t["offset"]), self.side)
+        """Move the scanner tip to look target t (IK + closed-loop correction of the full tip pose, _reach with aim: it
+        stops once crop_w, the rectangle the look pose was planned to show, is covered from the pose reached), capture
+        the hand camera, test the rectangle see_w (wall frame: the region the view has to show) for coverage from the
+        pose reached and, when covered, detect labels on the crop crop_w (see_w grown by the placement tolerance e the
+        look pose was planned with: a label of the box reaching the face edge stays clear of the crop border; what of it
+        lies outside the free view is caught by the cut test)."""
+        C = self._rect_face(*see_w)["corners"]
+        rr = self._reach(t, float(t["offset"]), self.side, aim={"corners": self._rect_face(*crop_w)["corners"], "see": C})
         if rr["ik_fail"]:
             return {"ik_fail": True, "reason": rr["reason"]}
         w = self._capture_wrist()
-        cov = self._view_coverage(w, self._rect_face(*see_w)["corners"])
+        cov = self._view_coverage(w, C)
         dets = self._cell_detections(w, crop_w) if cov["covered"] else []
         return {"ik_fail": False, "covered": cov["covered"], "coverage": cov, "dets": dets, "frame": w,
                 "residual": rr["history"][-1] if rr["history"] else None, "see_w": list(see_w), "rect_w": list(crop_w)}
@@ -1832,8 +1834,8 @@ class Toolbox:
     def _search_round(self, bc, st) -> dict:
         """One search of the cell from the current registration: the look pose of the stance's alternative (its roll and
         in-plane offset, on the re-registered cell), coverage of the cell grown by delta_lat (the face that has to be
-        seen: the look pose was planned for it grown by e more on every side, so an arm placement error up to e =
-        correction_tol, what _reach accepts, keeps it covered) and detection on the cell grown by delta_lat + e, one
+        seen: the look pose was planned for it grown by e = correction_tol more on every side, the slack of the arm
+        placement; _reach corrects the pose until that grown rectangle is in view) and detection on the cell grown by delta_lat + e, one
         extra view (same roll and stand-off) centred on the visible part of each cut detection that overlaps the cell,
         then the assignment: uncut detections whose centre lies in the (ungrown) cell rectangle, duplicates across views
         merged (_same_face_label). outcome: found | none (covered, nothing assigned, nothing unresolved) | uncovered | cut
@@ -1910,14 +1912,18 @@ class Toolbox:
         """Wall-layout task: find the label of the current box (an entry of kind "cell") with the hand camera, at the
         stance plan_stance planned for its look pose (reached), arm home.
         1. Re-register the wall from the head (_reregister_at_stance).
-        2. Look pose of the stance's roll alternative on the re-registered cell; IK + closed loop (_reach).
+        2. Look pose of the stance's roll alternative on the re-registered cell; IK + closed loop on the full tip pose
+           until the face grown by delta_lat and e (the rectangle the pose was planned for) is in view (_reach with aim).
         3. Coverage from the pose reached (FK): the cell grown by delta_lat in the hand camera's free view (the look pose
            was planned for it grown by e = correction_tol more: the placement slack of the arm loop).
         4-6. Detection on the cell grown by delta_lat + e, cut detections, assignment (_search_round).
         Nothing found with the face covered: the arm goes home, the wall is re-registered once more and the cell
         searched again (user decision 2026-11-19); still nothing -> "no_label" (a result: the whole face was seen and
         holds no label centre). A label found: the entry becomes that label (kind label, width_source hand_label), further
-        labels of the box become new entries right after it, and its wrist target is computed. Not covered / a cut label
+        labels of the box become new entries right after it, and its wrist target is computed; the label is scanned from
+        this stance (move_arm('final')) only when its scan pose passes plan_stance's stance test here
+        (_scan_pose_from_here), otherwise the look stance is dropped and the label's scan stance is planned as for any
+        label entry (data scan_from_this_stance). Not covered / a cut label
         not resolved: partial (never no_label), the stance recorded as failed so that a re-plan picks another one."""
         if self.wall_layout is None or self.ws.wall is None:
             return fail("search_cell is for a task with a wall layout, after plan_scans registered the wall")
@@ -1978,13 +1984,26 @@ class Toolbox:
             tr = self.compute_wrist_target(bc.id)
             if tr["status"] != "ok":
                 return with_diagnostics(fail(f"label found, wrist target: {tr['reason']}", base), diag)
-            return with_diagnostics(ok(dict(base, converted=True, added=added,
-                                            label={"center_odom": bc.center, "label_width_m": bc.label_width_m,
-                                                   "cell": bc.grid_cell},
-                                            wrist_target_odom=tr["data"]["wrist_target_odom"], offset=tr["data"]["offset"]),
-                                       "label found in the box face; call move_arm('final')"
-                                       + (f" ({len(added)} more label(s) in this box added as the next entries)" if added else "")),
-                                    diag)
+            # the look stance was planned for the view of the whole face, not for a scan pose at the label (which may
+            # sit at a face corner; 2026-11-19 scan room: move_arm('final') from it 0.117 m off the scanner axis, and
+            # one not reachable at all): the label is scanned from here only when this stance passes plan_stance's
+            # test for its scan pose; otherwise its scan stance is planned as for any label entry
+            here = self._scan_pose_from_here(self.ws.wrist_target)
+            diag["scan_pose_from_here"] = here
+            more = f" ({len(added)} more label(s) in this box added as the next entries)" if added else ""
+            data = dict(base, converted=True, added=added,
+                        label={"center_odom": bc.center, "label_width_m": bc.label_width_m, "cell": bc.grid_cell},
+                        wrist_target_odom=tr["data"]["wrist_target_odom"], offset=tr["data"]["offset"],
+                        scan_from_this_stance=here["ok"])
+            if here["ok"]:
+                return with_diagnostics(ok(data, "label found in the box face; call move_arm('final')" + more), diag)
+            self.ws.stance_target = None              # the look stance is no stance for the label's scan poses
+            return with_diagnostics(ok(data, "label found in the box face, but its scan pose is not reachable from this "
+                                             "stance (planned for the view of the whole face): plan its scan stance: "
+                                             "move_arm('home'), compute_wrist_target -> plan_stance -> approach -> "
+                                             "move_arm('pre') -> refine_with_wrist -> move_arm('final') -> "
+                                             "refine_with_wrist -> move_arm('final') -> check_wrist_placement -> scan"
+                                             + more), diag)
         if last["outcome"] == "none":
             dl, _ = self._search_grow()
             bc.status = "no_label"
@@ -2864,7 +2883,6 @@ class Toolbox:
         # only the current height for a walker without a body command. The first (highest) level with a feasible
         # stance wins: squatting costs time and balance margin.
         levels = body.levels if body is not None else [None]
-        margin = self.cfg["robot"]["body"]["clearance_margin_m"]
         R_yaw = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
         rejected = {"reach": 0, "ik": 0, "face_clearance": 0, "self_clearance": 0, "not_robust": 0, "failed_placement": 0}
         best, chosen, chosen_li, fallback, cands = None, None, None, None, []
@@ -2939,13 +2957,9 @@ class Toolbox:
                     cost, p, pw, d, l, m, travel, _, gap, Tc, q_lv, sols, man, ta, ai = cand
                     clear = None
                     if body is not None:
-                        fc = min(body.face_clearance(s_["q_full"], Tc, obstacles, poly) for s_ in sols)
-                        if fc < margin:
-                            rejected["face_clearance"] += 1
-                            continue
-                        sc = min(body.self_clearance(s_["q_full"])[0] for s_ in sols)
-                        if sc < margin:
-                            rejected["self_clearance"] += 1
+                        fc, sc, rej = self._body_clearance(body, sols, Tc, obstacles, poly)
+                        if rej is not None:
+                            rejected[rej] += 1
                             continue
                         sh = (Tc @ self.kin.pose(q_lv, body.shoulder_frame))[:3, 3]
                         tip = np.asarray(ta["pos"], float) + (finals[0] - ta["offset"]) * (-np.asarray(ta["forward"], float))
@@ -3010,6 +3024,51 @@ class Toolbox:
                   "stance planned (the robot has not moved): call approach('stance_target') to walk there"
                   + (f"; it then squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by itself"
                      if squat else ""))
+
+    def _body_clearance(self, body, sols, Tc, obstacles, poly):
+        """Clearances of the arm solutions sols at root pose Tc (plan_stance's checks, in its order): the smallest
+        distance of the body to the known faces (fc), then of the arm to the legs (sc); returns (fc, sc, the check that
+        fails against robot.yaml body.clearance_margin_m or None). sc is None when fc already fails."""
+        margin = self.cfg["robot"]["body"]["clearance_margin_m"]
+        fc = min(body.face_clearance(s_["q_full"], Tc, obstacles, poly) for s_ in sols)
+        if fc < margin:
+            return fc, None, "face_clearance"
+        sc = min(body.self_clearance(s_["q_full"])[0] for s_ in sols)
+        return fc, sc, ("self_clearance" if sc < margin else None)
+
+    def _scan_pose_from_here(self, t) -> dict:
+        """Whether the current stance is a scan stance for label target t: plan_stance's test of a stance candidate
+        (stance_eval.eval_candidate with the planning IK, then the body clearances) at the current root pose and joint
+        state, for the pose the label path commands from here (move_arm('final') at t's stand-off; the search replaced
+        the pre-pose). Its robustness test is not applied: it covers the walk's arrival error and the robot is at this
+        stance already. Only the first final pose is tested (t's stand-off, from the hand_label width: an upper bound
+        of the symbol); the final pose after refine_with_wrist, at the measured stand-off (down to standoff.min_m) and
+        the refined centre, is not: it can still fail IK from here, which the label path handles as any final-pose IK
+        failure (one stance re-plan). Testing standoff.min_m as well rejected all 4 logged look stances of the
+        2026-11-19 run, including the two scanned from them. Returns {"ok", "status": "ok" | "reach" | "ik" |
+        "face_clearance" | "self_clearance"}."""
+        from . import stance_eval as SE
+        body = self._body()
+        Tc = self._odom()
+        job = {"Tc": Tc, "q_lv": self._q(), "t": t, "finals": [float(t["offset"])], "pre_dists": [],
+               "stall": (int(self.ik.cfg["plan_stall_window"]), float(self.ik.cfg["plan_stall_eps_m"])),
+               "seed": [int(self.ik.cfg["seed"]), 0, 0]}
+        restarts = self.ik.cfg["restarts"]
+        self.ik.cfg["restarts"] = 1                   # the planning IK (plan_stance)
+        try:
+            ev = SE.eval_candidate(self.kin, self.ik, None if body is None else body.shoulder_frame,
+                                   None if body is None else body.arm_reach, job)
+        finally:
+            self.ik.cfg["restarts"] = restarts
+        if ev["status"] != "ok":
+            return {"ok": False, "status": ev["status"]}
+        out = {"ok": True, "status": "ok", "manipulability": round(float(ev["man"]), 4)}
+        if body is not None:
+            fc, sc, rej = self._body_clearance(body, ev["sols"], Tc, self._known_faces(), self._footprint())
+            out.update(face_m=fc, arm_leg_m=sc)
+            if rej is not None:
+                out.update(ok=False, status=rej)
+        return out
 
     def _eval_stance_jobs(self, jobs, body):
         """Evaluate stance candidates serially or in the planning pool (robot.yaml ik.plan_workers; 0 = serial)."""
@@ -3143,51 +3202,127 @@ class Toolbox:
                            "check_wrist_placement, then scan, which retries by itself)", data)
         return ok(data)
 
-    def _reach(self, t, off, side) -> dict:
+    def _reach(self, t, off, side, aim=None) -> dict:
         """IK on the current joint state to wrist target t at distance off, set_arm_joints, then closed-loop corrections
         of the commanded target (arm PD sag) using FK (move_arm and search_cell's look poses). Returns {"ik_fail",
-        "history"} (+ "reason", "iters" when IK found no solution for the first command)."""
+        "history"} (+ "reason", "iters" when IK found no solution for the first command).
+        aim (a look pose, _look_view): {"corners": the rectangle the look pose was planned to show (odom: the face grown
+        by delta_lat and the slack e), "see": the rectangle the view has to show (the face grown by delta_lat), 4 x 3
+        each}. What a look pose needs is where the hand camera looks; the arm's error there is mostly orientation, a
+        steady PD / gravity sag (2026-11-19 scan room: the tip 8 mm off but the scan axis 4.8 deg off left the face
+        uncovered; final-pose residuals 3-10 deg). So the full tip pose is corrected, as the position already is:
+        the commanded rotation is pre-compensated by the rotation still missing (R_cmd <- R_goal R_reached^T R_cmd)
+        next to p_cmd <- p_cmd + (p_goal - p_reached); this keeps the planned perspective and also corrects the roll
+        (a translation of the camera alone cannot undo a roll, and the translation that undoes a tilt is range x tilt,
+        which often left IK reach). The error measured is _view_error (how far the view lies from the planned one on
+        the wall, at the planned rectangle's corners); the loop stops as soon as the planned rectangle is covered from
+        the pose reached (FK; the view is then as good as planned) or the view error is below correction_tol (the slack
+        e the rectangle was grown by for exactly this placement error, as the tip loop stops on the tip error).
+        The first command of a look pose is not held to the IK tolerance of a scan pose (2 mm / 1 deg): when IK does
+        not converge, its best attempt is sent if that pose's view (FK of the solution) shows the rectangle `see`, the
+        test the capture applies (2026-11-19 rule run: every squat look stance failed the first IK by 4-7 mm /
+        0.7-1.4 deg)."""
         A = self.cfg["robot"]["arm_motion"]
         p_goal, d_goal = self._target_in_root(t, offset=off)
         p_cmd = p_goal.copy()
+        R_cmd = None if aim is None else self._tip_rotation_in_root(t, d_goal)
         hist = []
-        best = None                                   # (error, q_arm) of the best command sent so far
+        best = None                                   # (error, q_arm, record) of the best command sent so far
+
+        def measure():
+            p_g, d_g = self._target_in_root(t, offset=off)   # the base may have drifted: re-express the target
+            T = self.kin.pose(self._q(), self.cfg["robot"]["wrist_point_frame"])
+            err = p_g - T[:3, 3]
+            rec = {"pos_err_m": float(np.linalg.norm(err)), "angle_err_deg": math.degrees(angle_between(T[:3, 0], d_g))}
+            if aim is None:
+                return err, rec["pos_err_m"], rec, False, d_g
+            rec["roll_err_deg"] = self.ik.roll_error_deg(T[:3, :3], d_g, self._roll_in_root(t), signed=True)
+            ve = self._view_error(t, off, aim["corners"])
+            rec.update(view_err_m=ve["err"] if math.isfinite(ve["err"]) else None, planned_covered=ve["covered"])
+            return (err, self._tip_rotation_in_root(t, d_g) @ T[:3, :3].T), ve["err"], rec, ve["covered"], d_g
         for it in range(1 + A["correction_iters"]):
             q = self._q()
-            sol = self.ik.solve(q, p_cmd, d_goal, roll_axis=self._roll_in_root(t), **self._roll_kw(t))
-            if not sol["ok"]:
+            if aim is None:
+                sol = self.ik.solve(q, p_cmd, d_goal, roll_axis=self._roll_in_root(t), **self._roll_kw(t))
+            else:
+                sol = self.ik.solve(q, p_cmd, R_cmd[:, 0], roll_axis=R_cmd @ self.ik.img_x_in_tip, roll_signed=True)
+            unconverged = not sol["ok"] and aim is not None and best is None and self._hand_view().covers(
+                self._odom() @ self.kin.pose(sol["q_full"], self.cfg["robot"]["hand_camera"]["frame"]), aim["see"])
+            if not sol["ok"] and not unconverged:
                 if best is not None:                  # a correction left the reachable set: keep the best pose reached
                     self.robot.set_arm_joints(side, best[1], A["duration_s"])
                     self.robot.stand(A["settle_s"])
-                    hist.append({"reverted_to_best": True, "pos_err_m": best[0], "angle_err_deg": best[2]})
+                    hist.append({"reverted_to_best": True, **best[2]})
                     break
                 return {"ik_fail": True, "iters": it, "history": hist,
                         "reason": f"IK: target not reachable (residual {sol['pos_err']:.3f} m / {sol['angle_err_deg']:.1f} deg)"}
             self.robot.set_arm_joints(side, sol["q_arm"], A["duration_s"])
             self.arm_at_home = False
             self.robot.stand(A["settle_s"])
-            p_goal, d_goal = self._target_in_root(t, offset=off)   # the base may have drifted: re-express the target
-            T = self.kin.pose(self._q(), self.cfg["robot"]["wrist_point_frame"])
-            err = p_goal - T[:3, 3]
-            e, a = float(np.linalg.norm(err)), math.degrees(angle_between(T[:3, 0], d_goal))
-            hist.append({"pos_err_m": e, "angle_err_deg": a})
+            err, e, rec, covered, d_goal = measure()
+            if unconverged:                           # the IK residual of the pose sent (it shows `see` by FK)
+                rec.update(ik_unconverged={"pos_err_m": sol["pos_err"], "angle_err_deg": sol["angle_err_deg"]})
+            hist.append(rec)
+            if covered:                               # a look pose whose view shows the planned rectangle: done
+                break
             if best is not None and e > best[0]:
                 # the correction made it worse: the base / torso moves with the arm (GR00T balances the raised arm with
                 # the waist), so a full-gain correction can diverge (2026-11-06 stack scene: 3.5 -> 18 -> 36 cm).
                 # Go back to the best command and stop correcting
                 self.robot.set_arm_joints(side, best[1], A["duration_s"])
                 self.robot.stand(A["settle_s"])
-                T = self.kin.pose(self._q(), self.cfg["robot"]["wrist_point_frame"])
-                p_goal, d_goal = self._target_in_root(t, offset=off)
-                hist.append({"reverted_to_best": True, "pos_err_m": float(np.linalg.norm(p_goal - T[:3, 3])),
-                             "angle_err_deg": math.degrees(angle_between(T[:3, 0], d_goal))})
+                hist.append({"reverted_to_best": True, **measure()[2]})
                 break
             if best is None or e < best[0]:
-                best = (e, sol["q_arm"], a)
+                best = (e, sol["q_arm"], rec)
             if e < A["correction_tol"]:
                 break
-            p_cmd = p_cmd + err
+            if aim is None:
+                p_cmd = p_cmd + err
+            else:
+                p_cmd, R_cmd = p_cmd + err[0], err[1] @ R_cmd
         return {"ik_fail": False, "history": hist}
+
+    def _tip_rotation_in_root(self, t, d):
+        """Planned rotation (root frame) of the scanner tip for a target with a signed roll axis: scan axis along d (t's
+        forward in the root frame), image x along t's long axis made orthogonal to d (ArmIK.roll_target, signed)."""
+        from ..perception.look_view import tip_rotation
+        d = np.asarray(d, float) / np.linalg.norm(d)
+        L = self._roll_in_root(t)
+        L = L - (L @ d) * d
+        return tip_rotation(d, L / np.linalg.norm(L), self.ik.img_x_in_tip)
+
+    def _view_error(self, t, off, corners) -> dict:
+        """How far the hand camera's view from the pose reached (FK, current odometry) is from the view planned at look
+        target t (distance off), on the wall: planned, the tip on t's line at off with t's orientation (scan axis along
+        t["forward"] = -n, image x along the signed roll axis) and the camera rigidly on it, each corner of the
+        rectangle `corners` (4 x 3, odom, on the wall plane) seen along a camera ray; reached, the same camera ray hits
+        the plane at Q_i. err = max_i |Q_i - corner_i| (m; position, tilt and roll alike; inf when a ray no longer
+        reaches the plane); covered: the rectangle lies in the free view from the pose reached (HandView.covers)."""
+        if t.get("long_axis") is None or not t.get("roll_signed"):
+            raise ValueError("a view error needs a target with a signed roll axis (a look target)")
+        from ..perception.look_view import tip_rotation
+        hv = self._hand_view()
+        fwd = np.asarray(t["forward"], float)
+        fwd = fwd / np.linalg.norm(fwd)
+        n = -fwd
+        L = np.asarray(t["long_axis"], float)
+        L = L - (L @ fwd) * fwd
+        Tt = np.eye(4)
+        Tt[:3, :3] = tip_rotation(fwd, L / np.linalg.norm(L), self.ik.img_x_in_tip)
+        Tt[:3, 3] = np.asarray(t["pos"], float) + (off - t["offset"]) * n
+        Tp = Tt @ hv.T_tip_cam                                   # planned camera pose (odom)
+        P = np.asarray(corners, float)
+        r = (P - Tp[:3, 3]) @ Tp[:3, :3]                         # planned rays to the corners, camera frame
+        Tc = self._odom() @ self.kin.pose(self._q(), self.cfg["robot"]["hand_camera"]["frame"])
+        covered = hv.covers(Tc, P)
+        c = Tc[:3, 3]
+        rw = r @ Tc[:3, :3].T                                    # the same rays from the pose reached (odom)
+        den = rw @ n
+        if np.any(den >= 0.0):
+            return {"err": math.inf, "covered": covered}
+        Q = c + ((P - c) @ n / den)[:, None] * rw
+        return {"err": float(np.max(np.linalg.norm(Q - P, axis=1))), "covered": covered}
 
     def _label_view(self, t, off, label_width: float | None = None) -> dict:
         """Where the wrist target's label centre lies relative to the SCANNER's view cone from the current arm pose
