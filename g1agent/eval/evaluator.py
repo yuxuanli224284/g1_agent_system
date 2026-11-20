@@ -120,7 +120,7 @@ def _decoded_contents(decoded) -> list:
 
 
 def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, target_boxes=None, order_rule="columns",
-           order_unit="label") -> dict:
+           order_unit="label", strip_columns=None, layout_columns=None) -> dict:
     """Merged task (find the boxes, then scan every GT barcode once, left to right then top to bottom).
     Subset task (target_boxes = the scenario's GT box ids, evaluation only; order_rule = the scenario's scan_targets
     order, the rule the agent was told): the expected set is the barcodes of those boxes, ordered by order_rule;
@@ -144,12 +144,20 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
       frame of the reference root pose; boxes grouped by centre containment), labels of one box by the label rule;
       output key "order_unit" only then. A plan entry recorded "no_label" (search_cell saw the whole box face and
       found no label) is listed in "reported_no_label"; it never excuses an expected label: an unread GT label still
-      fails the scan count."""
+      fails the scan count.
+    - order rule "strips" (scenario scan_targets.order with strip_columns; order unit "box" only): the strips of
+      strip_columns ABSOLUTE wall columns (every GT box), checked against the layout's column count layout_columns
+      (scan_order.order_boxes_in_frame); the output gains "strip_columns" and "layout_columns" only then."""
     out = {}
     if order_rule not in ORDER_RULES:
         raise ValueError(f"unknown order rule {order_rule!r} (known: {ORDER_RULES})")
     if order_unit not in ORDER_UNITS:
         raise ValueError(f"unknown order unit {order_unit!r} (known: {ORDER_UNITS})")
+    if order_rule == "strips" and order_unit != "box":
+        raise ValueError("order 'strips' is defined on the boxes of a wall layout: it needs order unit 'box'")
+    if (order_rule == "strips") != (strip_columns is not None) or (layout_columns is not None and order_rule != "strips"):
+        raise ValueError(f"strip_columns / layout_columns ({strip_columns!r}, {layout_columns!r}) with order "
+                         f"{order_rule!r}: they belong to the order 'strips' only")
     t1 = stages.get("task1_end")
     if t1 is None:
         out["task1"] = {"success": False, "failure": "the run never reached the task1_end stage"}
@@ -186,6 +194,8 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
             raise ValueError(f"target boxes without a GT barcode: {sorted(missing)}")
         out["target_boxes"] = list(target_boxes)
     out["order_rule"] = order_rule
+    if order_rule == "strips":
+        out.update(strip_columns=strip_columns, layout_columns=layout_columns)
     by_content = {b["content"]: b for b in exp}
     other_gt = {b["content"] for b in all_gt} - set(by_content)
     labels = [{"key": b["content"], "center": b["center"], "normal": b["normal"], "up": b["up"], "size": b["size"]}
@@ -202,7 +212,9 @@ def _task3(gt: dict, actual: dict, ws: dict, stages: dict, scan_log: list, targe
     elif order_unit == "box":
         boxes = {b["id"]: b for b in gt["boxes"]}
         order = order_boxes_in_frame([dict(lb, box_id=b["box_id"]) for lb, b in zip(labels, exp)], boxes,
-                                     yaw_only(T_ref), order_rule)
+                                     yaw_only(T_ref), order_rule,
+                                     **({"strip_columns": strip_columns, "layout_columns": layout_columns}
+                                        if order_rule == "strips" else {}))
         out["order_unit"] = "box"
     else:
         order = order_labels_in_frame(labels, T_ref, order_rule)
@@ -307,12 +319,13 @@ def _tour_metrics(groups: list, scanned_gt: list) -> dict:
 
 
 def evaluate(task: int, gt: dict, actual: dict, ws: dict, stages: dict | None = None, scan_log: list | None = None,
-             target_boxes: list | None = None, order_rule: str = "columns", order_unit: str = "label") -> dict:
+             target_boxes: list | None = None, order_rule: str = "columns", order_unit: str = "label",
+             strip_columns: int | None = None, layout_columns: int | None = None) -> dict:
     """ws: harness world-state export {"root_target", "wrist_target", "wrist_target_refined"} (odom frame); task 3 also
     needs "scan_plan" and "scanned" (I4), "task1_end_root_target" (the harness root target snapshotted when the
     task1_end stage fired; required when that stage exists), the eval-port stage states (get_stage_states) and scan
     log (get_scan_log). Task 3 subset (scenario target_boxes / scan_targets.order; order_unit "box" for scenarios
-    with a wall layout): see _task3."""
+    with a wall layout; strip_columns / layout_columns for the order "strips"): see _task3."""
     if task == 1:
         return _task1(gt, actual, ws, config.load("task1")["eval"])
     if task == 2:
@@ -320,5 +333,6 @@ def evaluate(task: int, gt: dict, actual: dict, ws: dict, stages: dict | None = 
     if task == 3:
         if stages is None or scan_log is None:
             raise ValueError("task 3 evaluation needs the stage states and the scan log")
-        return _task3(gt, actual, ws, stages, scan_log, target_boxes, order_rule, order_unit)
+        return _task3(gt, actual, ws, stages, scan_log, target_boxes, order_rule, order_unit, strip_columns,
+                      layout_columns)
     raise ValueError(f"unknown task {task!r}")

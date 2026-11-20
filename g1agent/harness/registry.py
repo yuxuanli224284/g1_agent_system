@@ -72,6 +72,15 @@ PLAN_SCANS_LAYOUT_BODY = ("register the wall seen from here to the given layout 
                           "plan one entry of kind cell per requested box, in the order of the task's rule; fails, naming "
                           "the reason, when a side edge is not in view or the wall does not match the layout; a later "
                           "call changes nothing.")
+# plan_scans body of a wall layout worked in strips (scan_targets order "strips", Toolbox.strip_mode)
+PLAN_SCANS_STRIP_BODY = ("register the wall seen from here to the given layout from its LEFT side edge (front plane, left "
+                         "edge; the floor where in view) and plan one entry of kind cell per requested box, strip by "
+                         "strip; fails, naming the reason, when the left edge is not in view or the wall does not match "
+                         "the layout; a later call changes nothing.")
+GO_TO_NEXT_STRIP_TEXT = ("Task 3 with a wall layout worked in strips: when next_barcode returns strip_done=true, stand up, "
+                         "step along the wall to the next strip that has requested boxes (one strip width per step, from "
+                         "the strip's reference stance) and re-register the wall from the head after every step. Refused "
+                         "while the current strip has unfinished boxes. Then call next_barcode.")
 SEARCH_CELL_TEXT = ("Task 3 with a wall layout: for the current box (an entry of kind cell), stand at the planned stance "
                     "with the arm home, then: re-register the wall from the head, move the hand camera (D405) to the view "
                     "of the whole box face, find the label inside that face and make the entry that label (its wrist "
@@ -103,6 +112,7 @@ TOOLS = {
     "go_to_next_face": (NoArgs, "Task 3 with every side of the stack: walk around the stack to the next side of the tour (front -> right -> back -> left) and stand at its observation pose (arm home, stand up, back off, sidestep past the corner, turn, fit the side, step to its observation pose). Call it when next_barcode returns face_done=true, then plan_scans."),
     "next_barcode": (NoArgs, "Task 3: switch to the next barcode of the scan plan (an unfinished current barcode is marked failed); clears the per-barcode wrist / stance targets. Works on the current side of the stack: when that side is finished and the task covers every side, it returns face_done=true (call go_to_next_face, then plan_scans); done=true when everything has been handled."),
     "search_cell": (BarcodeArgs, SEARCH_CELL_TEXT),
+    "go_to_next_strip": (NoArgs, GO_TO_NEXT_STRIP_TEXT),
     "scan": (NoArgs, "Trigger the scanner and decode what it sees. The code nearest the image centre counts for the current barcode; a content read before is a duplicate and is not counted again. On no read the tool itself retries once (refine_with_wrist + move_arm final + scan); data.retries records it."),
     "finish": (FinishArgs, "End the task and report success or failure with a one-sentence summary."),
 }
@@ -117,12 +127,18 @@ TASK3_ONLY = ["plan_scans", "next_barcode", "go_to_next_face"]
 # tools of a task-3 episode with a wall layout only (Toolbox.wall_layout): every other episode's tool list and texts stay
 # as they were (task_tools)
 LAYOUT_ONLY = ["search_cell"]
-TASK2_TOOLS = [n for n in TOOLS if n not in TASK3_ONLY + LAYOUT_ONLY]
-TASK_TOOLS = {1: TASK1_TOOLS, 2: TASK2_TOOLS, 3: [n for n in TOOLS if n not in LAYOUT_ONLY]}
+# tools of a task-3 wall-layout episode worked in strips only (Toolbox.strip_columns)
+STRIP_ONLY = ["go_to_next_strip"]
+TASK2_TOOLS = [n for n in TOOLS if n not in TASK3_ONLY + LAYOUT_ONLY + STRIP_ONLY]
+TASK_TOOLS = {1: TASK1_TOOLS, 2: TASK2_TOOLS, 3: [n for n in TOOLS if n not in LAYOUT_ONLY + STRIP_ONLY]}
 
 
 def task_tools(task: int, toolbox) -> list:
-    """The tools of an episode: the task's tools, plus the layout-only tools in a task-3 episode with a wall layout."""
+    """The tools of an episode: the task's tools, plus the layout-only tools in a task-3 episode with a wall layout;
+    a strip episode (a wall layout worked in strips) also gets the strip-only tools and has no go_to_next_face (a wall
+    has no sides to tour, and an 8B model confuses the two moves)."""
+    if task == 3 and getattr(toolbox, "wall_layout", None) is not None and getattr(toolbox, "strip_columns", None):
+        return [n for n in TASK_TOOLS[task] if n != "go_to_next_face"] + LAYOUT_ONLY + STRIP_ONLY
     return TASK_TOOLS[task] + (LAYOUT_ONLY if task == 3 and getattr(toolbox, "wall_layout", None) is not None else [])
 
 

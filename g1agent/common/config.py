@@ -81,7 +81,8 @@ def apply_robot_variant(cfg: dict, variant: str | None) -> dict:
     r = cfg["robot"]
     r.update(robot_variant=variant, urdf=os.path.join(ROOT, p["urdf"]), wrist_point_frame=p["wrist_point_frame"],
              scanner_cam_frame=p["scanner_cam_frame"], hand_camera=hc, head_models=list(p["head_models"]),
-             texts=dict(p["texts"]), tool_texts=dict(p.get("tool_texts") or {}))
+             texts=dict(p["texts"]), tool_texts=dict(p.get("tool_texts") or {}),
+             odom_scale_err=p.get("odom_scale_err"))   # None: the variant states none (strip mode then refuses)
     r["view"] = dict(r["view"], calibration=p["view_calibration"])
     r["body"] = dict(r["body"], calibration=p["body_calibration"])
     cfg["perception"] = deep_merge(cfg["perception"], p.get("perception"))

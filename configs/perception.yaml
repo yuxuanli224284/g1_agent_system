@@ -35,6 +35,13 @@ plane_fit:
   min_inliers: 150
   seed: 0
 fov_margin_frac: 0.05                # face corners inside the head image with a 5 % border
+wall_layout:                         # wall-layout task, strip mode (scan_targets.order "strips"; toolbox _strip_delta)
+  edge_bias_px: 10.3                 # outward bias of ONE side edge of the wall in the head stereo depth (px), used for the
+                                     # lateral margin of a one-edge registration: delta_edge = this x edge depth / fx.
+                                     # Source (design scanroom_strip_design.md 5.1): run-1 two-edge width residual
+                                     # r = 0.020 m at 1.2 m (fx 616.9: 10.3 px), both edges fattened outward; SGBM repro
+                                     # 0.013-0.020 m per edge at 1.2 m (6.7-10.3 px, the largest kept); label-derived
+                                     # bias 7-9 px at stance depth
 barcode:
   roi_pad_frac: 0.05                 # face ROI padding in the image
   upscale: 3                         # head-camera ROI is upsampled before detection (labels are ~20-40 px wide)

@@ -21,6 +21,11 @@ tests/test_no_gt_leak.py); tests/test_task3_logic.py checks that both give the s
   duplicate or a fragment inside a cell never forms a row / column of its own.
 - Scan order of a given wall layout (order_lattice): the order rule applied to the layout cells themselves (no label
   extents); several labels inside one cell: order_in_cell.
+- Order rule "strips" (user decision 2026-11-20, the wall-layout strip mode; a box-lattice order only, it needs a wall
+  layout and the task's strip width "strip_columns" w): the wall is worked in strips of w columns from the left end
+  (strip of an ABSOLUTE wall column c, 1 = leftmost: (c - 1) // w + 1, strip_of); inside a strip the requested rows
+  from the top, the k-th of them (k = 0 at the strip's top requested row) left to right when k is even, right to left
+  when k is odd; every strip restarts left to right at its top requested row (user answer Q5, 2026-11-20).
 - Adaptive stand-off (user requirement 5): d = label_width / (2 tan(hfov / 2)) / fill, clamped to [d_min, d_max].
 """
 from __future__ import annotations
@@ -41,7 +46,14 @@ def adaptive_standoff(label_width_m: float, hfov_rad: float, fill: float, d_min:
     return float(min(max(d, d_min), d_max))
 
 
-ORDER_RULES = ("columns", "rows", "serpentine")
+ORDER_RULES = ("columns", "rows", "serpentine", "strips")
+# rules defined on the box lattice of a given wall layout only (order_lattice); never on label extents
+LATTICE_ONLY_RULES = ("strips",)
+
+
+def strip_of(column: int, strip_columns: int) -> int:
+    """Strip (1 = leftmost) of an absolute wall column (1 = leftmost) for strips of strip_columns columns."""
+    return (int(column) - 1) // int(strip_columns) + 1
 
 
 def _overlap_groups(items: list[dict], lo: str, hi: str) -> list[list[dict]]:
@@ -105,26 +117,49 @@ def order_items(items: list[dict], rule: str = "columns") -> list:
         return row_order(items)
     if rule == "serpentine":
         return serpentine_order(items)
+    if rule in LATTICE_ONLY_RULES:
+        raise ValueError(f"order {rule!r} is a box-lattice order: it needs a wall layout")
     raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
 
 
 def order_in_cell(items: list[dict], rule: str, left_to_right: bool = True) -> list:
     """Scan order of several labels inside ONE box cell (items as order_items): the label rule of the task; for rule
     "serpentine" the rows of labels inside the cell top to bottom, each in the lateral direction of the cell's row
-    (left_to_right: that row's direction, see order_lattice), so the robot keeps walking the same way."""
-    if rule == "serpentine":
+    (left_to_right: that row's direction, see order_lattice), so the robot keeps walking the same way; rule "strips"
+    likewise (the direction of the cell's row inside its strip)."""
+    if rule in ("serpentine", "strips"):
         return row_order(items, left_to_right)
     return order_items(items, rule)
 
 
-def order_lattice(cells: list[dict], rule: str = "columns") -> list[dict]:
+def order_lattice(cells: list[dict], rule: str = "columns", strip_columns: int | None = None) -> list[dict]:
     """Scan order of the cells of a given wall layout (cells: [{"key", "column": 1 = leftmost, "row": 1 = top}], the
     lattice itself, no label extents). Rule "rows": rows from the top, columns from the left inside a row; "columns":
     columns from the left, rows from the top inside a column; "serpentine": rows from the top, the k-th row (k = 0 at
-    the top, counted over the rows that hold cells) left to right when k is even, right to left when k is odd.
-    Returns [{"key", "left_to_right": the lateral direction of the cell's row (order_in_cell)}] in scan order."""
+    the top, counted over the rows that hold cells) left to right when k is even, right to left when k is odd;
+    "strips" (strip_columns w required; "column" = the ABSOLUTE wall column): strips from the left (strip_of), inside a
+    strip the serpentine of the rows that hold cells OF THAT STRIP (k = 0 at the strip's top row, so every strip
+    restarts left to right).
+    Returns [{"key", "left_to_right": the lateral direction of the cell's row (order_in_cell)}] in scan order; for
+    "strips" also "strip"."""
     if rule not in ORDER_RULES:
         raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
+    if rule == "strips":
+        if not isinstance(strip_columns, int) or isinstance(strip_columns, bool) or strip_columns < 1:
+            raise ValueError(f"order 'strips' needs strip_columns (an integer >= 1), got {strip_columns!r}")
+        strip = {c["key"]: strip_of(c["column"], strip_columns) for c in cells}
+        rows_of = {}
+        for c in cells:
+            rows_of.setdefault(strip[c["key"]], set()).add(c["row"])
+        rank = {c["key"]: sorted(rows_of[strip[c["key"]]]).index(c["row"]) for c in cells}
+        l2r = {k: r % 2 == 0 for k, r in rank.items()}
+
+        def skey(c):
+            k = c["key"]
+            return (strip[k], rank[k], c["column"] if l2r[k] else -c["column"]), str(k)
+        return [{"key": c["key"], "left_to_right": l2r[c["key"]], "strip": strip[c["key"]]} for c in sorted(cells, key=skey)]
+    if strip_columns is not None:
+        raise ValueError(f"strip_columns is a parameter of the order 'strips', not of {rule!r}")
     rank = {r: k for k, r in enumerate(sorted({c["row"] for c in cells}))}
     l2r = {c["key"]: rule != "serpentine" or rank[c["row"]] % 2 == 0 for c in cells}
 
@@ -161,19 +196,27 @@ def parse_targets(spec) -> dict | None:
     "rows": (same), "order": rule, "spec": the spec}. spec: None (every label, order "columns") or a dict with at most
     one of columns_from_left / columns_from_right / columns, at most one of rows_from_top / rows_from_bottom / rows
     (*_from_*: lists of 1-based indices counted from that edge of the box wall; "columns" / "rows": the value "all",
-    every column / row of the wall, which needs both of its edges) and "order" (ORDER_RULES, default "columns").
-    Anything else is an error."""
+    every column / row of the wall, which needs both of its edges) and "order" (ORDER_RULES, default "columns");
+    "strip_columns" (an integer >= 1, the strip width of the order "strips") is required with the order "strips" and
+    refused with any other order; only then the result has "strip_columns". Anything else is an error."""
     if spec is None:
         return None
     if not isinstance(spec, dict):
         raise ValueError(f"scan target spec must be a dict, got {type(spec).__name__}")
-    known = {k for opts in _DIMS.values() for k, _ in opts} | set(_DIMS) | {"order"}
+    known = {k for opts in _DIMS.values() for k, _ in opts} | set(_DIMS) | {"order", "strip_columns"}
     bad = set(spec) - known
     if bad:
         raise ValueError(f"unknown scan target keys {sorted(bad)} (known: {sorted(known)})")
     out = {"order": spec.get("order", "columns"), "spec": dict(spec)}
     if out["order"] not in ORDER_RULES:
         raise ValueError(f"scan target order must be one of {ORDER_RULES}, got {out['order']!r}")
+    if out["order"] == "strips":
+        w = spec.get("strip_columns")
+        if not isinstance(w, int) or isinstance(w, bool) or w < 1:
+            raise ValueError(f"scan target order 'strips' needs strip_columns (an integer >= 1), got {w!r}")
+        out["strip_columns"] = w
+    elif "strip_columns" in spec:
+        raise ValueError(f"scan target strip_columns is a parameter of the order 'strips', not of {out['order']!r}")
     for dim, opts in _DIMS.items():
         given = [(k, edge) for k, edge in opts if k in spec]
         if dim in spec:
@@ -211,7 +254,10 @@ def describe_targets(t: dict | None) -> str:
     return "the labels of the boxes in " + " and ".join(parts) + " of the box wall" if parts else "every barcode label"
 
 
-def order_rule_text(rule: str) -> str:
+def order_rule_text(rule: str, strip_columns: int | None = None) -> str:
+    if rule == "strips":
+        return (f"strips of {strip_columns} columns from the left; inside a strip rows of boxes from the top, the first "
+                "row left to right, the next right to left, alternating")
     return {"columns": "columns of overlapping lateral label extents, left to right as seen facing this side; "
                        "top to bottom inside a column",
             "rows": "rows of overlapping vertical label extents, top to bottom; left to right inside a row as seen "

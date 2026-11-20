@@ -23,6 +23,11 @@ A task with a given wall layout (set_wall_layout, approach A) plans boxes instea
 wall (plane, side edges, floor) and plans one entry of kind "cell" per requested box in the lattice order; each box is
 visited with the hand-camera search (compute_wrist_target -> plan_stance -> approach -> search_cell), which turns the
 entry into its label or records no_label (see "task 3: wall layout" below). Every layout branch is gated on wall_layout.
+The order "strips" (strip mode, user decisions 2026-11-20) works such a wall in strips of strip_columns columns from the
+left end: phase 1 walks to the left end, the wall is registered from its left side edge, a stance serves the boxes of a
+strip row where it can (planned where the robot stands first), every stance arrival / height change re-registers the
+wall, and the strip ledger (ws.strips) makes next_barcode / go_to_next_strip finish a strip before the next one. Every
+strip branch is gated on strip_mode.
 """
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ from ..perception.plane_fit import fit_front_face, fit_support_plane, wall_exten
 from .scan_order import (adaptive_standoff, cell_targeted, describe_targets, grid_cell, grid_conflict, hfov_from_intrinsics,
                          order_by_cells, order_in_cell, order_items,
                          order_items_in_frame, order_lattice, order_rule_text as scan_order_text, parse_targets,
-                         quad_width, resolve_grid)
+                         quad_width, resolve_grid, strip_of)
 
 
 def R3(x):
@@ -103,6 +108,12 @@ class Toolbox:
     wall_layout = None
     _layout_edges = None              # wall side edges / extent seen in phase 1 (odom points), _layout_view_points
     _look_cache = None                # look-pose search results per (face size, delta, e), _search_view
+    # strip mode (scan_targets order "strips" with a wall layout, user decision 2026-11-20; set_wall_layout): the strip
+    # width in columns and the number of strips; None outside strip mode (every strip branch is gated on strip_mode)
+    strip_columns = None
+    n_strips = None
+    _settled = False                  # layout episodes: the body stood still once before the first head capture
+    _walk_seq = 0                     # walking-tool counter (_walk_guard): an in-place stance is valid while it holds
 
     def __init__(self, robot, box_detector=None, device: str | None = None):
         from ..perception.box_detector import BoxDetector
@@ -197,6 +208,11 @@ class Toolbox:
             raise ValueError(f"phase1_view must be one of {self.PHASE1_VIEWS}, got {mode!r}")
         self.phase1_view = mode
 
+    @property
+    def strip_mode(self) -> bool:
+        """The wall-layout task worked in strips (set_wall_layout with the order "strips")."""
+        return self.wall_layout is not None and self.strip_columns is not None
+
     def _spec_view_mode(self) -> bool:
         """compute_obs_pose plans the view from the target spec (obs_pose mode of a target-spec task)."""
         return self.scan_targets is not None and self.phase1_view == "obs_pose"
@@ -218,6 +234,18 @@ class Toolbox:
 
     def _standing(self):
         return self.base_height_cmd is None or self.base_height_cmd >= float(self.body_cmd["height_default"]) - 1e-6
+
+    def set_base_height_tool(self, height: float | None = None):
+        """The tool set_base_height (the Harness calls this): set_base_height; in strip mode with the arm at home the wall
+        is then re-registered from the head (user decision 2026-11-20: at every body-height change before the arm
+        moves). The tools' own height changes (_walk_guard's stand-up, approach's squat) call set_base_height itself:
+        a walk's arrival re-registers by itself."""
+        r = self.set_base_height(height)
+        if r["status"] == "ok" and self.strip_mode and self.ws.wall is not None and self.arm_at_home:
+            rec = self._reregister_at_stance()
+            r["data"]["reregistration"] = R3(self._rereg_summary(rec))
+            r = with_diagnostics(r, dict(r.get("diagnostics") or {}, reregistration=rec))
+        return r
 
     def set_base_height(self, height: float | None = None):
         """Squat to / stand up at a commanded pelvis height (GR00T body command), standing still. The planned squat
@@ -388,6 +416,15 @@ class Toolbox:
     def _capture_head(self):
         """Head frame: colour image, depth registered to it, camera pose (FK) and odometry. Depth source: perception.yaml
         head_depth.source (stereo = own matching on the infrared pair; render = the camera's delivered depth)."""
+        if self.wall_layout is not None and not self._settled:
+            # a wall-layout episode registers its wall frame from head frames: the first one waits until the body has
+            # settled after the reset (2026-11-20 run 1: the first head capture at t_sim 0.02 s with the pelvis 3.5 cm
+            # above its settled height, settled from 0.2 s on); the wait is the calibration hold (robot.yaml
+            # body.settle_s, the time the calibrated body states are taken after)
+            r = self.robot.stand(float(self.cfg["robot"]["body"]["settle_s"]))
+            if r.get("status") != "ok":
+                raise RuntimeError(f"standing still before the first head view: {r.get('status')}: {r.get('reason')}")
+            self._settled = True
         src = self.cfg["perception"]["head_depth"]["source"]
         o = self.robot.get_head_obs(depth=src == "render")
         q = self._q()
@@ -764,6 +801,8 @@ class Toolbox:
         Also returns the pose reference point: the region's lateral middle (not the middle of the faces fitted in this
         view, which after a walk may be a part of the region), at the plane and height of _faces_reference.
         With a wall layout: _layout_view_points."""
+        if self.strip_mode:
+            return self._strip_view_points(faces)
         if self.wall_layout is not None:
             return self._layout_view_points(faces)
         center, nh = self._faces_reference(faces)
@@ -805,6 +844,10 @@ class Toolbox:
         spec_view = None
         if self._spec_view_mode():
             corners, spec_view, center = self._spec_view_points(faces)     # the pose centred on the region
+            mm = spec_view.get("layout_mismatch")
+            if mm is not None:                       # strip mode (_strip_view_points): the wall is wider than the layout
+                return fail(f"the wall seen does not match the layout: no left side edge where the layout puts it "
+                            f"({mm['W']:.2f} m left of the right edge)", {"spec_view": spec_view})
         else:
             corners = self._to_stack_top(np.vstack([np.asarray(f["corners"], float) for f in faces]))
         yaw = math.atan2(-nh[1], -nh[0])
@@ -892,7 +935,8 @@ class Toolbox:
         if not self.arm_at_home:
             return fail("the arm is raised: call move_arm('home') first (the base never walks with the arm raised)")
         self._stance_reached = None                    # every walking tool calls this guard first: the robot leaves
-        if self._standing() and abs(self.view_pitch) < 1e-9:   # the stance it may have reached
+        self._walk_seq += 1                            # the stance it may have reached (an in-place stance is stale)
+        if self._standing() and abs(self.view_pitch) < 1e-9:
             return None
         if self._standing():                            # leaned back for a head view: upright before walking
             if not self.arm_at_home:
@@ -950,6 +994,9 @@ class Toolbox:
         (move_summary). data["walk_done"] marks a result whose walk ended and only the arrival check decided.
         target="stance_target": a successful arrival marks the planned stance as reached (move_arm requires it); any
         walk to it counts as an attempt of the current barcode (next_barcode may then close it)."""
+        st = self.ws.stance_target
+        if target == "stance_target" and st is not None and self.strip_mode and st.get("in_place") is not None:
+            return self._approach_in_place(st)
         g = self._walk_guard()
         if g is not None:
             return g
@@ -959,8 +1006,62 @@ class Toolbox:
                 self._stance_attempted.add(self.ws.current_barcode_id)
             if r["status"] == "ok":
                 self._stance_reached = self.ws.stance_target
+                if self.strip_mode and self.ws.wall is not None:
+                    # strip mode: the frame is re-registered at every stance arrival before the arm moves (user
+                    # decision 2026-11-20); the strip's first stance becomes its reference for the strip move
+                    rec = self._reregister_at_stance()
+                    r["data"]["reregistration"] = R3(self._rereg_summary(rec))
+                    r = with_diagnostics(r, dict(r.get("diagnostics") or {}, reregistration=rec))
+                    self._strip_note_ref(self.ws.stance_target)
             return r
         return self._approach(target)
+
+    def _approach_in_place(self, st):
+        """approach(stance_target) for a strip-mode stance planned where the robot stands (plan_stance's in-place
+        candidate): valid while no walking tool ran since it was planned (st["in_place"] == the walk counter; else
+        it is stale: plan again). No walk; a different body height is squatted to (the arm at home), which
+        re-registers the wall."""
+        if st["in_place"] != self._walk_seq:
+            return fail("the robot moved since this stance was planned: call plan_stance")
+        if self.ws.current_barcode_id is not None:
+            self._stance_attempted.add(self.ws.current_barcode_id)
+        data, diag = {"in_place": True}, None
+        bh = st.get("base_height")
+        changed = bh is not None and abs(bh - self.base_height_cmd) > 1e-6
+        if changed:
+            if not self.arm_at_home:
+                return fail("this stance is here at another body height: call move_arm('home') first, then "
+                            "approach('stance_target') again")
+            r = self.set_base_height(bh)
+            if r["status"] != "ok":
+                return fail(f"squat to the stance height {bh}: {r['reason']}", data)
+            data["base_height"] = r["data"]
+            rec = self._reregister_at_stance()
+            data["reregistration"] = R3(self._rereg_summary(rec))
+            diag = dict(r.get("diagnostics") or {}, reregistration=rec)
+        self._stance_reached = st
+        self._strip_note_ref(st)
+        nxt = "call search_cell" if st.get("purpose") == "look" else "call move_arm('pre')"
+        hc = self.base_height_cmd
+        return with_diagnostics(ok(data, f"no walk needed: the robot stands at this stance (body height command "
+                                         f"{hc:.2f} m{', wall re-registered' if changed else ''}): {nxt}"), diag)
+
+    @staticmethod
+    def _rereg_summary(rec) -> dict:
+        """The part of a re-registration record a tool reply carries (the whole record is in ws.wall["history"])."""
+        return {k: rec.get(k) for k in ("refit", "anchored", "ds_m", "dpsi_deg", "delta_lat", "note") if k in rec}
+
+    def _strip_note_ref(self, st):
+        """The first stance reached in the current strip becomes the strip's reference (wall frame x, y of the planned
+        standing position): the strip move steps strip_columns x box_w along the wall from it."""
+        S = self.ws.strips
+        if S is None:
+            return
+        k = S["current"]
+        if S["strips"][k]["ref_source"] == "stance":
+            return
+        rw = apply(inv_T(self._wall_T()), np.array([[st["pos"][0], st["pos"][1], 0.0]]))[0]
+        S["strips"][k].update(ref_w=[float(rw[0]), float(rw[1])], ref_source="stance")
 
     def _approach(self, target):
         A = self._c1()["approach"]
@@ -1113,6 +1214,10 @@ class Toolbox:
             return None
         if cur is None:
             return f"no current barcode: call next_barcode (it gives the next barcode of the plan)"
+        if self.strip_mode:
+            # a bare "call next_barcode" would close the current box as failed (C1 P6 of the strip design)
+            return (f"{barcode_id} is not the current box: finish the current box {cur} first; next_barcode gives the "
+                    "boxes in the strip order")
         return f"{barcode_id} is not the current barcode ({cur}): call next_barcode to move on to the next barcode of the plan"
 
     def _label_on_face(self, frame, rec, face):
@@ -1329,7 +1434,8 @@ class Toolbox:
     def set_wall_layout(self, layout):
         """Scenario field wall_layout (task instruction): {"columns", "rows" (integers >= 1), "box_w", "box_h" (m, > 0),
         "base": "floor"}. Needs the target spec (set_scan_targets) and the obs_pose phase 1 (set_phase1_view) first; a
-        multi-face task is refused, and so is a requested column / row beyond the layout."""
+        multi-face task is refused, and so is a requested column / row beyond the layout. With the order "strips" the
+        layout's columns must split into whole strips of the spec's strip_columns (strip mode, strip_mode)."""
         if not isinstance(layout, dict):
             raise ValueError(f"wall_layout must be a dict, got {type(layout).__name__}")
         missing = [k for k in self.LAYOUT_KEYS if k not in layout]
@@ -1358,6 +1464,13 @@ class Toolbox:
             if d is not None and d.get("index") and max(d["index"]) > layout[dim]:
                 raise ValueError(f"the target spec asks for {dim} {d['index']} from the {d['from']}, the wall layout has "
                                  f"{layout[dim]} {dim}")
+        strips = self.scan_targets["order"] == "strips"
+        if strips and layout["columns"] % self.scan_targets["strip_columns"]:
+            # no decision covers a remainder strip (narrower than the others)
+            raise ValueError(f"a wall of {layout['columns']} columns does not split into strips of "
+                             f"{self.scan_targets['strip_columns']}")
+        self.strip_columns = self.scan_targets["strip_columns"] if strips else None
+        self.n_strips = layout["columns"] // self.strip_columns if strips else None
         self.wall_layout = {"columns": int(layout["columns"]), "rows": int(layout["rows"]),
                             "box_w": float(layout["box_w"]), "box_h": float(layout["box_h"]), "base": layout["base"]}
         self.ws.wall = None
@@ -1398,10 +1511,20 @@ class Toolbox:
     def _cell_face(self, c, r) -> dict:
         return dict(self._rect_face(*self._cell_rect(c, r)), layout_cell=[int(c), int(r)])
 
-    def _search_grow(self):
+    def _search_grow(self, bc=None, plan=False):
         """Growth of a box face for the hand-camera search: delta_lat (the registration's lateral uncertainty) laterally
-        and e = robot.yaml arm_motion.correction_tol (the placement error the arm loop accepts) on every side."""
-        return float(self.ws.wall["delta_lat"]), float(self.cfg["robot"]["arm_motion"]["correction_tol"])
+        and e = robot.yaml arm_motion.correction_tol (the placement error the arm loop accepts) on every side.
+        Strip mode (bc: the cell entry): the look pose is planned with the cell's delta_plan (_delta_plan, stored on the
+        entry when its look target is computed: compute_wrist_target, or plan_stance for the other boxes of a row); the
+        search verifies and crops with max(delta_plan, the margin now), so a margin grown since the plan is covered or
+        the search reports the face not covered (partial: the one re-plan)."""
+        e = float(self.cfg["robot"]["arm_motion"]["correction_tol"])
+        if not self.strip_mode:
+            return float(self.ws.wall["delta_lat"]), e
+        if bc.wall.get("delta_plan") is None:
+            bc.wall["delta_plan"] = self._delta_plan(bc)
+        dp = float(bc.wall["delta_plan"])
+        return (dp if plan else max(dp, self._delta_now())), e
 
     def _sync_layout(self, bc):
         """Odometry fields of a layout entry from its wall-frame geometry (current registration)."""
@@ -1589,6 +1712,243 @@ class Toolbox:
                         "history": []}
         return None, diag
 
+    # ---- strip mode (scan_targets order "strips"; user decisions 2026-11-20): phase 1 walks to the LEFT end, the wall is
+    # registered from its front plane and the left side edge (the odometry floor; the floor seen is a check only), the
+    # lateral margin grows with the walk since the last edge sighting (_strip_delta), and the harness keeps a strip
+    # ledger (ws.strips: next_barcode / go_to_next_strip)
+    def _strip_view_points(self, faces):
+        """Observation-pose region of a strip-mode task (the _spec_view_points contract): the anchor strip (strip 1, the
+        strip_columns x box_w = A metres at the wall's LEFT end) and its left side edge. Edge memory (self._layout_edges):
+        per side the newest measurement {"pt", "t"} that agrees with the union of the wall extents seen in phase 1
+        ("seen", odom points), by the halfway rule: a left edge s_L must satisfy (a) s_L <= s_min + box_w / 2 (nothing
+        of the wall seen beyond it) and (b) s_L >= s_max - W - box_w / 2 (the wall seen fits on the layout's side of
+        it); a right edge (a) s_R >= s_max - box_w / 2 and (b) s_R <= s_min + W + box_w / 2. A new measurement
+        violating either is dropped and logged (edge_rejected); a remembered edge is dropped (logged) when the wall
+        seen since violates (a): it is no end of the wall. Lateral region:
+        - left edge known: [s_L, s_L + A];
+        - right edge only: [s_R - W, s_R - W + A] (walk there: the registration needs the left edge);
+        - neither: [s_max - W, s_min + A] (every anchor-strip place consistent with what was seen); seen wider than W:
+          [s_min, s_max] (no placement holds it), noted seen_wider_than_layout.
+        Layout mismatch: a remembered edge that the wall seen since violates (b), e.g. the right edge and the wall seen
+        reaching s_R - W - box_w / 2 or farther left (more than half a box beyond the left end the layout puts W left
+        of the right edge): the wall is wider than the layout; info "layout_mismatch" (compute_obs_pose then fails).
+        Vertically the top requested row of the anchor strip (where strip 1 starts; every requested row when strip 1
+        holds none), [(r - 1) box_h, r box_h] above the odometry floor."""
+        L = self.wall_layout
+        W, A, bw = L["columns"] * L["box_w"], self.strip_columns * L["box_w"], L["box_w"]
+        plane = self._wall_plane(faces)
+        center, _ = self._faces_reference(faces)
+        p0, right = plane["point"], plane["right"]
+        mem = self._layout_edges if self._layout_edges is not None else {}
+        self._layout_edges = mem
+        ext = self._wall_extent(self.head, plane)
+        s_of = lambda P: np.atleast_2d(np.asarray(P, float) - p0) @ right
+        if ext["seen"] is not None:
+            mem["seen"] = np.vstack([mem.get("seen", np.zeros((0, 3))), [p0 + v * right for v in ext["seen"]]])
+        S = s_of(mem["seen"]) if "seen" in mem else s_of(np.vstack([np.asarray(f["corners"], float) for f in faces]))
+        s_min, s_max = float(S.min()), float(S.max())
+        rejected, mismatch = [], None
+        beyond = {"left": lambda v: v <= s_min + bw / 2, "right": lambda v: v >= s_max - bw / 2}           # (a)
+        fits = {"left": lambda v: v >= s_max - W - bw / 2, "right": lambda v: v <= s_min + W + bw / 2}     # (b)
+        for side in ("left", "right"):
+            e = ext[side]
+            if e is not None:
+                sv = float(e["s"])
+                if beyond[side](sv) and fits[side](sv):
+                    mem[side] = {"pt": p0 + sv * right, "t": self.head["t"], "depth": e.get("depth")}
+                else:
+                    rejected.append({"side": side, "s": sv, "seen": [s_min, s_max], "W": W, "new": True})
+            elif side in mem:
+                sv = float(s_of(mem[side]["pt"])[0])
+                if not beyond[side](sv):
+                    rejected.append({"side": side, "s": sv, "seen": [s_min, s_max], "W": W, "new": False})
+                    del mem[side]
+                elif not fits[side](sv):
+                    mismatch = {"s_" + side: sv, "W": W, "seen": [s_min, s_max]}
+        s = {sd: float(s_of(mem[sd]["pt"])[0]) for sd in ("left", "right") if sd in mem}
+        info = {"layout": True, "strips": True}
+        if mismatch is not None:
+            info["layout_mismatch"] = mismatch
+        if "left" in s:
+            lo, hi = s["left"], s["left"] + A
+        elif "right" in s:
+            lo, hi = s["right"] - W, s["right"] - W + A
+        elif s_max - s_min > W:
+            lo, hi = s_min, s_max
+            info["seen_wider_than_layout"] = {"seen": [s_min, s_max], "W": W}
+        else:
+            lo, hi = s_max - W, s_min + A
+        cells = self._requested_cells()
+        first = [r for c, r in cells if strip_of(c, self.strip_columns) == 1] or [r for _, r in cells]
+        r_top = max(first)
+        z_lo, z_hi = (r_top - 1) * L["box_h"], r_top * L["box_h"]
+        up = np.array([0.0, 0.0, 1.0])
+        P = lambda sv, zv: p0 + sv * right + zv * up
+        corners = np.array([P(hi, z_hi), P(lo, z_hi), P(lo, z_lo), P(hi, z_lo)])
+        ref = P(0.5 * (lo + hi), float(np.asarray(center, float)[2]))
+        info.update({"lateral": [lo, hi], "z_range": [z_lo, z_hi], "edges_seen": {sd: sd in s for sd in ("left", "right")},
+                     "seen": ext["seen"]})
+        if rejected:
+            info["edge_rejected"] = rejected
+        return corners, info, ref
+
+    def _strip_delta_edge(self, depth, fx) -> float:
+        """Lateral error of one side edge seen at optical depth `depth` (m) by a head camera of focal length fx (px):
+        perception.yaml wall_layout.edge_bias_px x depth / fx (metres)."""
+        return float(self.cfg["perception"]["wall_layout"]["edge_bias_px"]) * float(depth) / float(fx)
+
+    def _strip_delta(self, D) -> float:
+        """Lateral margin of the strip-mode wall frame: delta = delta_edge (the anchor edge's bias at its depth) + eps x
+        |D| (eps = robot.yaml variant odom_scale_err: the odometry scale error over D, the net lateral displacement since
+        the anchor edge was seen). Stored rounded UP to 1 mm (float-safe): it keys the look-pose cache only, and 1 mm is
+        far below the smallest delta_edge (~8 mm), so it changes no outcome."""
+        eps = self.cfg["robot"].get("odom_scale_err")
+        if eps is None:
+            raise ValueError(f"robot variant {self.cfg['robot'].get('robot_variant')!r} gives no odom_scale_err (robot.yaml): "
+                             "the strip mode's lateral margin needs it")
+        x = float(self.ws.wall["anchor"]["delta_edge"]) + float(eps) * abs(float(D))
+        return math.ceil(round(x * 1000.0, 6)) / 1000.0
+
+    def _wall_s(self, p) -> float:
+        """Wall-frame lateral coordinate (x, along the wall to the right) of an odom point."""
+        return float(apply(inv_T(self._wall_T()), np.asarray(p, float)[None])[0, 0])
+
+    def _strip_D_now(self) -> float:
+        """Net lateral displacement of the root along the wall since the anchor edge was seen (odometry)."""
+        root = self._odom()[:3, 3]
+        return float((root[:2] - np.asarray(self.ws.wall["anchor_root_xy"], float)) @ self._wall_axes()["right"][:2])
+
+    def _delta_now(self) -> float:
+        return self._strip_delta(self._strip_D_now())
+
+    def _delta_plan(self, bc) -> float:
+        """Margin of a cell's look pose planned from here: the robot will stand at the cell when it searches, so D is
+        the displacement since the anchor plus the way from the root to the cell along the wall."""
+        L = self.wall_layout
+        s_cell = (bc.wall["cell"][0] - 0.5) * L["box_w"]
+        return self._strip_delta(self._strip_D_now() + s_cell - self._wall_s(self._odom()[:3, 3]))
+
+    def _register_wall_strip(self, h, faces):
+        """Initial registration of a strip-mode wall from head frame h at the left end (plan_scans): the plane
+        (_wall_plane), the LEFT side edge (_wall_extent; required: user decision 2026-11-20, the anchor is the left end
+        only) consistent with the wall seen in phase 1 (the halfway rule of _strip_view_points), the right edge when in
+        view as the closure check (|s_R - s_L - W| >= box_w / 2: the wall does not match the layout; otherwise logged),
+        the height = the odometry floor; the floor seen in the head depth is a CHECK only (user answer Q1 2026-11-20:
+        logged against the odometry floor, never applied; >= box_h / 2 off is logged as a rejection, the halfway rule).
+        Returns (None or the failure, the log-only diagnostics); registered: ws.wall with "anchor" {"side": "left", "s", "depth_m", "delta_edge", "root_xy", "t"},
+        "closure" [...], "z0" {"value": 0.0, "source": "odom"}, delta_lat = the margin with D = 0."""
+        L = self.wall_layout
+        W, H = L["columns"] * L["box_w"], L["rows"] * L["box_h"]
+        plane = self._wall_plane(faces)
+        ext = self._wall_extent(h, plane)
+        diag = {"plane": plane, "extent": ext}
+        el, er = ext["left"], ext["right"]
+        if el is None:
+            rj = ext["rejected"]["left"]
+            why = ("no wall surface found on the plane" if ext["seen"] is None else
+                   "no vertical side boundary: the wall's outline runs across the view there"
+                   if rj["boundary"] > rj["cut"] and rj["boundary"] > rj["front"] else
+                   "cut by the image border" if rj["cut"] >= rj["front"] else "occluded")
+            return with_diagnostics(fail(f"the left side edge of the wall ({why}) is not in the head view: call "
+                                         "compute_obs_pose and approach again (they plan the view from what was seen so "
+                                         "far), then plan_scans", {"edges": {sd: ext[sd] for sd in ("left", "right")},
+                                                                   "seen": ext["seen"]}), diag), diag
+        sL = float(el["s"])
+        p0, right, nh = plane["point"], plane["right"], plane["normal"]
+        mem = self._layout_edges or {}
+        S = [float(v) for v in (ext["seen"] or [])]
+        if "seen" in mem:
+            S += list(np.atleast_2d(np.asarray(mem["seen"], float) - p0) @ right)
+        if S and not (min(S) + L["box_w"] / 2 >= sL >= max(S) - W - L["box_w"] / 2):
+            return with_diagnostics(fail(f"the left edge seen at s {sL:.2f} m contradicts the wall seen ({min(S):.2f} .. "
+                                         f"{max(S):.2f} m) for a {W:.2f} m wide layout: call compute_obs_pose and approach "
+                                         "again, then plan_scans", {"s_left": sL, "seen": [min(S), max(S)]}), diag), diag
+        closure = []
+        if er is not None:
+            r = float(er["s"]) - sL - W
+            if abs(r) >= L["box_w"] / 2:
+                return with_diagnostics(fail(f"the wall seen is {er['s'] - sL:.2f} m wide, the layout says {W:.2f} m: the "
+                                             "wall does not match the layout", {"W_meas": er["s"] - sL, "W": W}), diag), diag
+            closure.append({"t": h["t"], "side": "right", "ds_m": r, "D_m": 0.0, "at": "registration"})
+        origin = p0 + sL * right
+        zf = self._floor_height(h, origin + (0.5 * self.strip_columns * L["box_w"]) * right, plane)
+        diag["floor"] = zf
+        fc = {"t": h["t"], "z_floor": None if zf is None else zf["z"], "odom_floor": 0.0,
+              "n_inliers": None if zf is None else zf["n_inliers"], "at": "registration"}
+        if zf is not None and abs(zf["z"]) >= L["box_h"] / 2:
+            fc["note"] = (f"the floor seen at {zf['z']:.3f} m disagrees with the odometry floor by more than half a box: "
+                          "rejected (a check only, the odometry floor is used)")
+        root_xy = np.asarray(h["T_odom_root"], float)[:2, 3].copy()
+        d_edge = self._strip_delta_edge(el["depth"], np.asarray(h["K"], float)[0, 0])
+        self.ws.wall = {"T_odom_wall": self._wall_frame(origin, right, nh), "W": W, "H": H, "columns": L["columns"],
+                        "rows": L["rows"], "box_w": L["box_w"], "box_h": L["box_h"], "delta_lat": None,
+                        "t": h["t"], "anchor_root_xy": root_xy,
+                        "anchor": {"side": "left", "s": sL, "depth_m": float(el["depth"]), "delta_edge": d_edge,
+                                   "root_xy": root_xy.copy(), "t": h["t"], "closure_open": er is None},
+                        "closure": closure, "z0": {"value": 0.0, "source": "odom", "t": h["t"]},
+                        "floor_checks": [fc],
+                        "registration": {"s_L": sL, "s_R": None if er is None else float(er["s"]),
+                                         "mad_L": el["mad"], "n_rows_L": el["n_rows"], "depth_L": el["depth"],
+                                         "z_floor_depth": None if zf is None else zf["z"],
+                                         "z_floor_note": None if zf is not None else
+                                         "the floor is not in view: the odometry floor is used (the floor is a check only)",
+                                         "plane_offset": plane["offset"], "n_faces": plane["n_faces"], "t": h["t"]},
+                        "history": []}
+        self.ws.wall["delta_lat"] = self._strip_delta(0.0)
+        return None, diag
+
+    def _strip_init_ledger(self, h):
+        """The strip ledger (WorldState.strips) after the strip-mode plan: the robot stands at strip 1 (the anchor);
+        ref_w of strip 1 = the root in the wall frame now (replaced by the first stance reached in the strip)."""
+        w, N = self.strip_columns, self.n_strips
+        rw = apply(inv_T(self._wall_T()), np.asarray(h["T_odom_root"], float)[:3, 3][None])[0]
+        self.ws.strips = {"width": w, "n": N, "current": 1, "done_reported": None,
+                          "strips": {k: {"columns": [(k - 1) * w + 1, k * w], "ref_w": None, "ref_source": None}
+                                     for k in range(1, N + 1)},
+                          "moves": []}
+        self.ws.strips["strips"][1].update(ref_w=[float(rw[0]), float(rw[1])], ref_source="plan_scans")
+
+    def _entry_strip(self, bc) -> int | None:
+        """Strip of a layout entry (derived from its cell, never stored: labels added by _convert_cell carry the cell)."""
+        return None if bc.wall is None else strip_of(bc.wall["cell"][0], self.strip_columns)
+
+    def _strip_pending(self, k) -> list:
+        ws = self.ws
+        return [b for b in ws.scan_plan if ws.barcodes[b].status == "pending" and self._entry_strip(ws.barcodes[b]) == k]
+
+    def _next_strip(self):
+        """The first strip after the current one that holds a requested box not handled yet; None outside strip mode or
+        when there is none (strips without requested boxes are skipped)."""
+        if not self.strip_mode or self.ws.strips is None:
+            return None
+        cur = self.ws.strips["current"]
+        ks = sorted({self._entry_strip(self.ws.barcodes[b]) for b in self.ws.scan_plan
+                     if self.ws.barcodes[b].status == "pending"} - {None})
+        return next((k for k in ks if k > cur), None)
+
+    def _strip_progress(self, k) -> dict:
+        """Progress of strip k from the entry statuses: per requested row (from the top) the number of boxes, of boxes
+        with a label scanned and of boxes handled (no entry of the box pending)."""
+        ws, L = self.ws, self.wall_layout
+        cells = {}
+        for b in ws.scan_plan:
+            bc = ws.barcodes[b]
+            if bc.wall is None or not ws.targeted(b) or self._entry_strip(bc) != k:
+                continue
+            cells.setdefault(tuple(bc.wall["cell"]), []).append(bc.status)
+        rows = []
+        for r in sorted({c[1] for c in cells}, reverse=True):
+            mine = [st for c, st in cells.items() if c[1] == r]
+            rows.append({"row_from_bottom": r, "boxes": len(mine), "scanned": sum("scanned" in st for st in mine),
+                         "handled": sum("pending" not in st for st in mine)})
+        cols = self.ws.strips["strips"][k]["columns"] if self.ws.strips else None
+        return {"strip": k, "of": self.n_strips, "columns": cols, "rows": rows,
+                "done": all(r["handled"] == r["boxes"] for r in rows)}
+
+    def _strip_text(self, k) -> str:
+        c0, c1 = self.ws.strips["strips"][k]["columns"]
+        return f"strip {k} of {self.n_strips} (columns {c0}-{c1})"
+
     def _requested_cells(self) -> list:
         """Requested layout cells [(c, r)] (column from the left, row from the bottom, 1-based): "all" / an absent
         dimension -> every index; *_from_left / *_from_bottom i -> i; *_from_right / *_from_top i -> n + 1 - i."""
@@ -1621,13 +1981,15 @@ class Toolbox:
         boxes = [{"id": k, "bbox": b.bbox} for k, b in ws.boxes.items()]
         if not faces:
             return fail("no box face fitted from here", {"boxes": boxes, "skipped": skipped})
-        failed, reg_diag = self._register_wall(h, list(faces.values()))
+        strips = self.strip_mode
+        failed, reg_diag = (self._register_wall_strip if strips else self._register_wall)(h, list(faces.values()))
         if failed is not None:
             return failed
         L, wall = self.wall_layout, ws.wall
         rule = self._order_rule()
         cells = self._requested_cells()
-        order = order_lattice([{"key": f"c{c}_r{r}", "column": c, "row": L["rows"] + 1 - r} for c, r in cells], rule)
+        order = order_lattice([{"key": f"c{c}_r{r}", "column": c, "row": L["rows"] + 1 - r} for c, r in cells], rule,
+                              **({"strip_columns": self.strip_columns} if strips else {}))
         by_key = {f"c{c}_r{r}": (c, r) for c, r in cells}
         T_ref = np.asarray(h["T_odom_root"], float)
         for o in order:
@@ -1684,6 +2046,22 @@ class Toolbox:
         out = [{"id": b, "kind": ws.barcodes[b].kind, "cell": ws.barcodes[b].grid_cell,
                 "center_odom": ws.barcodes[b].center, "status": ws.barcodes[b].status, "face_id": 0} for b in ws.scan_plan
                if ws.barcodes[b].wall is not None]
+        if strips:
+            self._strip_init_ledger(h)
+            k1 = 1 if self._strip_pending(1) else self._next_strip()
+            data = {"n": len(out), "barcodes": out, "boxes": boxes, "skipped": skipped, "face_id": 0,
+                    "face": self.TOUR[0], "first_for_face": True,
+                    "order_rule": scan_order_text(rule, self.strip_columns), "targets": targets,
+                    "registration": {"anchor": {"side": "left", "s": reg["s_L"], "n_rows": reg["n_rows_L"]},
+                                     "delta_lat": wall["delta_lat"], "z0": wall["z0"], "closure": wall["closure"],
+                                     "z_floor_depth": reg["z_floor_depth"]},
+                    "strips": self._strip_progress(k1)}
+            diag = {"registration": dict(reg, delta_lat=wall["delta_lat"], anchor=wall["anchor"],
+                                         T_odom_wall=wall["T_odom_wall"]), **reg_diag}
+            c0, c1 = self.ws.strips["strips"][1]["columns"]
+            return with_diagnostics(ok(data, f"{len(out)} box(es) planned for {targets['description']} in strips of "
+                                             f"{self.strip_columns} columns (strip 1 = columns {c0}-{c1} at the left end, "
+                                             "where the robot stands); call next_barcode"), diag)
         data = {"n": len(out), "barcodes": out, "boxes": boxes, "skipped": skipped, "face_id": 0, "face": self.TOUR[0],
                 "first_for_face": True, "order_rule": scan_order_text(rule), "targets": targets,
                 "registration": {"W_meas": reg["W_meas"], "r": reg["r"],
@@ -1739,7 +2117,7 @@ class Toolbox:
         long_axis = L_k (look_view.roll_axis), signed: the side of the scan axis the camera sits on matters."""
         from ..perception.look_view import roll_axis
         L = self.wall_layout
-        dl, e = self._search_grow()
+        dl, e = self._search_grow(bc, plan=True)
         sv = self._search_view(L["box_w"], L["box_h"], dl, e)
         f = self._cell_face(*bc.wall["cell"])
         ctr, n, right, up = (np.asarray(f[k], float) for k in ("center", "normal", "right", "up"))
@@ -1800,6 +2178,55 @@ class Toolbox:
                 for sd in ("left", "right")} | {"rejected": ext["rejected"]}
 
     def _reregister_at_stance(self) -> dict:
+        """_reregister_wall (below); in strip mode also the floor check and the lateral margin of the frame after it
+        (_strip_after_reregistration)."""
+        rec = self._reregister_wall()
+        if self.strip_mode:
+            self._strip_after_reregistration(rec)
+        return rec
+
+    def _strip_after_reregistration(self, rec):
+        """Strip mode, after a re-registration record rec: the floor CHECK (user answer Q1 2026-11-20: the floor seen in
+        the head depth is logged against the odometry floor, never applied; |z_floor| >= box_h / 2 is logged as a
+        rejection, the halfway rule) at the wall point in front of the root, and the lateral margin delta (_strip_delta
+        with the displacement since the anchor edge) stored as delta_lat; both go into rec."""
+        wall, h = self.ws.wall, self.head
+        ax = self._wall_axes()
+        root = self._odom()[:3, 3]
+        if rec.get("region_px"):
+            base = ax["origin"] + float((root - ax["origin"]) @ ax["right"]) * ax["right"]
+            zf = self._floor_height(h, base, {"point": ax["origin"], "normal": ax["normal"]})
+            fc = {"t": rec["t"], "z_floor": None if zf is None else zf["z"], "odom_floor": 0.0,
+                  "n_inliers": None if zf is None else zf["n_inliers"], "at": "stance"}
+            if zf is not None and abs(zf["z"]) >= wall["box_h"] / 2:
+                fc["note"] = (f"the floor seen at {zf['z']:.3f} m disagrees with the odometry floor by more than half a "
+                              "box: rejected (a check only, the frame is unchanged)")
+            wall["floor_checks"].append(fc)
+            rec["floor_check"] = fc
+        wall["delta_lat"] = self._delta_now()
+        rec["delta_lat"] = wall["delta_lat"]
+        rec["D_m"] = self._strip_D_now()
+
+    def _strip_anchor(self, el, er, root, right, net, t):
+        """Strip mode: the lateral re-anchor of a re-registration from the side edges in view (el / er on the refit
+        plane): the left edge when in view (the anchor side of the task), else the right one (ds = its offset from where
+        the frame puts that end). The first edge of the side opposite to the current anchor after that anchor was set
+        is logged as a closure {"t", "side", "ds_m" (the shift it implies, before anything is applied), "D_m" (the net
+        lateral displacement since the anchor), "root_w"}; never blocking. Returns (ds or None, the side used)."""
+        wall = self.ws.wall
+        W = wall["W"]
+        ds_of = {"left": None if el is None else float(el["s"]), "right": None if er is None else float(er["s"]) - W}
+        side = "left" if el is not None else "right" if er is not None else None
+        a = wall["anchor"]
+        opp = "right" if a["side"] == "left" else "left"
+        if ds_of[opp] is not None and a.get("closure_open", True):
+            rw = apply(inv_T(self._wall_T()), np.asarray(root, float)[None])[0]
+            wall["closure"].append({"t": t, "side": opp, "ds_m": ds_of[opp], "D_m": net,
+                                    "ds_anchor_side_m": ds_of[a["side"]], "root_w": [float(rw[0]), float(rw[1])]})
+            a["closure_open"] = False
+        return (None, None) if side is None else (ds_of[side], side)
+
+    def _reregister_wall(self) -> dict:
         """Re-register the wall frame from the head at a stance (arm home): fit_front_face, in odom (gravity-aligned),
         on the pixels where the registered wall is predicted (_wall_region). 2026-11-20 rule run i=151 (bc17, a stance
         0.3 m beyond the wall's right end, squatted to base_height 0.45 with the pelvis pitched 21 deg; reproduced in
@@ -1870,14 +2297,18 @@ class Toolbox:
         rec.update(edges=self._edge_log(ext), edges_on="refit plane")
         el, er = ext["left"], ext["right"]
         ds = None
-        if el is not None and er is not None:
-            ds = 0.5 * (el["s"] + er["s"]) - wall["W"] / 2
-        elif el is not None:
-            ds = el["s"]
-        elif er is not None:
-            ds = er["s"] - wall["W"]
-        anchored = [sd for sd, e_ in (("left", el), ("right", er)) if e_ is not None]
         net = float((root[:2] - np.asarray(wall["anchor_root_xy"], float)) @ right[:2])
+        if self.strip_mode:
+            ds, side_used = self._strip_anchor(el, er, root, right, net, h["t"])
+            anchored = [] if side_used is None else [side_used]
+        else:
+            if el is not None and er is not None:
+                ds = 0.5 * (el["s"] + er["s"]) - wall["W"] / 2
+            elif el is not None:
+                ds = el["s"]
+            elif er is not None:
+                ds = er["s"] - wall["W"]
+            anchored = [sd for sd, e_ in (("left", el), ("right", er)) if e_ is not None]
         if ds is not None:
             shift_a = self._wall_shift(self._wall_frame(origin + ds * right, right, normal))
             rec["shift_anchored_m"] = shift_a
@@ -1890,6 +2321,11 @@ class Toolbox:
         if ds is not None:
             origin = origin + ds * right
             wall["anchor_root_xy"] = root[:2].copy()
+            if self.strip_mode:
+                e_ = el if anchored[0] == "left" else er
+                wall["anchor"] = {"side": anchored[0], "s": float(e_["s"]), "depth_m": float(e_["depth"]),
+                                  "delta_edge": self._strip_delta_edge(e_["depth"], np.asarray(h["K"], float)[0, 0]),
+                                  "root_xy": root[:2].copy(), "t": h["t"], "closure_open": True}
         wall["T_odom_wall"] = self._wall_frame(origin, right, normal)
         rec.update(refit=True, ds_m=ds, anchored=anchored, net_lateral_since_anchor_m=net)
         wall["history"].append(rec)
@@ -1966,7 +2402,7 @@ class Toolbox:
         alt = t["alternatives"][int(st.get("look_alt") or 0)]
         ta = dict(t, pos=alt["pos"], long_axis=alt["long_axis"])
         self.ws.wrist_target = ta
-        dl, e = self._search_grow()
+        dl, e = self._search_grow(bc)
         c, r = bc.wall["cell"]
         cell = self._cell_rect(c, r)
         see = self._cell_rect(c, r, dl, 0.0)
@@ -2028,7 +2464,7 @@ class Toolbox:
         self._store_layout(b)
 
     def _record_failed_stance(self, bc, st):
-        self._failed_stances.add((bc.id, tuple(st["target_pos"]), st["face_dist"], st["lateral_offset"], st["level_index"]))
+        self._failed_stances.add(self._failed_key(bc.id, st))
 
     def search_cell(self, barcode_id: str | None = None):
         """Wall-layout task: find the label of the current box (an entry of kind "cell") with the hand camera, at the
@@ -2060,7 +2496,8 @@ class Toolbox:
         if bc.status != "pending":
             return fail(f"{bc.id} is already recorded {bc.status}: call next_barcode")
         st = self.ws.stance_target
-        if st is None or st.get("barcode_id") != bc.id or st.get("purpose") != "look":
+        if st is None or (st.get("barcode_id") != bc.id and bc.id not in (st.get("serves") or [])) \
+                or st.get("purpose") != "look":
             return fail(f"no hand-camera view stance planned for {bc.id}: call compute_wrist_target, plan_stance, then "
                         "approach('stance_target')")
         if getattr(self, "_stance_reached", None) is not st:
@@ -2082,6 +2519,15 @@ class Toolbox:
             if res["outcome"] != "none":
                 break
         last = rounds[-1]
+        added = self._convert_cell(bc, last["assigned"]) if last["outcome"] == "found" else None
+        members, member_diag = [], []
+        if self.strip_mode:
+            # strip mode: the other boxes of the row this stance was planned for are searched from here too, whatever
+            # the current box's outcome (the walk is made; the scan order is unaffected); not marked attempted: a box
+            # left partial gets its own stance when it is current
+            wt0 = self.ws.wrist_target
+            members, member_diag = self._search_members(bc, st)
+            self.ws.wrist_target = wt0
         n_views = sum(len(rd["views"]) for rd in rounds)
         rereg = [rd["reregistration"] for rd in rounds]
 
@@ -2097,14 +2543,27 @@ class Toolbox:
         diag = {"rounds": [{"outcome": rd["outcome"], "reregistration": rd["reregistration"],
                             "views": [view_log(v) for v in rd["views"]]} for rd in rounds]}
         base = {"barcode_id": bc.id, "views": n_views, "reregistration": rereg}
+        more_m = ""
+        if self.strip_mode and members:
+            diag["cells"] = members
+            diag["member_rounds"] = [{"barcode_id": x["barcode_id"],
+                                      "rounds": [{"outcome": rd["outcome"], "reregistration": rd["reregistration"],
+                                                  "views": [view_log(v) for v in rd["views"]]} for rd in x["rounds"]]}
+                                     for x in member_diag]
+            base["row_members"] = [{k: x[k] for k in ("outcome", "barcode_status") if k in x} for x in members]
+            words = {"found": "label found (next_barcode gives it after this one; call no tool for it now)",
+                     "no_label": "no label in the box (recorded)",
+                     "partial": "not fully seen from here (it gets its own stance when it is current)"}
+            more_m = "".join(f"; the next box of this row was also searched: "
+                             f"{words['no_label' if x.get('barcode_status') == 'no_label' else 'found' if x['outcome'] == 'found' else 'partial']}"
+                             for x in members)
         if last["outcome"] == "ik":
             self._record_failed_stance(bc, st)
             # as a partial search (rule mode: one new stance and search for both)
             return with_diagnostics(fail("hand-camera view not reachable from this stance: move_arm('home'), "
                                          "compute_wrist_target -> plan_stance -> approach -> search_cell again (once), "
-                                         "then next_barcode", dict(base, ik=last["reason"])), diag)
+                                         "then next_barcode" + more_m, dict(base, ik=last["reason"])), diag)
         if last["outcome"] == "found":
-            added = self._convert_cell(bc, last["assigned"])
             tr = self.compute_wrist_target(bc.id)
             if tr["status"] != "ok":
                 return with_diagnostics(fail(f"label found, wrist target: {tr['reason']}", base), diag)
@@ -2120,27 +2579,66 @@ class Toolbox:
                         wrist_target_odom=tr["data"]["wrist_target_odom"], offset=tr["data"]["offset"],
                         scan_from_this_stance=here["ok"])
             if here["ok"]:
-                return with_diagnostics(ok(data, "label found in the box face; call move_arm('final')" + more), diag)
+                return with_diagnostics(ok(data, "label found in the box face; call move_arm('final')" + more + more_m),
+                                        diag)
             self.ws.stance_target = None              # the look stance is no stance for the label's scan poses
             return with_diagnostics(ok(data, "label found in the box face, but its scan pose is not reachable from this "
                                              "stance (planned for the view of the whole face): plan its scan stance: "
                                              "move_arm('home'), compute_wrist_target -> plan_stance -> approach -> "
                                              "move_arm('pre') -> refine_with_wrist -> move_arm('final') -> "
                                              "refine_with_wrist -> move_arm('final') -> check_wrist_placement -> scan"
-                                             + more), diag)
+                                             + more + more_m), diag)
         if last["outcome"] == "none":
-            dl, _ = self._search_grow()
+            dl, _ = self._search_grow(bc)
             bc.status = "no_label"
             bc.fail_reason = (f"the whole box face (grown by {dl:.3f} m laterally) was in the hand-camera view and no "
                               f"label centre lies in it ({len(rounds)} searches)")
             return with_diagnostics(ok(dict(base, barcode_status="no_label"),
-                                       "no label in this box: move_arm('home'), next_barcode"), diag)
+                                       "no label in this box: move_arm('home'), next_barcode" + more_m), diag)
         self._record_failed_stance(bc, st)
         why = ("the box face was not fully in the hand-camera view from the pose reached" if last["outcome"] == "uncovered"
                else "a label at the border of the box face was not seen whole, also not from a view centred on it")
         return with_diagnostics(partial(f"{why}: move_arm('home'), compute_wrist_target -> plan_stance -> approach -> "
-                                        "search_cell again (once), then next_barcode", dict(base, outcome=last["outcome"])),
-                                diag)
+                                        "search_cell again (once), then next_barcode" + more_m,
+                                        dict(base, outcome=last["outcome"])), diag)
+
+    def _search_members(self, bc, st):
+        """Strip mode, search_cell: every other box the look stance st serves (st["serves"], plan order) that is still a
+        pending cell entry is searched from this stance as the current one (arm home, the wall re-registered, the look
+        pose of its own alternative st["look_alts"], a second search after "none"): found -> its entry becomes the label
+        (_convert_cell), none twice -> no_label, otherwise it stays a cell. Returns ([{"barcode_id", "outcome",
+        "barcode_status"?, "added"?}], [{"barcode_id", "rounds"}]) (ids for the harness and the logs only)."""
+        out, logs = [], []
+        for mid in (st.get("serves") or [])[1:]:
+            m = self.ws.barcodes.get(mid)
+            if m is None or m.kind != "cell" or m.status != "pending":
+                continue
+            rounds = []
+            for _ in range(2):
+                hm = self.move_arm("home")
+                if hm["status"] != "ok":
+                    rounds.append({"outcome": "home_failed", "reason": hm["reason"], "views": [], "reregistration": None})
+                    break
+                rr = self._reregister_at_stance()
+                res = self._search_round(m, dict(st, look_alt=st["look_alts"][mid]))
+                res["reregistration"] = rr
+                rounds.append(res)
+                if res["outcome"] != "none":
+                    break
+            last = rounds[-1]
+            rec = {"barcode_id": mid, "outcome": last["outcome"]}
+            if last["outcome"] == "found":
+                rec["added"] = self._convert_cell(m, last["assigned"])
+            elif last["outcome"] == "none":
+                dl, _ = self._search_grow(m)
+                m.status = "no_label"
+                m.fail_reason = (f"the whole box face (grown by {dl:.3f} m laterally) was in the hand-camera view and no "
+                                 f"label centre lies in it ({len(rounds)} searches, from the stance of the row's box "
+                                 f"{bc.id})")
+                rec["barcode_status"] = "no_label"
+            out.append(rec)
+            logs.append({"barcode_id": mid, "rounds": rounds})
+        return out, logs
 
     def _convert_cell(self, bc, assigned) -> list:
         """The cell entry becomes the first of its labels in the within-cell order of the task's rule
@@ -2175,7 +2673,7 @@ class Toolbox:
         nearest to the current estimate. Returns (frame, rec, est, n_hidden) or (frame, None, None, n_hidden); n_hidden:
         the labels centred in the cell dropped only because part of them lies outside the free view."""
         w = self._capture_wrist()
-        dl, e = self._search_grow()
+        dl, e = self._search_grow(bc)
         c, r = bc.wall["cell"]
         cell = self._cell_rect(c, r)
         keep, n_hidden = [], 0
@@ -2579,6 +3077,8 @@ class Toolbox:
         # wall layout: the cells are fixed by the layout, no plan update from here
         update = self._plan_update_from_here() if self.task == 3 and prev is not None and self.wall_layout is None else None
         diag = None if update is None else {"plan_update": update.pop("diagnostics")}     # logged, not shown (D11)
+        if self.strip_mode and ws.strips is not None:
+            return self._next_barcode_strip(prev, closed, cur)
         nxt = next((b for b in ws.scan_plan if ws.barcodes[b].status == "pending" and ws.barcodes[b].face_id == cur), None)
         ws.current_barcode_id = nxt
         base = {"closed": closed, "n_planned": len(ws.scan_plan), "scanned": [e["content"] for e in ws.scanned],
@@ -2597,6 +3097,123 @@ class Toolbox:
         if self.wall_layout is not None:
             data["kind"] = bc.kind
         return with_diagnostics(ok(data, f"current barcode: {nxt}"), diag)
+
+    def _next_barcode_strip(self, prev, closed, face):
+        """next_barcode in strip mode (after the attempted-check and the closing of an unfinished current entry): the
+        next pending entry of the CURRENT strip only, with the strip's per-row progress, the entry's row and whether it
+        starts a new row; with none left in the strip: strip_done (the next strip holding a requested box: call
+        go_to_next_strip) or done (no later strip holds one). The other boxes of a row are not named (ids only in the
+        diagnostics: an id in the reply invites the LLM to work on it)."""
+        ws, S = self.ws, self.ws.strips
+        k = S["current"]
+        ws.current_barcode_id = None
+        base = {"closed": closed, "n_planned": len(ws.scan_plan), "scanned": [e["content"] for e in ws.scanned],
+                "scan_plan": ws.scan_plan_export(), "face_id": face, "face": self.TOUR[face], "plan_update": None}
+        pend = self._strip_pending(k)
+        prog = self._strip_progress(k)
+        if not pend:
+            k2 = self._next_strip()
+            if k2 is not None:
+                S["done_reported"] = k
+                n_h = sum(r["handled"] for r in prog["rows"])
+                n_b = sum(r["boxes"] for r in prog["rows"])
+                st = {}
+                for b in ws.scan_plan:
+                    bc = ws.barcodes[b]
+                    if self._entry_strip(bc) == k and ws.targeted(b):
+                        st[bc.status] = st.get(bc.status, 0) + 1
+                what = ", ".join(f"{v} {s_}" for s_, v in st.items())
+                return ok(dict(base, done=False, strip_done=True, next_strip=k2, strip=prog),
+                          f"{self._strip_text(k)} finished: {n_h} of {n_b} boxes handled ({what}): call "
+                          f"go_to_next_strip (it stands up and steps to {self._strip_text(k2)}), then next_barcode")
+            return ok(dict(base, done=True, strip=prog), "every planned barcode has been handled")
+        nxt = pend[0]
+        ws.current_barcode_id = nxt
+        bc = ws.barcodes[nxt]
+        pb = ws.barcodes.get(prev) if prev is not None else None
+        row = bc.wall["cell"][1]
+        new_row = pb is None or pb.wall is None or pb.wall["cell"][1] != row or self._entry_strip(pb) != k
+        remaining = sum(ws.barcodes[b].status == "pending" for b in ws.scan_plan) - 1
+        data = dict(base, done=False, barcode_id=nxt, index=bc.order_index, box_id=bc.box_id, remaining=remaining,
+                    width_m=bc.width_m, standoff_m=self._standoff_or_none(bc), kind=bc.kind, strip=prog,
+                    row_from_bottom=row, new_row=new_row)
+        mates = [b for b in pend[1:] if ws.barcodes[b].wall["cell"][1] == row]
+        reason = f"current barcode: {nxt}" + (" (a new row: plan_stance plans one stance for this row's boxes of the "
+                                              "strip when possible)" if new_row and mates else "")
+        return with_diagnostics(ok(data, reason), {"row_mates": mates})
+
+    def go_to_next_strip(self):
+        """Strip mode (user decision 2026-11-20): after next_barcode reported strip_done, stand up and step along the
+        registered wall to the next strip holding a requested box: one step of strip_columns x box_w per strip from
+        the strip's reference stance (ref_w, wall frame, facing the wall), converted to odometry with the CURRENT frame;
+        the segmented walk of a stance approach (no re-perception, no arrival check), then the wall re-registered from
+        the head (plane, side-edge re-anchor where in view, closure, margin, floor check). Strips without requested
+        boxes are crossed in such steps inside this call, each re-registered (odometry is trusted over one step). A
+        failed refit is noted, not failed (the frame carries over by odometry for one step); a walk that falls or
+        collides fails. Refused while the current strip has unfinished boxes or before next_barcode reported it done."""
+        ws = self.ws
+        if not self.strip_mode or ws.wall is None or ws.strips is None:
+            return fail("go_to_next_strip is for a wall-layout task worked in strips, after plan_scans registered the wall")
+        S = ws.strips
+        k = S["current"]
+        if self._strip_pending(k):
+            return fail(f"strip {k} still has unfinished boxes: call next_barcode")
+        if S["done_reported"] != k:
+            return fail(f"strip {k} has not been reported finished: call next_barcode (it reports strip_done)")
+        k2 = self._next_strip()
+        if k2 is None:
+            return fail("no later strip holds a requested box: call next_barcode")
+        g = self._walk_guard()
+        if g is not None:
+            return g
+        L = self.wall_layout
+        step_w = self.strip_columns * L["box_w"]
+        steps, closure0 = [], len(ws.wall["closure"])
+        for j in range(k, k2):
+            ref = S["strips"][j]["ref_w"]
+            p_w = [float(ref[0]) + step_w, float(ref[1])]
+            T = self._wall_T()
+            P = apply(T, np.array([[p_w[0], p_w[1], 0.0]]))[0]
+            yaw = math.atan2(T[1, 1], T[0, 1])                 # facing the wall: along its into-the-wall axis
+            log = self._walk_to(P[:2], yaw)
+            if log and log[-1]["status"] in ("fell", "collision"):
+                return fail(f"move: {log[-1]['status']} ({log[-1]['move'].get('reason')})",
+                            {"steps": steps, "log": log})
+            rec = self._reregister_at_stance()
+            aw = apply(inv_T(self._wall_T()), self._odom()[:3, 3][None])[0]
+            S["strips"][j + 1].update(ref_w=p_w, ref_source="step")
+            steps.append({"to_strip": j + 1, "target_w": p_w, "arrival_w": [float(aw[0]), float(aw[1])],
+                          "residual_w": [float(aw[0] - p_w[0]), float(aw[1] - p_w[1])],
+                          "reregistration": self._rereg_summary(rec), "reregistration_record": rec, "log": log})
+        S["moves"].append({"from": k, "to": k2, "steps": steps, "closure": ws.wall["closure"][closure0:]})
+        S["current"], S["done_reported"] = k2, None
+        c0, c1 = S["strips"][k2]["columns"]
+        data = {"strip": k2, "of": self.n_strips, "columns": [c0, c1],
+                "steps": [{k_: st_[k_] for k_ in ("to_strip", "target_w", "arrival_w", "reregistration")} for st_ in steps],
+                "closure": ws.wall["closure"][closure0:]}
+        return with_diagnostics(ok(data, f"at {self._strip_text(k2)}, wall re-registered: call next_barcode"),
+                                {"steps": steps})
+
+    def _walk_to(self, pos, yaw) -> list:
+        """The segmented walk of a stance approach (_approach with a stance target) to an odom pose, standing: steps of
+        approach.segment_frac of the remaining distance (at most max_segment_m), the last one below final_below_m at
+        the precise speed; no re-perception, no arrival check. Returns the move log (a fall / collision ends it)."""
+        A = self._c1()["approach"]
+        log = []
+        for _ in range(A["max_segments"]):
+            dx, dy, dyaw = self._rel(pos, yaw)
+            dist = math.hypot(dx, dy)
+            if dist < A["final_below_m"]:
+                r = self.robot.move_root_relative(dx, dy, dyaw, A["move_timeout_s"], speed_scale=A["precise_speed_scale"])
+                log.append({"final": [dx, dy, dyaw], "status": r["status"], "move": move_summary(r)})
+                return log
+            step = min(dist * A["segment_frac"], A["max_segment_m"])
+            r = self.robot.move_root_relative(step * dx / dist, step * dy / dist, dyaw * step / dist, A["move_timeout_s"])
+            log.append({"segment": [step * dx / dist, step * dy / dist, dyaw * step / dist], "status": r["status"],
+                        "move": move_summary(r)})
+            if r["status"] in ("fell", "collision"):
+                return log
+        return log
 
     def _plan_update_from_here(self) -> dict:
         """Look again from where the robot is now (closer to the side than the observation pose) before choosing the
@@ -2848,7 +3465,9 @@ class Toolbox:
         ignored = None
         if bc.kind == "cell":
             # wall layout, a box whose label is not found yet: the hand-camera view of the whole box face (search_cell);
-            # a caller's offset is ignored as for labels
+            # a caller's offset is ignored as for labels. Strip mode: the margin of this plan, from here (_delta_plan)
+            if self.strip_mode:
+                bc.wall["delta_plan"] = self._delta_plan(bc)
             t = self._look_target(bc)
             self.ws.wrist_target = t
             self.ws.wrist_target_refined = None
@@ -2946,7 +3565,14 @@ class Toolbox:
         """Root stance for the wrist target: a grid of positions relative to the barcode (distance from its face in
         [min_face_dist, max_face_dist], lateral offset along the robot's left axis), yaw facing the face; every point
         needs IK solutions for the pre-pose and the final pose. Cost: largest joint-limit margin, then the shortest
-        walk from the current root."""
+        walk from the current root.
+        Strip mode (user decision 2026-11-20: one stance per strip row; squat and re-look instead of walking): the
+        current barcode's group = it + the other pending entries of its kind in its strip row (_stance_group); tried in
+        this order: where the robot stands (_in_place_stance) for the group, then for the current barcode alone; the
+        grid laid around the group's centre for the group (every member feasible, the worst member's cost, robust for
+        every member); the grid for the current barcode alone (exactly the approach-A plan). The stance records the
+        members it serves ("serves", per member "look_alts" or "pre_gaps" / "target_pos_by" / "finals_by") and, when
+        planned in place, the walk counter ("in_place")."""
         t = self.ws.wrist_target_refined if which == "refined" else self.ws.wrist_target
         if t is None and self.ws.current_barcode_id is not None and which != "refined":
             # the wrist target of the current barcode follows from its estimate alone: computed here when the caller
@@ -2966,7 +3592,6 @@ class Toolbox:
         nh = np.array([n[0], n[1], 0.0]); nh /= np.linalg.norm(nh)
         yaw = math.atan2(-nh[1], -nh[0])
         left = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
-        base = np.array([bc.center[0], bc.center[1], 0.0])
         # every known face is an obstacle: with boxes of different setbacks, a stance lateral to the barcode can stand
         # in front of a neighbouring face that sticks out toward the robot (min_face_dist applies to it too). The
         # barcode's own face never rejects more than the plane test above (distance to a segment >= to its line).
@@ -2975,33 +3600,8 @@ class Toolbox:
         q0 = self._q()
         dists = np.arange(S["min_face_dist_m"], S["max_face_dist_m"] + 1e-9, S["step"])
         lat = np.arange(S["lateral_range"][0], S["lateral_range"][1] + 1e-9, S["step"])
-        # required final distances: the stand-off, and with a head width (an upper bound of the symbol) also the clamp
-        # min_m, the closest the wrist measurement can bring the final pose. Pre-pose: the configured gap behind the
-        # stand-off is preferred; the pre-pose only has to keep the wrist camera at least as far as the largest
-        # possible final distance (the final move then goes forward), so smaller gaps down to 0 are accepted in
-        # stance-grid steps when the preferred one is out of reach (deep squats, 2026-11-06 stack scene)
-        # With a head width (an upper bound of the symbol: the true stand-off lies in [min_m, offset]) the final
-        # distance is not known yet: the stance must reach the clamp min_m and a pre-pose as far as possible up to
-        # offset + the pre gap, from which the wrist camera measures the code; the final pose then lies between the
-        # two reachable ends (forward, or back if the pre-pose had to be closer than the measured stand-off). A head
-        # stand-off that is out of reach does not veto the stance (2026-11-06 stack scene: the 0.19 m code at the
-        # head's 0.30 m is unreachable in any squat, at the measured 0.20 m it is reachable).
-        c2 = self._c2()
-        S3 = c2["standoff"]
-        gap0 = float(c2["pre_offset_m"] - c2["offset_m"])
         look = t.get("purpose") == "look"
-        if look:
-            # wall layout, the hand-camera view of a box face (search_cell): the look pose only, approached from home
-            # (no pre-pose); its quarter-roll alternatives tie geometrically, reachability decides (the largest
-            # manipulability, the planner's posture criterion)
-            finals, pre_dists = [float(t["offset"])], []
-        elif S3["mode"] == "adaptive" and bc.width_source != "wrist":
-            # head / hand_label width: an upper bound of the symbol
-            finals = [float(S3["min_m"])]
-            pre_dists = list(np.arange(t["offset"] + gap0, float(S3["min_m"]) - 1e-9, -S["step"]))
-        else:
-            finals = [t["offset"]]
-            pre_dists = list(np.arange(t["offset"] + gap0, t["offset"] - 1e-9, -S["step"]))
+        cur = self._stance_member(bc, t)
         body = self._body()
         # body heights to try, standing first: the walker's measured squat levels (robot.yaml body.calibration), or
         # only the current height for a walker without a body command. The first (highest) level with a feasible
@@ -3009,30 +3609,41 @@ class Toolbox:
         levels = body.levels if body is not None else [None]
         R_yaw = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
         rejected = {"reach": 0, "ik": 0, "face_clearance": 0, "self_clearance": 0, "not_robust": 0, "failed_placement": 0}
-        best, chosen, chosen_li, fallback, cands = None, None, None, None, []
         # stances that already failed placement for this barcode and this exact wrist target (check_wrist_placement):
         # the planner is deterministic (per-candidate IK seeds), so identical inputs would give the identical stance and
         # the identical failure (2026-11-19 scanroom: the same stance 4 times, ~600 s). A changed target is a new problem.
         # a look target is recomputed on every re-registration of the wall: its identity is the box (the barcode id)
-        tpos = ("look",) if look else _stance_target_key(t["pos"])
-        alts = [dict(t, pos=a["pos"], long_axis=a["long_axis"]) for a in t["alternatives"]] if look else [t]
+        tpos = cur["tpos"]
         failed = {(d_, l_, li_) for (b_, tp_, d_, l_, li_) in self._failed_stances if b_ == bc.id and tp_ == tpos}
-        restarts = self.ik.cfg["restarts"]
-        self.ik.cfg["restarts"] = 1
         stall = (int(self.ik.cfg["plan_stall_window"]), float(self.ik.cfg["plan_stall_eps_m"]))
-        try:
+        strips = self.strip_mode
+
+        def rel(p):
+            """Identity of a stance point for the failed-stance record: (face distance, lateral offset) of the pelvis
+            point relative to the CURRENT barcode (strip mode: a group grid is laid around the group's centre)."""
+            v = np.asarray(p, float)[:2] - cur["base"][:2]
+            return float(v @ nh[:2]), float(v @ left[:2])
+
+        def grid(members):
+            """The grid search of plan_stance for a group of members (the current one first): a point is feasible when
+            every member has an IK-feasible alternative there; per member the alternative with the largest
+            manipulability; cost = (-the smallest pre gap, -the smallest manipulability, travel) over the members (the
+            stance is as good as its worst member; one member: approach A's cost); clearances and robustness for every
+            member. Returns (best, chosen level, its index, fallback)."""
+            best, chosen, chosen_li, fallback, cands = None, None, None, None, []
+            base = cur["base"] if len(members) == 1 else np.mean([m["base"] for m in members], axis=0)
             for li, lv in enumerate(levels):
                 q_lv = q0 if lv is None else body.q_at(q0, lv)
                 # with the feet fixed the pelvis moves while squatting: walk (standing) to the pelvis position minus
                 # that shift, so the squatted pelvis lands on the planned point
                 shift = np.zeros(2) if lv is None else R_yaw @ body.foot_shift(lv, levels[0], q0)
-                jobs, meta = [], []
+                jobs, alt_of, meta = [], [], []
                 for d in dists:
                     for l in lat:
-                        if (float(d), float(l), li) in failed:
+                        p = base + d * nh + l * left
+                        if ((*rel(p), li) if strips else (float(d), float(l), li)) in failed:
                             rejected["failed_placement"] += 1
                             continue
-                        p = base + d * nh + l * left
                         pw = p[:2] - shift
                         if poly is not None:
                             # closed footprint (multi-face): signed distance to it, so a stance behind / beside the stack
@@ -3046,22 +3657,32 @@ class Toolbox:
                                 continue
                         Tc = T_from_xy_yaw(p[0], p[1], yaw, T0[2, 3]) if lv is None else body.T_root(p[0], p[1], yaw, lv)
                         ji = []
-                        for ta in alts:                       # one job per grid point (per look alternative)
-                            ji.append(len(jobs))
-                            jobs.append({"Tc": Tc, "q_lv": q_lv, "t": ta, "finals": finals, "pre_dists": pre_dists,
-                                         "stall": stall, "seed": [int(self.ik.cfg["seed"]), li, len(jobs)]})
+                        for m in members:
+                            mj = []
+                            for ai_, ta in enumerate(m["alts"]):   # one job per grid point (per look alternative)
+                                mj.append(len(jobs))
+                                alt_of.append(ai_)
+                                jobs.append({"Tc": Tc, "q_lv": q_lv, "t": ta, "finals": m["finals"],
+                                             "pre_dists": m["pre_dists"], "stall": stall,
+                                             "seed": [int(self.ik.cfg["seed"]), li, len(jobs)]})
+                            ji.append(mj)
                         meta.append((p, pw, d, l, Tc, ji))
                 # reach prefilter + IK of the required poses + posture, per grid point (tools/stance_eval.py), in the
                 # planning process pool when configured (identical results: per-candidate IK seeds)
                 evs = self._eval_stance_jobs(jobs, body)
                 for (p, pw, d, l, Tc, ji) in meta:
-                    oks = [j for j in ji if evs[j]["status"] == "ok"]
-                    if not oks:
-                        rejected["reach" if all(evs[j]["status"] == "reach" for j in ji) else "ik"] += 1
+                    picks = []
+                    for mj in ji:
+                        oks = [j for j in mj if evs[j]["status"] == "ok"]
+                        if not oks:
+                            rejected["reach" if all(evs[j]["status"] == "reach" for j in mj) else "ik"] += 1
+                            picks = None
+                            break
+                        picks.append(max(oks, key=lambda j_: evs[j_]["man"]))  # the best posture (one: itself)
+                    if picks is None:
                         continue
-                    j = max(oks, key=lambda j_: evs[j_]["man"])  # the alternative with the best posture (one: itself)
-                    ev, ai, ta = evs[j], ji.index(j), alts[ji.index(j)]
-                    sols, gap, m, man = ev["sols"], ev["gap"], ev["margin"], ev["man"]
+                    gap = min(evs[j]["gap"] for j in picks)
+                    man = min(evs[j]["man"] for j in picks)
                     travel = float(np.hypot(pw[0] - T0[0, 3], pw[1] - T0[1, 3]))
                     # arm posture: the position manipulability sqrt(det(Jp Jp^T)) of the scanner-tip Jacobian over the
                     # 7 arm joints, smallest over the required poses (Yoshikawa). It falls towards both singular
@@ -3069,7 +3690,7 @@ class Toolbox:
                     # off) and the folded arm (then chosen by "least extension": elbow up beside the head, joints at
                     # their limits, unnatural and the arm correction diverged) -> the most manipulable pose wins
                     cost = (-gap, -man, travel)              # the preferred pre gap first, then posture, walk
-                    cands.append((cost, p, pw, d, l, m, travel, None, gap, Tc, q_lv, sols, man, ta, ai))
+                    cands.append((cost, p, pw, d, l, travel, Tc, q_lv, picks))
                 # The cost does not depend on the clearances or on robustness, so the candidates are taken in cost order
                 # and the (expensive) checks run only until the first one passes: the same stance as checking every
                 # candidate and picking the cheapest passing one (2026-11-07: the arm-vs-legs check of every
@@ -3078,28 +3699,58 @@ class Toolbox:
                 # stance_robust_*), so the stance is re-checked displaced by it (2026-11-06: a stance at the joint-limit
                 # bound became unreachable by 3 mm after the real walk + squat).
                 for cand in sorted(cands, key=lambda c_: c_[0]):
-                    cost, p, pw, d, l, m, travel, _, gap, Tc, q_lv, sols, man, ta, ai = cand
-                    clear = None
+                    cost, p, pw, d, l, travel, Tc, q_lv, picks = cand
+                    j0 = picks[0]
+                    clear, rej = None, None
                     if body is not None:
-                        fc, sc, rej = self._body_clearance(body, sols, Tc, obstacles, poly)
+                        for mi, j in enumerate(picks):
+                            fc, sc, rej = self._body_clearance(body, evs[j]["sols"], Tc, obstacles, poly)
+                            if rej is not None:
+                                break
+                            if mi == 0:
+                                ta = jobs[j]["t"]
+                                sh = (Tc @ self.kin.pose(q_lv, body.shoulder_frame))[:3, 3]
+                                tip = np.asarray(ta["pos"], float) + (cur["finals"][0] - ta["offset"]) * (-np.asarray(ta["forward"], float))
+                                clear = {"face_m": fc, "arm_leg_m": sc,
+                                         "arm_extension": round(float(np.linalg.norm(tip - sh) / body.arm_reach), 2),
+                                         "manipulability": round(evs[j]["man"], 4)}
                         if rej is not None:
                             rejected[rej] += 1
                             continue
-                        sh = (Tc @ self.kin.pose(q_lv, body.shoulder_frame))[:3, 3]
-                        tip = np.asarray(ta["pos"], float) + (finals[0] - ta["offset"]) * (-np.asarray(ta["forward"], float))
-                        clear = {"face_m": fc, "arm_leg_m": sc, "arm_extension": round(float(np.linalg.norm(tip - sh) / body.arm_reach), 2),
-                                 "manipulability": round(man, 4)}
-                    cand = (cost, p, pw, d, l, m, travel, clear, gap, Tc, q_lv, ai)
+                    out = {"p": p, "pw": pw, "d": d, "l": l, "m": evs[j0]["margin"], "travel": travel, "clear": clear,
+                           "gap": evs[j0]["gap"], "Tc": Tc, "ai": alt_of[j0], "lv": lv, "li": li,
+                           "members": [{"m": m, "ai": alt_of[j], "ev": evs[j]} for m, j in zip(members, picks)]}
                     if fallback is None:
-                        fallback = (cand, lv)
-                    rb = self._stance_robust(ta, Tc, q_lv, finals, None if look else t["offset"] + gap)
+                        fallback = (out, lv)
+                    rb = all(self._stance_robust(jobs[j]["t"], Tc, q_lv, m["finals"],
+                                                 None if m["look"] else m["t"]["offset"] + evs[j]["gap"])
+                             for m, j in zip(members, picks))
                     rejected["not_robust"] += not rb
                     if rb:
-                        best, chosen, chosen_li = cand, lv, li
+                        best, chosen, chosen_li = out, lv, li
                         break
                 cands = []
                 if best is not None:
                     break
+            return best, chosen, chosen_li, fallback
+
+        restarts = self.ik.cfg["restarts"]
+        self.ik.cfg["restarts"] = 1
+        best, chosen, chosen_li, fallback, in_place = None, None, None, None, False
+        try:
+            group = [cur] + (self._stance_group(bc) if strips else [])
+            if strips:
+                # strip mode: first where the robot stands (user decisions 2026-11-20: squat and re-look instead of
+                # walking; every walk adds odometry error), the group first, then the current box alone
+                for members in ([group, [cur]] if len(group) > 1 else [[cur]]):
+                    best = self._in_place_stance(members, levels, body, q0, T0, obstacles, poly, stall, failed)
+                    if best is not None:
+                        chosen, chosen_li, in_place = best["lv"], best["li"], True
+                        break
+            if best is None and len(group) > 1:
+                best, chosen, chosen_li, _ = grid(group)
+            if best is None:
+                best, chosen, chosen_li, fallback = grid([cur])
         finally:
             self.ik.cfg["restarts"] = restarts
         robust = best is not None
@@ -3131,26 +3782,172 @@ class Toolbox:
             bc.status, bc.fail_reason = "unreachable", reason
             return fail(reason, {"unreachable": True, "barcode_id": bc.id, "label_z_m": z, "rejected": rejected,
                                  "levels_tried": len(levels), "exact_stop_only": fallback is not None})
-        _, p, pw, d, l, m, travel, clear, gap, _, _, ai = best
-        self.ws.stance_target = {"pos": [float(pw[0]), float(pw[1])], "yaw": yaw, "face_dist": float(d), "lateral_offset": float(l),
-                                 "barcode_id": bc.id, "travel_m": travel,
-                                 "base_height": None if chosen is None else float(chosen["height_cmd"]),
-                                 "pelvis_pos": [float(p[0]), float(p[1])],
-                                 "pelvis_z": None if chosen is None else float(chosen["pelvis_z"]), "pre_gap": gap,
-                                 "level_index": chosen_li, "target_pos": list(tpos)}
+        p, pw, d, l, m, travel, clear, gap, ai = (best[k] for k in ("p", "pw", "d", "l", "m", "travel", "clear", "gap", "ai"))
+        if strips:
+            d, l = rel(p)                              # the stance's identity relative to the current barcode
+        st = {"pos": [float(pw[0]), float(pw[1])], "yaw": float(best.get("yaw", yaw)), "face_dist": float(d),
+              "lateral_offset": float(l), "barcode_id": bc.id, "travel_m": travel,
+              "base_height": None if chosen is None else float(chosen["height_cmd"]),
+              "pelvis_pos": [float(p[0]), float(p[1])],
+              "pelvis_z": None if chosen is None else float(chosen["pelvis_z"]), "pre_gap": gap,
+              "level_index": chosen_li, "target_pos": list(tpos)}
+        self.ws.stance_target = st
         if look:                                     # only look stances carry these keys (other logs unchanged)
-            self.ws.stance_target.update(purpose="look", look_alt=int(ai),
-                                         look_roll_deg=float(t["alternatives"][ai]["roll_deg"]))
-        self._marker("stance", "red", "root", [pw[0], pw[1], 0.0], yaw=yaw)
+            st.update(purpose="look", look_alt=int(ai), look_roll_deg=float(t["alternatives"][ai]["roll_deg"]))
+        if strips:                                   # strip mode only (other logs unchanged)
+            mem = best["members"]
+            st["serves"] = [x["m"]["bc"].id for x in mem]
+            st["target_pos_by"] = {x["m"]["bc"].id: list(x["m"]["tpos"]) for x in mem}
+            if look:
+                st["look_alts"] = {x["m"]["bc"].id: int(x["ai"]) for x in mem}
+            else:
+                st["pre_gaps"] = {x["m"]["bc"].id: float(x["ev"]["gap"]) for x in mem}
+                st["finals_by"] = {x["m"]["bc"].id: list(x["m"]["finals"]) for x in mem}
+            if in_place:
+                st["in_place"] = self._walk_seq
+        self._marker("stance", "red", "root", [pw[0], pw[1], 0.0], yaw=st["yaw"])
         squat = chosen is not None and chosen is not levels[0]
+        if in_place:
+            msg = ("stance planned where the robot stands (no walk"
+                   + (f"; it squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by "
+                      "itself" if chosen is not None and abs(chosen["height_cmd"] - self.base_height_cmd) > 1e-6 else "")
+                   + "): call approach('stance_target')")
+        else:
+            msg = ("stance planned (the robot has not moved): call approach('stance_target') to walk there"
+                   + (f"; it then squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by itself"
+                      if squat else ""))
         res = ok({"stance_odom": self.ws.stance_target, "joint_limit_margin_rad": m, "clearance": clear,
-                  "squat": squat, "robust": robust, "rejected": rejected},
-                 "stance planned (the robot has not moved): call approach('stance_target') to walk there"
-                 + (f"; it then squats to base_height {chosen['height_cmd']} (pelvis z {chosen['pelvis_z']:.2f} m) by itself"
-                    if squat else ""))
+                  "squat": squat, "robust": robust, "rejected": rejected}, msg)
         if chosen is None:
             return res
         return with_diagnostics(res, {"body_level": "measured" if chosen.get("measured") else "calibration"})
+
+    def _stance_member(self, bc, t) -> dict:
+        """What plan_stance needs of one barcode's wrist target t: the required final distances and the pre-pose
+        distances to try, the target alternatives (a look target: its quarter-roll alternatives), the identity of the
+        target for the failed-stance record, and the grid's base point (the barcode centre on the ground)."""
+        S = self._c2()["stance"]
+        # required final distances: the stand-off, and with a head width (an upper bound of the symbol) also the clamp
+        # min_m, the closest the wrist measurement can bring the final pose. Pre-pose: the configured gap behind the
+        # stand-off is preferred; the pre-pose only has to keep the wrist camera at least as far as the largest
+        # possible final distance (the final move then goes forward), so smaller gaps down to 0 are accepted in
+        # stance-grid steps when the preferred one is out of reach (deep squats, 2026-11-06 stack scene)
+        # With a head width (an upper bound of the symbol: the true stand-off lies in [min_m, offset]) the final
+        # distance is not known yet: the stance must reach the clamp min_m and a pre-pose as far as possible up to
+        # offset + the pre gap, from which the wrist camera measures the code; the final pose then lies between the
+        # two reachable ends (forward, or back if the pre-pose had to be closer than the measured stand-off). A head
+        # stand-off that is out of reach does not veto the stance (2026-11-06 stack scene: the 0.19 m code at the
+        # head's 0.30 m is unreachable in any squat, at the measured 0.20 m it is reachable).
+        c2 = self._c2()
+        S3 = c2["standoff"]
+        gap0 = float(c2["pre_offset_m"] - c2["offset_m"])
+        look = t.get("purpose") == "look"
+        if look:
+            # wall layout, the hand-camera view of a box face (search_cell): the look pose only, approached from home
+            # (no pre-pose); its quarter-roll alternatives tie geometrically, reachability decides (the largest
+            # manipulability, the planner's posture criterion)
+            finals, pre_dists = [float(t["offset"])], []
+        elif S3["mode"] == "adaptive" and bc.width_source != "wrist":
+            # head / hand_label width: an upper bound of the symbol
+            finals = [float(S3["min_m"])]
+            pre_dists = list(np.arange(t["offset"] + gap0, float(S3["min_m"]) - 1e-9, -S["step"]))
+        else:
+            finals = [t["offset"]]
+            pre_dists = list(np.arange(t["offset"] + gap0, t["offset"] - 1e-9, -S["step"]))
+        return {"bc": bc, "t": t, "look": look, "finals": finals, "pre_dists": pre_dists,
+                "alts": [dict(t, pos=a["pos"], long_axis=a["long_axis"]) for a in t["alternatives"]] if look else [t],
+                "tpos": ("look",) if look else _stance_target_key(t["pos"]),
+                "base": np.array([bc.center[0], bc.center[1], 0.0])}
+
+    def _label_target(self, bc) -> dict:
+        """The wrist target compute_wrist_target gives a label entry by default (its stand-off), without the current-id
+        check and without writing ws.wrist_target (plan_stance's row members)."""
+        off = self._standoff(bc)
+        return {"pos": bc.center + off * bc.normal, "forward": -bc.normal, "bar_dir": bc.bar_dir, "offset": off,
+                "barcode_id": bc.id, "long_axis": self._long_axis(bc)}
+
+    def _stance_group(self, bc) -> list:
+        """Strip mode: the other boxes of the current box's strip row one stance may serve (user decision 2026-11-20:
+        one stance per strip row): the pending entries of the same kind (cells for a look stance, labels for a scan
+        stance) in the same strip and row, in plan order, as plan_stance members (_stance_member). A cell member's look
+        target is planned from here (its delta_plan)."""
+        ws, k, row = self.ws, self._entry_strip(bc), bc.wall["cell"][1]
+        out = []
+        for b in ws.scan_plan:
+            m = ws.barcodes[b]
+            if b == bc.id or m.status != "pending" or m.kind != bc.kind or m.wall is None \
+                    or self._entry_strip(m) != k or m.wall["cell"][1] != row:
+                continue
+            if m.kind == "cell":
+                m.wall["delta_plan"] = self._delta_plan(m)
+                out.append(self._stance_member(m, self._look_target(m)))
+            else:
+                out.append(self._stance_member(m, self._label_target(m)))
+        return out
+
+    def _in_place_stance(self, members, levels, body, q0, T0, obstacles, poly, stall, failed):
+        """Strip mode: a stance where the robot stands (its floor position and heading), at every body level highest
+        first: at the current level the measured pose and joints, at another the standing-equivalent position (the
+        pelvis minus the current level's foot shift) plus that level's foot shift. Per member plan_stance's per-point
+        test (the planning IK of the required poses, the pre-pose search, the clearances) WITHOUT the robustness test:
+        it models the walk's arrival error and there is no walk (as _scan_pose_from_here). A level whose in-place
+        stance already failed placement for the current barcode since the last walk is skipped. Returns the first level
+        where every member passes (the plan_stance result dict), else None."""
+        yaw_now = yaw_of(T0)
+        Rn = np.array([[math.cos(yaw_now), -math.sin(yaw_now)], [math.sin(yaw_now), math.cos(yaw_now)]])
+        if body is None:
+            cur_li, pw_now = 0, T0[:2, 3].copy()
+        else:
+            cur_li = next((i for i, lv in enumerate(levels)
+                           if abs(float(lv["height_cmd"]) - float(self.base_height_cmd)) < 1e-9), None)
+            if cur_li is None:                       # the body is at a height that is no planned level
+                return None
+            pw_now = T0[:2, 3] - Rn @ body.foot_shift(levels[cur_li], levels[0], q0)
+        for li, lv in enumerate(levels):
+            if ("in_place", self._walk_seq, li) in failed:
+                continue
+            if li == cur_li:
+                Tc, q_lv = T0, q0
+            else:
+                p = pw_now + Rn @ body.foot_shift(lv, levels[0], q0)
+                Tc, q_lv = body.T_root(p[0], p[1], yaw_now, lv), body.q_at(q0, lv)
+            jobs, owner = [], []
+            for mi, m in enumerate(members):
+                for ai, ta in enumerate(m["alts"]):
+                    owner.append((mi, ai))
+                    jobs.append({"Tc": Tc, "q_lv": q_lv, "t": ta, "finals": m["finals"], "pre_dists": m["pre_dists"],
+                                 "stall": stall, "seed": [int(self.ik.cfg["seed"]), li, len(jobs)]})
+            evs = self._eval_stance_jobs(jobs, body)
+            picks, clear = [], None
+            for mi, m in enumerate(members):
+                oks = [j for j, (o, _) in enumerate(owner) if o == mi and evs[j]["status"] == "ok"]
+                if not oks:
+                    break
+                j = max(oks, key=lambda j_: evs[j_]["man"])
+                if body is not None:
+                    fc, sc, rej = self._body_clearance(body, evs[j]["sols"], Tc, obstacles, poly)
+                    if rej is not None:
+                        break
+                    if mi == 0:
+                        clear = {"face_m": fc, "arm_leg_m": sc, "manipulability": round(evs[j]["man"], 4)}
+                picks.append(j)
+            if len(picks) != len(members):
+                continue
+            j0 = picks[0]
+            return {"p": Tc[:2, 3].copy(), "pw": pw_now, "d": None, "l": None, "m": evs[j0]["margin"], "travel": 0.0,
+                    "clear": clear, "gap": evs[j0]["gap"], "Tc": Tc, "ai": owner[j0][1], "lv": lv, "li": li,
+                    "yaw": yaw_now, "members": [{"m": m, "ai": owner[j][1], "ev": evs[j]} for m, j in zip(members, picks)]}
+        return None
+
+    @staticmethod
+    def _failed_key(bc_id, st) -> tuple:
+        """Identity of a stance that failed placement for barcode bc_id (the _failed_stances record plan_stance skips):
+        (id, its target identity, face distance, lateral offset, level index); an in-place stance (strip mode) is
+        identified by the walk counter it was planned at instead of its position (the same place while no walk)."""
+        tp = tuple((st.get("target_pos_by") or {}).get(bc_id, st["target_pos"]))
+        if st.get("in_place") is not None:
+            return bc_id, tp, "in_place", st["in_place"], st["level_index"]
+        return bc_id, tp, st["face_dist"], st["lateral_offset"], st["level_index"]
 
     def _body_clearance(self, body, sols, Tc, obstacles, poly):
         """Clearances of the arm solutions sols at root pose Tc (plan_stance's checks, in its order): the smallest
@@ -3840,8 +4637,7 @@ class Toolbox:
             if st is not None and st.get("barcode_id") == bc.id:
                 # this stance failed placement for this wrist target: plan_stance will not plan it again for the same
                 # target (identity: barcode, target position, face distance, lateral offset, body level)
-                self._failed_stances.add((bc.id, tuple(st["target_pos"]), st["face_dist"], st["lateral_offset"],
-                                          st["level_index"]))
+                self._failed_stances.add(self._failed_key(bc.id, st))
                 data["failed_stance"] = {k: st[k] for k in ("face_dist", "lateral_offset", "base_height", "level_index")}
             return fail(f"{where}: move_arm('final') did not reach it ({last.get('status')}); re-plan the stance "
                         "(move_arm('home'), compute_wrist_target, plan_stance, approach)", data)

@@ -54,12 +54,18 @@ def git_provenance(path: str) -> dict:
 def subset_eval_args(sc: dict, task: int) -> dict:
     """Evaluator arguments of a task-3 subset scenario: the GT target box ids and the order rule of its target spec; with
     a wall layout the order unit "box" (the agent plans one entry per layout cell; absent otherwise, so the evaluation
-    of every other scenario is the one it was)."""
+    of every other scenario is the one it was); with the order "strips" (a box-lattice order: a wall layout is required)
+    also its strip_columns and the layout's column count (layout_columns, checked against the GT wall)."""
     if task != 3:
         return {}
-    out = {"target_boxes": sc.get("target_boxes"), "order_rule": (sc.get("scan_targets") or {}).get("order", "columns")}
+    st = sc.get("scan_targets") or {}
+    out = {"target_boxes": sc.get("target_boxes"), "order_rule": st.get("order", "columns")}
     if "wall_layout" in sc:
         out["order_unit"] = "box"
+    if out["order_rule"] == "strips":
+        if "wall_layout" not in sc:
+            raise ValueError(f"scenario {sc.get('id')!r}: order 'strips' needs a wall_layout")
+        out.update(strip_columns=st["strip_columns"], layout_columns=sc["wall_layout"]["columns"])
     return out
 
 
@@ -85,6 +91,7 @@ def make_episode_runner(device=None):
         task = sc["task"] if task is None else int(task)
         if task not in TASKS:
             raise ValueError(f"unknown task {task!r} (known: {TASKS})")
+        eval_args = subset_eval_args(sc, task)        # validated before the episode (e.g. "strips" without a layout)
 
         provenance = {"agent": git_provenance(ROOT), "sim": git_provenance(SIM)}
         stage_ws = {}              # harness estimates at a stage, paired with the GT state the eval port stores there
@@ -161,12 +168,18 @@ def make_episode_runner(device=None):
         ws = {"root_target": tb.ws.root_target, "wrist_target": tb.ws.wrist_target, "wrist_target_refined": tb.ws.wrist_target_refined}
         if task == 3:
             ws.update({k: summ[k] for k in ("scan_plan", "scanned", "current_barcode_id")}, **stage_ws)
-        metrics = evaluate(task, gt, actual, ws, stages=stages, scan_log=scan_log, **subset_eval_args(sc, task))
+        metrics = evaluate(task, gt, actual, ws, stages=stages, scan_log=scan_log, **eval_args)
         res = {"scenario": sc["id"], "task": task, "scenario_task": sc["task"], "mode": mode,
                "robot_variant": tb.info["robot_variant"], "head_camera_model": tb.info["head_camera_model"],
                "target_boxes": sc.get("target_boxes"), "scan_targets": sc.get("scan_targets"),
                "head_views": sc.get("head_views"), "phase1_view": sc.get("phase1_view"),
                **({"wall_layout": sc["wall_layout"]} if "wall_layout" in sc else {}),
+               # strip mode: the strip ledger and the wall's anchor / closure / floor-check logs (evidence for the
+               # one-edge registration and the floor fit, design Q1)
+               **({"strip_log": {"strips": tb.ws.strips, "wall": None if tb.ws.wall is None else
+                                 {k: tb.ws.wall.get(k) for k in ("anchor", "closure", "floor_checks", "z0", "delta_lat",
+                                                                 "registration")}}}
+                  if getattr(tb, "strip_mode", False) else {}),
                "provenance": provenance,
                "robot_init": sc.get("robot_init"), "harness_finish": h.finished,
                "orchestrator_error": err, "tool_calls": h.n_calls, "explore_steps": tb.ws.explore_steps,

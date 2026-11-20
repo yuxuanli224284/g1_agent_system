@@ -7,7 +7,10 @@ Task 3 bookkeeping lives here so that the rule and the LLM orchestrators behave 
 - next_barcode ok -> the per-tool failure streaks are reset (retries are per barcode), barcode_end of an unfinished
   barcode (failed), barcode_start of the next one, scan_done when the plan is exhausted;
 - scan resolving the current barcode -> barcode_end;
-- search_cell (wall layout only) -> labels it added extend the budget like planned ones, no_label -> barcode_end;
+- search_cell (wall layout only) -> labels it added extend the budget like planned ones, no_label -> barcode_end; in
+  strip mode also for the other boxes of the row it searched (diagnostics "cells"), whatever the current box's outcome;
+- strip mode (Toolbox.strip_mode): next_barcode strip_done -> stage strip_end (no barcode_start, no fail-streak reset),
+  go_to_next_strip ok -> stage strip_start; finish(success=true) is refused while a later strip holds requested boxes;
 - finish -> the scan ledger and plan statuses are attached and success is computed from the ledger (and the
   stack tour, every requested target cell found and the target count verified, ws.grid_warnings; a box of a wall
   layout recorded no_label is handled, like an unreadable label); finish(success=true)
@@ -117,6 +120,11 @@ class Harness:
             # stays allowed; a refused claim does not end the episode, the tool-call budget still bounds it.
             left = self._task3_work_left()
             if left:
+                if getattr(self.tb, "strip_mode", False):
+                    return {"status": "fail", "data": {}, "rejected": True,
+                            "reason": f"finish(success=true) refused: {left}. Call next_barcode (it gives the next box or "
+                                      "reports strip_done: then go_to_next_strip); finish with success=false only to "
+                                      "give up"}
                 return {"status": "fail", "data": {}, "rejected": True,
                         "reason": f"finish(success=true) refused: {left}. Call next_barcode (it moves to the next barcode "
                                   "or reports face_done for the next side); finish with success=false only to give up"}
@@ -130,6 +138,9 @@ class Harness:
         pending = [b for b in ws.scan_plan if ws.barcodes[b].status == "pending"]
         if pending:
             return f"barcode(s) {', '.join(pending)} still pending"
+        ns = self.tb._next_strip()
+        if ns is not None:
+            return f"strip {ns} of {self.tb.n_strips} still has requested boxes"
         nf = self.tb._next_face()
         if nf is not None:
             return f"the {self.tb.TOUR[nf]} side of the stack has not been visited"
@@ -154,6 +165,8 @@ class Harness:
                 return tb.approach(a["target"])
             if name == "compute_wrist_target":
                 return tb.compute_wrist_target(a["barcode_id"], a["offset"])
+            if name == "set_base_height":       # the tool (strip mode: re-registers the wall after the change)
+                return tb.set_base_height_tool(a["height"])
             fn = getattr(tb, name)
             return fn(**{k: v for k, v in a.items()})
         except Exception as e:             # tool errors go back to the caller as a structured failure, and are logged
@@ -195,6 +208,16 @@ class Harness:
             self.last_approach = {"status": res["status"], "reason": res.get("reason"), "error": d.get("error")}
         if self.task == 3 and name == "plan_stance" and res["status"] == "fail" and (res.get("data") or {}).get("unreachable"):
             self._end_barcode(res["data"]["barcode_id"], "unreachable")     # reported with its reason (stage + log)
+        if self.task == 3 and name == "search_cell":
+            # strip mode: the other boxes of the row searched from this stance (diagnostics "cells"), processed before
+            # the status gate: the current box's outcome can be partial / fail while another box was resolved
+            per = self.base_budget.get("per_barcode")
+            for c in (res.get("diagnostics") or {}).get("cells") or []:
+                if c.get("added") and per is not None:
+                    for k, v in per.items():
+                        self.budget[k] += len(c["added"]) * v
+                if c.get("barcode_status") == "no_label":
+                    self._end_barcode(c["barcode_id"], "no_label")
         if self.task == 3 and name == "scan" and res["status"] != "ok":
             # a label recorded unreadable ends with a failed scan call (no code read): its barcode_end is due here
             cur = self.tb.ws.current_barcode_id
@@ -221,9 +244,10 @@ class Harness:
                 self._stage("face_start", {"face": fid, "normal_odom": None if nrm is None else [round(float(v), 3) for v in nrm],
                                            "n_planned": int(d.get("n", 0))})
         elif name == "next_barcode":
-            if not (d.get("face_done") or d.get("done")):
-                # retries are counted per barcode; a side change (face_done) does not reset them, so a failing
-                # go_to_next_face / plan_scans cycle hits the retry limit (2026-11-07: it looped until the budget)
+            if not (d.get("face_done") or d.get("done") or d.get("strip_done")):
+                # retries are counted per barcode; a side change (face_done) or a strip change (strip_done) does not
+                # reset them, so a failing go_to_next_face / plan_scans (go_to_next_strip) cycle hits the retry limit
+                # (2026-11-07: it looped until the budget)
                 self.fail_streak = {}
             if d.get("closed"):
                 self._end_barcode(d["closed"]["id"], d["closed"]["status"])
@@ -233,8 +257,15 @@ class Harness:
                                                                    if ws.barcodes[b].face_id == fid}})
             if d.get("done"):
                 self._scan_done()
+            elif d.get("strip_done"):
+                self._stage("strip_end", {"strip": d["strip"], "next_strip": d["next_strip"], "t_wall_s":
+                                          round(time.time() - self.t0, 1),
+                                          "statuses": {b: ws.barcodes[b].status for b in ws.scan_plan
+                                                       if self.tb._entry_strip(ws.barcodes[b]) == d["strip"]["strip"]}})
             elif not d.get("face_done"):
                 self._stage("barcode_start", {"id": d["barcode_id"], "index": d["index"]})
+        elif name == "go_to_next_strip":
+            self._stage("strip_start", {"strip": d["strip"], "columns": d["columns"], "t_wall_s": round(time.time() - self.t0, 1)})
         elif name == "scan":
             bc = ws.barcodes.get(ws.current_barcode_id) if ws.current_barcode_id else None
             if bc is not None and bc.status in ("scanned", "duplicate", "unreadable"):
@@ -270,6 +301,7 @@ class Harness:
                        # failed / unreachable / pending are not
                        success=any(s == "scanned" for s in task)
                        and all(s in ("scanned", "unreadable", "no_label") for s in task) and self.tb._next_face() is None
+                       and self.tb._next_strip() is None
                        and not ws.missing_cells() and not ws.grid_warnings(),
                        scanned=[dict(e) for e in ws.scanned], plan_status=statuses)
             if ws.target_grid is not None:

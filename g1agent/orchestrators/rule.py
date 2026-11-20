@@ -207,7 +207,9 @@ class Task2:
             r = h.call("move_arm", {"pose": "home"})
             if r["status"] != "ok":
                 return end(False, False, f"arm home before walking: {r['reason']}")
-        if not h.tb._standing():                   # walking while squatted degrades (toolbox _walk_guard)
+        if not h.tb._standing() and (h.tb.ws.stance_target or {}).get("in_place") is None:
+            # walking while squatted degrades (toolbox _walk_guard); a strip-mode stance planned where the robot stands
+            # has no walk (approach changes the height itself)
             r = h.call("set_base_height", {})
             if r["status"] != "ok":
                 return end(False, False, f"stand up before walking: {r['reason']}")
@@ -315,7 +317,8 @@ class Task3:
     phase1_view "start_pose", the default) or walks to the observation pose compute_obs_pose plans from the spec
     (phase1_view "obs_pose": the task-1 stage, Toolbox.set_phase1_view). With a wall layout (Toolbox.set_wall_layout)
     every planned box is searched with search_cell at its look stance (place_and_scan), no plan update in phase 2, and
-    a box recorded no_label counts as handled."""
+    a box recorded no_label counts as handled; worked in strips (order "strips"), next_barcode's strip_done is followed
+    by go_to_next_strip."""
 
     def __init__(self, h, cfg, selector, explore_policy=None, recovery_policy=None):
         self.h, self.cfg = h, cfg
@@ -365,6 +368,13 @@ class Task3:
                 if g["status"] != "ok":
                     break
                 h.call("plan_scans", {})
+                continue
+            if nb["data"].get("strip_done"):
+                # wall layout worked in strips: the current strip is finished, step to the next one holding requested
+                # boxes (the tool refuses otherwise); a strip that cannot be reached ends the task
+                g = h.call("go_to_next_strip", {})
+                if g["status"] != "ok":
+                    break
                 continue
             # a wall layout fixes the cells: no plan update before standing up
             results.append(self.t2.place_and_scan(nb["data"]["barcode_id"], home_after=True,

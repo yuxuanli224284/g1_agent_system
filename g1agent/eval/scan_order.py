@@ -12,6 +12,11 @@ evaluator never imports algorithm code:
 - Order unit "box" (scenarios with a wall layout, order_boxes_in_frame): the rule is applied to the GT boxes of the
   labels (their labelled faces), grouped into rows / columns by centre containment; labels of one box by the label
   rule (serpentine: in the direction of the box's row).
+- Order rule "strips" (scenario scan_targets.order with scan_targets.strip_columns w, user decision 2026-11-20; order
+  unit "box" only): the ABSOLUTE wall columns (centre-containment groups over every GT box of the wall, not only the
+  expected ones) form strips of w from the left; inside a strip the rows holding expected labels of that strip from the
+  top, the k-th (k = 0 at the strip's top one) left to right when k is even, right to left when k is odd; every strip
+  restarts left to right.
 - Adaptive stand-off: d = label_width / (2 tan(hfov / 2)) / fill, clamped to [d_min, d_max].
 """
 from __future__ import annotations
@@ -31,7 +36,7 @@ def hfov_from_intrinsics(fx: float, width: float) -> float:
     return 2.0 * math.atan(width / 2.0 / fx)
 
 
-ORDER_RULES = ("columns", "rows", "serpentine")
+ORDER_RULES = ("columns", "rows", "serpentine", "strips")
 ORDER_UNITS = ("label", "box")
 
 
@@ -95,6 +100,8 @@ def order_items(items: list[dict], rule: str = "columns") -> list:
         return row_order(items)
     if rule == "serpentine":
         return serpentine_order(items)
+    if rule == "strips":
+        raise ValueError("order 'strips' is defined on the boxes of a wall layout (order unit 'box'), not on labels")
     raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
 
 
@@ -178,7 +185,15 @@ def _containment_groups(items: list[dict], lo: str, hi: str, c: str) -> list[lis
     return sorted(groups.values(), key=lambda g: (-float(np.mean([it[c] for it in g])), min(str(it["key"]) for it in g)))
 
 
-def order_boxes_in_frame(labels: list[dict], boxes: dict, T_world_frame, rule: str = "columns") -> list:
+def _face_item(key, f, T_fw) -> dict:
+    cf = (T_fw[:3, :3] @ f["corners"].T).T + T_fw[:3, 3]
+    cc = T_fw[:3, :3] @ f["center"] + T_fw[:3, 3]
+    return {"key": key, "y_lo": float(cf[:, 1].min()), "y_hi": float(cf[:, 1].max()), "y": float(cc[1]),
+            "z_lo": float(cf[:, 2].min()), "z_hi": float(cf[:, 2].max()), "z": float(cc[2])}
+
+
+def order_boxes_in_frame(labels: list[dict], boxes: dict, T_world_frame, rule: str = "columns",
+                         strip_columns: int | None = None, layout_columns: int | None = None) -> list:
     """Order unit "box": labels [{"key", "center", "normal", "up", "size", "box_id"}] (world), boxes {id: GT box},
     T_world_frame: 4x4 reference frame (the evaluator passes a yaw-only frame). Each label's order item is the face of
     its box that carries it (box_face with the label normal), in the frame. Boxes are grouped into rows (centre z
@@ -186,9 +201,17 @@ def order_boxes_in_frame(labels: list[dict], boxes: dict, T_world_frame, rule: s
     to right). Rule "rows": rows from the top, columns from the left inside a row; "columns": columns from the left,
     rows from the top inside a column; "serpentine": rows from the top, the k-th row (k = 0 at the top, over the rows
     holding labels) left to right when k is even, right to left when k is odd. Labels of one box: the label rule in the
-    same frame (serpentine: row_order in the direction of the box's row). Returns the keys in scan order."""
+    same frame (serpentine: row_order in the direction of the box's row). Returns the keys in scan order.
+    Rule "strips" (strip_columns w required): the columns are the ABSOLUTE wall columns, the centre-containment groups
+    of the faces of EVERY box in `boxes` on the labelled side (the side whose normal the labels share), so a strip does
+    not depend on which boxes are expected; with layout_columns given, a number of column groups other than it is an
+    error (the GT wall is not the layout). strip = column index // w; inside a strip the rows holding expected labels
+    of that strip from the top, the k-th left to right when k is even, else right to left; labels of one box by
+    row_order in its row's direction."""
     if rule not in ORDER_RULES:
         raise ValueError(f"unknown order rule {rule!r} (known: {ORDER_RULES})")
+    if (rule == "strips") != (strip_columns is not None):
+        raise ValueError(f"strip_columns {strip_columns!r} with order {rule!r}: it is required with 'strips' and only there")
     T_fw = np.linalg.inv(np.asarray(T_world_frame, float))
     faces = {}
     for lb in labels:
@@ -196,22 +219,39 @@ def order_boxes_in_frame(labels: list[dict], boxes: dict, T_world_frame, rule: s
         if lb["box_id"] in faces and not np.allclose(faces[lb["box_id"]]["normal"], f["normal"]):
             raise ValueError(f"box {lb['box_id']} carries labels on two faces: order unit 'box' is defined on one face")
         faces[lb["box_id"]] = f
-    items = []
-    for bid, f in faces.items():
-        cf = (T_fw[:3, :3] @ f["corners"].T).T + T_fw[:3, 3]
-        cc = T_fw[:3, :3] @ f["center"] + T_fw[:3, 3]
-        items.append({"key": bid, "y_lo": float(cf[:, 1].min()), "y_hi": float(cf[:, 1].max()), "y": float(cc[1]),
-                      "z_lo": float(cf[:, 2].min()), "z_hi": float(cf[:, 2].max()), "z": float(cc[2])})
+    items = [_face_item(bid, f, T_fw) for bid, f in faces.items()]
     row = {it["key"]: k for k, g in enumerate(_containment_groups(items, "z_lo", "z_hi", "z")) for it in g}
+    yc = {it["key"]: it["y"] for it in items}
+    litems = {it["key"]: it for it in _frame_items(labels, T_world_frame)}
+    if rule == "strips":
+        if not isinstance(strip_columns, int) or isinstance(strip_columns, bool) or strip_columns < 1:
+            raise ValueError(f"order 'strips' needs strip_columns (an integer >= 1), got {strip_columns!r}")
+        normals = {tuple(np.round(f["normal"], 9)) for f in faces.values()}
+        if len(normals) != 1:
+            raise ValueError("order 'strips' is defined on one labelled wall side, the labels lie on several")
+        n = next(iter(faces.values()))["normal"]
+        wall = [_face_item(bid, box_face(b, n), T_fw) for bid, b in boxes.items()]
+        groups = _containment_groups(wall, "y_lo", "y_hi", "y")          # left to right (descending y)
+        if layout_columns is not None and len(groups) != int(layout_columns):
+            raise ValueError(f"the GT wall has {len(groups)} box columns, the wall layout {layout_columns}")
+        col = {it["key"]: k for k, g in enumerate(groups) for it in g}
+        strip = {b: col[b] // strip_columns for b in faces}
+        rank = {b: sorted({row[o] for o in faces if strip[o] == strip[b]}).index(row[b]) for b in faces}
+        l2r = {b: rank[b] % 2 == 0 for b in faces}
+
+        def skey(b):
+            return (strip[b], rank[b], col[b] if l2r[b] else -col[b]), (-yc[b] if l2r[b] else yc[b]), str(b)
+        out = []
+        for b in sorted(faces, key=skey):
+            out += row_order([litems[lb["key"]] for lb in labels if lb["box_id"] == b], l2r[b])
+        return out
     col = {it["key"]: k for k, g in enumerate(_containment_groups(items, "y_lo", "y_hi", "y")) for it in g}
     rows = sorted(set(row.values()))
     l2r = {b: rule != "serpentine" or rows.index(row[b]) % 2 == 0 for b in row}
-    yc = {it["key"]: it["y"] for it in items}
 
     def key(b):
         c = col[b] if l2r[b] else -col[b]
         return ((col[b], row[b]) if rule == "columns" else (row[b], c)), (-yc[b] if l2r[b] else yc[b]), str(b)
-    litems = {it["key"]: it for it in _frame_items(labels, T_world_frame)}
     out = []
     for b in sorted(faces, key=key):
         mine = [litems[lb["key"]] for lb in labels if lb["box_id"] == b]

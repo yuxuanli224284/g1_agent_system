@@ -922,7 +922,8 @@ def test_serpentine_order_matches_evaluator_copy_and_rule():
     assert so.order_items(grid, "rows") == ["a", "b", "c", "d", "e", "f"]
     assert so.order_items(grid, "columns") == ["a", "c", "e", "b", "d", "f"]
     t = so.parse_targets({"columns": "all", "rows_from_bottom": [2, 3, 4], "order": "serpentine"})
-    assert t["order"] == "serpentine" and so.ORDER_RULES == ("columns", "rows", "serpentine")
+    # "strips" (2026-11-20) is a box-lattice rule (order_lattice), refused on label extents
+    assert t["order"] == "serpentine" and so.ORDER_RULES == ("columns", "rows", "serpentine", "strips")
     assert "the next right to left, alternating" in so.order_rule_text("serpentine")
     assert so.order_rule_text("rows") == ("rows of overlapping vertical label extents, top to bottom; left to right inside "
                                           "a row as seen facing this side")

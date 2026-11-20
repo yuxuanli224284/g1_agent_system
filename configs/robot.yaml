@@ -56,6 +56,11 @@ variants:                              # per robot variant (g1_barcode_sim confi
     # identical (29 body joints of both URDFs agree to 2e-8 m), only the left-hand mass differs (bracket + scanner + D405,
     # no gripper); the 4-box scanroom targets (rows 2-3 from the top, z 0.73-0.98 m) are expected to need no squat (unverified)
     body_calibration: assets/gear_body_calibration.json
+    # odometry scale error per metre of net displacement (lateral margin of the strip-mode wall frame between two edge
+    # sightings, toolbox _strip_delta): the simulator's odometry model (g1_barcode_sim configs/robot.yaml
+    # odom.pos_err_per_m 0.02, a per-episode scale on every increment, env.py _post_reset); the real robot's value is
+    # unknown (user answer Q4 2026-11-20: keep the simulator's 2 %)
+    odom_scale_err: 0.02
     head_models: [d435i]               # the upstream camera would sit at the d435_joint origin inside the D435 body on
                                        # this mount (g1_barcode_sim robot_variants.yaml g1_v2 camera.d435i comment)
     perception:

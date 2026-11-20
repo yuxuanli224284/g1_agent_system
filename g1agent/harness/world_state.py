@@ -88,6 +88,11 @@ class WorldState:
                                              #  {"T_odom_wall" (x = right along the wall, y = into the wall, z = up; origin
                                              #  = bottom-left corner of the front face as seen by the robot), "W", "H",
                                              #  "columns", "rows", "box_w", "box_h", "delta_lat", "registration", "history"}
+    strips: dict | None = None               # wall layout worked in strips (Toolbox.strip_mode): the strip ledger
+                                             #  {"width", "n", "current" (the strip the robot works on), "done_reported"
+                                             #  (the strip next_barcode reported finished), "strips": {k: {"columns",
+                                             #  "ref_w" (wall-frame x, y of the strip's reference stance), "ref_source"}},
+                                             #  "moves": [go_to_next_strip records]}; None otherwise
     target_grid: dict | None = None          # with a target spec: {"targets" (scan_order.parse_targets), "edges_seen":
                                              #  [{"face_id", "edge", "pts" (odom), "clear"}], "face_centres":
                                              #  [{"face_id", "center" (odom)}], "fitted_faces": [{"face_id", "face":

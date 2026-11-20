@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import json
 
-from ..harness.registry import (PLAN_SCANS_BODY, PLAN_SCANS_FROM_OBS, PLAN_SCANS_LAYOUT_BODY, TOOLS, openai_tools,
-                                task_tools)
+from ..harness.registry import (PLAN_SCANS_BODY, PLAN_SCANS_FROM_OBS, PLAN_SCANS_LAYOUT_BODY, PLAN_SCANS_STRIP_BODY, TOOLS,
+                                openai_tools, task_tools)
 from ..tools.scan_order import describe_targets
 from .common import clean, image_message, load_prompt, log_llm, tool_result_text
 
@@ -34,11 +34,21 @@ def _prune_images(msgs):
 # the scan order of a target spec in the start message, per order rule (scan_order.ORDER_RULES)
 ORDER_WORDS = {"rows": "row by row from the top, left to right within a row",
                "columns": "column by column from the left, top to bottom within a column",
-               "serpentine": "row by row from the top, the top row left to right, the next right to left, alternating"}
+               "serpentine": "row by row from the top, the top row left to right, the next right to left, alternating",
+               # a template (strip width w): formatted only for the order "strips"
+               "strips": "strip by strip from the left end of the wall, {w} columns per strip; inside a strip row by row "
+                         "from the top, the first row left to right, the next right to left, alternating"}
 # ... and in the phase-1 rules
 ORDER_RULE_WORDS = {"rows": "rows top to bottom, left to right inside a row",
                     "columns": "columns left to right, top to bottom inside a column",
-                    "serpentine": "rows top to bottom, the top row left to right, the next right to left, alternating"}
+                    "serpentine": "rows top to bottom, the top row left to right, the next right to left, alternating",
+                    "strips": "strip by strip from the left end of the wall, {w} columns per strip; inside a strip row "
+                              "by row from the top, the first row left to right, the next right to left, alternating"}
+
+
+def order_words(words: dict, targets: dict) -> str:
+    """The order of a target spec in words (ORDER_WORDS / ORDER_RULE_WORDS); the order "strips" names its width."""
+    return words["strips"].format(w=targets["strip_columns"]) if targets["order"] == "strips" else words[targets["order"]]
 
 
 def _start_text(task, selector, multi_face=False, targets=None, phase1_view="start_pose", lean=True, layout=None):
@@ -51,8 +61,16 @@ def _start_text(task, selector, multi_face=False, targets=None, phase1_view="sta
                  "next_barcode returns face_done and you call go_to_next_face, then plan_scans." if multi_face else
                  " This task covers the side of the boxes facing you only.")
         if targets is not None:
-            head = (f"Start task 3: scan only {describe_targets(targets)}, {ORDER_WORDS[targets['order']]}"
+            head = (f"Start task 3: scan only {describe_targets(targets)}, {order_words(ORDER_WORDS, targets)}"
                     " (the tools fix this order).")
+            if phase1_view == "obs_pose" and layout is not None and targets["order"] == "strips":
+                views = "upright and leaned-back head views" if lean else "upright head views only"
+                return (head + f" The wall layout is given: {layout['columns']} columns x {layout['rows']} rows of boxes, "
+                        f"each {layout['box_w']:g} m wide x {layout['box_h']:g} m tall, standing on the floor. You work in "
+                        f"strips of {targets['strip_columns']} columns from the LEFT end of the wall: walk to the pose "
+                        f"the tools compute at the left end (compute_obs_pose, then approach; {views}): from there the "
+                        "head sees the left side edge. Then plan_scans registers the wall and plans one entry per "
+                        "requested box." + sides)
             if phase1_view == "obs_pose" and layout is not None:
                 views = "upright and leaned-back head views" if lean else "upright head views only"
                 return (head + f" The wall layout is given: {layout['columns']} columns x {layout['rows']} rows of boxes, "
@@ -195,6 +213,52 @@ PHASE2_LOOP_LAYOUT = """- Phase 2: you never choose the order. Each plan entry o
   -> search_cell again (once), then next_barcode. An entry of kind label
   (a second label search_cell added): compute_wrist_target -> plan_stance -> move_arm("home") -> approach -> move_arm("pre")
   -> refine_with_wrist -> move_arm("final") -> refine_with_wrist -> move_arm("final") -> check_wrist_placement -> scan."""
+# wall layout worked in strips (scan_targets order "strips", Toolbox.strip_mode; user decisions 2026-11-20): phase 1 walks
+# to the LEFT end and registers the wall from its left side edge; phase 2 works the strips one after the other
+PHASE1_TARGET_STRIP_GOAL = ("Phase 1 (find): find the box wall in front of you, walk to its LEFT end (the pose the tools "
+                            "compute for the first strip of the given wall layout)\nand register the wall there. The task "
+                            "names the boxes to scan by their place on the wall ({targets}).")
+PHASE1_TARGET_STRIP_RULES = """- Phase 1 sequence: detect_boxes -> select_target_box("all") -> fit_front_face -> compute_obs_pose -> approach ->
+  plan_scans. compute_obs_pose picks the nearest pose from which the {view_text} sees the wall's left side edge and the
+  first strip (from what it has seen so far: first in front of the part of the wall where the left end can be);
+  approach walks there and re-plans as it sees more of the wall.
+- Phase 1 ends when approach returns ok, or partial ("walk finished; arrival check not within tolerance"): in both
+  cases call plan_scans next; do NOT explore to fix a small arrival error (the scan phase plans its own stances).
+  plan_scans registers the wall from its left side edge (front plane, left edge; the floor where in view) and plans
+  one entry of kind cell per requested box, in the fixed order ({order}).
+  If plan_scans reports the left side edge not in view, call compute_obs_pose and approach again, then plan_scans. If
+  compute_obs_pose or plan_scans reports that the wall does not match the layout, explore a little sideways and redo
+  phase 1 once; if it still does not match, finish(success=false).
+  If no box is visible, call look_head and choose an explore move (left / right / back / forward <= 0.5 m,
+  turn_left / turn_right <= 15 deg); {head_view}.{head_view_note}
+  If fit_front_face fails because the boxes are too far (no valid depth), move forward and try again. Explore moves
+  that would end closer than the minimum distance to a box face are refused by the tool."""
+PHASE2_LOOP_STRIP = """- Phase 2: you never choose the order. The wall is worked in strips of {w} columns from the left end; next_barcode
+  reports the strip, its rows and how many boxes of each row are handled. Inside a strip it goes row by row from the
+  top (plan_stance squats lower for lower rows by itself and keeps the robot where it stands when it can); the next
+  strip comes only after the current one is finished. Work only on the current box: next_barcode gives the others.
+  An entry of kind cell is a requested box whose label is not found yet:
+  next_barcode -> compute_wrist_target -> plan_stance -> move_arm("home") -> approach(target="stance_target") (walks
+  or stays, squats, re-registers the wall) -> search_cell (searches the current box and the other boxes this stance was
+  planned for; each label found makes its entry a label) -> move_arm("home") -> then the label path of the current entry.
+  Label path (an entry of kind label): compute_wrist_target -> plan_stance -> move_arm("home") -> approach ->
+  move_arm("pre") -> refine_with_wrist -> move_arm("final") -> refine_with_wrist -> move_arm("final") ->
+  check_wrist_placement -> scan -> move_arm("home").
+  If search_cell says the current label can be scanned from this stance: move_arm("final") -> refine_with_wrist ->
+  move_arm("final") -> check_wrist_placement -> scan instead.
+  search_cell recording "no_label" for a box is a result. search_cell partial, or failing with "hand-camera view not
+  reachable from this stance": move_arm("home"), compute_wrist_target -> plan_stance -> approach -> search_cell again
+  (once), then next_barcode.
+  When next_barcode returns strip_done=true: call go_to_next_strip (never walk to the next strip with explore /
+  approach yourself), then next_barcode. If go_to_next_strip fails: move_arm("home") and call it once more; if it fails
+  again, finish(success=false)."""
+# sentences appended to the tool texts in a strip episode, after LAYOUT_TOOL_NOTES (which stay as they are: they are in
+# the approach-A tool texts)
+STRIP_TOOL_NOTES = {
+    "search_cell": " In strips it also searches the other boxes of the row that this stance was planned for.",
+    "next_barcode": " In strips it returns strip_done=true when the current strip is finished (call go_to_next_strip).",
+    "plan_stance": " In strips it first tries the place where the robot stands (only squatting), then plans one stance "
+                   "for the row's boxes of the strip."}
 # sentences appended to the effective tool texts in a wall-layout episode (run_agent_full)
 LAYOUT_TOOL_NOTES = {
     "compute_wrist_target": " For an entry of kind cell it plans the hand-camera view of the whole box face (call plan_stance, "
@@ -218,7 +282,16 @@ def task3_prompt_kw(tb, lean: bool) -> dict:
         return {"robot_text": tx["robot"], "phase1_goal": PHASE1_ALL_GOAL, "scan_what": "every barcode label on the boxes",
                 "phase1_rules": PHASE1_ALL_RULES.format(head_view=tx["head_view"], head_view_note=note), "success_note": "",
                 "final_refine_note": tx["final_refine_note"], "phase2_loop": loop}
-    order = ORDER_RULE_WORDS[t["order"]]
+    order = order_words(ORDER_RULE_WORDS, t)
+    if getattr(tb, "wall_layout", None) is not None and getattr(tb, "strip_columns", None):
+        return {"robot_text": tx["robot"], "phase1_goal": PHASE1_TARGET_STRIP_GOAL.format(targets=describe_targets(t)),
+                "scan_what": describe_targets(t),
+                "phase1_rules": PHASE1_TARGET_STRIP_RULES.format(
+                    order=order, head_view=tx["head_view"], head_view_note=note,
+                    view_text="head (upright or leaned back)" if lean else "upright head"),
+                "success_note": " and every requested box handled: its label read, or recorded unreadable or no_label",
+                "final_refine_note": tx["final_refine_note"],
+                "phase2_loop": PHASE2_LOOP_STRIP.format(w=t["strip_columns"])}
     if getattr(tb, "wall_layout", None) is not None:
         return {"robot_text": tx["robot"], "phase1_goal": PHASE1_TARGET_LAYOUT_GOAL.format(targets=describe_targets(t)),
                 "scan_what": describe_targets(t),
@@ -262,7 +335,10 @@ def run_agent_full(h, tcfg, selector, llm, log):
     if getattr(h.tb, "scan_targets", None) is not None:
         version += " (target spec)"
     layout = getattr(h.tb, "wall_layout", None) if h.task == 3 else None
-    if layout is not None:
+    strips = layout is not None and getattr(h.tb, "strip_columns", None) is not None
+    if strips:
+        version += " (wall layout, strips)"
+    elif layout is not None:
         version += " (wall layout)"
     tool_texts = dict(h.tb.cfg["robot"]["tool_texts"])
     if h.task == 3 and h.tb.phase1_view == "obs_pose":
@@ -270,9 +346,13 @@ def run_agent_full(h, tcfg, selector, llm, log):
         # pose, for the 4-box scenario, whose tools text stays that of the g1v2-sub4-run1 tag)
         if "plan_scans" in tool_texts:
             raise ValueError("the robot variant replaces the plan_scans text: the obs_pose text cannot be applied")
-        tool_texts["plan_scans"] = PLAN_SCANS_FROM_OBS + (PLAN_SCANS_LAYOUT_BODY if layout is not None else PLAN_SCANS_BODY)
+        tool_texts["plan_scans"] = PLAN_SCANS_FROM_OBS + (PLAN_SCANS_STRIP_BODY if strips else PLAN_SCANS_LAYOUT_BODY
+                                                          if layout is not None else PLAN_SCANS_BODY)
     if layout is not None:
         for name, note_ in LAYOUT_TOOL_NOTES.items():
+            tool_texts[name] = tool_texts.get(name, TOOLS[name][1]) + note_
+    if strips:
+        for name, note_ in STRIP_TOOL_NOTES.items():
             tool_texts[name] = tool_texts.get(name, TOOLS[name][1]) + note_
     names = task_tools(h.task, h.tb)              # the Harness's list: layout-only tools in a layout episode only
     tools = openai_tools(names, tool_texts)

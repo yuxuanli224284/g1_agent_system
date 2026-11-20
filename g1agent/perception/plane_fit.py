@@ -194,8 +194,9 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
        its s within its own tolerance (step 1's rule, on the side face's plane: s = that crossing) of the crossing.
        Otherwise (no side face in view, the run ends at invalid depth, or on a surface farther back) the boundary is
        the depth step at the corner itself: d = 0.
-    6. Per side over the edge rows: median s, MAD, number of rows and the z range.
-    Returns {"left" | "right": {"s", "mad", "n_rows", "z_range"} or None, "seen": [s_min, s_max] over every component
+    6. Per side over the edge rows: median s, MAD, number of rows, the z range and the median optical depth of the
+       edge pixels ("depth": the depth at which the edge's pixel offset converts to metres, strip mode's margin).
+    Returns {"left" | "right": {"s", "mad", "n_rows", "z_range", "depth"} or None, "seen": [s_min, s_max] over every component
     row (None without a component), "rejected": {"left" | "right": {"cut", "front", "floor", "boundary"}} (rows whose
     end was not an edge), "floor_px_removed" (number of "on" pixels removed as floor; None without floor_z), "rows":
     [[row, s_left, s_right, left is edge, right is edge]] (log only)}. Left / right as seen from the camera side (the plane's right axis)."""
@@ -306,7 +307,7 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
             if s is not None:
                 s_all.append(s)
                 if kind == "edge":
-                    samples[side].append((s, zq))
+                    samples[side].append((s, zq, float(zz[y, x])))
             if kind != "edge":
                 out["rejected"][side][kind] += 1
             row[side] = (s, kind == "edge")
@@ -319,5 +320,6 @@ def wall_extent(depth, K, T_root_cam, T_odom_root, plane: dict, cfg: dict | None
             Z = np.array([v[1] for v in samples[side]])
             med = float(np.median(S))
             out[side] = {"s": med, "mad": float(np.median(np.abs(S - med))), "n_rows": int(len(S)),
-                         "z_range": [float(Z.min()), float(Z.max())]}
+                         "z_range": [float(Z.min()), float(Z.max())],
+                         "depth": float(np.median([v[2] for v in samples[side]]))}
     return out

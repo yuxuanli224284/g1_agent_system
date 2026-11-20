@@ -1446,12 +1446,15 @@ def test_plan_stance_width_upper_bound_includes_the_hand_label_width():
     """plan_stance's required final distances: a head or a hand-label width (an upper bound of the symbol) plans the
     clamp min_m and the pre-pose range; only a wrist-measured width plans the stand-off itself."""
     import inspect
-    src = inspect.getsource(tbmod.Toolbox._plan_stance)
+    src = inspect.getsource(tbmod.Toolbox._stance_member)          # plan_stance's required poses (2026-11-20 split)
     assert 'bc.width_source != "wrist"' in src and 'bc.width_source == "head"' not in src
+    assert "self._stance_member(bc, t)" in inspect.getsource(tbmod.Toolbox._plan_stance)
 
 
 def test_harness_registry_layout_tools_leave_the_task_lists_unchanged():
     from g1agent.harness.registry import LAYOUT_ONLY, TASK2_TOOLS, TOOLS
     assert LAYOUT_ONLY == ["search_cell"] and "search_cell" in TOOLS
-    assert TASK_TOOLS[3] == [n for n in TOOLS if n != "search_cell"] and "search_cell" not in TASK2_TOOLS
+    from g1agent.harness.registry import STRIP_ONLY
+    assert STRIP_ONLY == ["go_to_next_strip"]                         # strip episodes only (2026-11-20)
+    assert TASK_TOOLS[3] == [n for n in TOOLS if n not in LAYOUT_ONLY + STRIP_ONLY] and "search_cell" not in TASK2_TOOLS
     assert "no_label" in __import__("g1agent.harness.world_state", fromlist=["x"]).BARCODE_STATUSES
