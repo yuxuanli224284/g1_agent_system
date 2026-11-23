@@ -1,5 +1,19 @@
 # g1_agent_system：G1 人形机器人找码扫码 Agent 系统
 
+<!-- branch-overview:start -->
+> **分支一览**：本仓库按机器人 / 场景分成几个分支，`main` 是通用版，场景专用的改动放在各自分支，不并入 `main`。两个仓库（[g1_barcode_sim](https://github.com/yuxuanli224284/g1_barcode_sim) 仿真、[g1_agent_system](https://github.com/yuxuanli224284/g1_agent_system) agent）要用配套的分支。
+
+| 分支 | 内容 | 状态 | 配套的 g1_barcode_sim 分支 |
+|---|---|---|---|
+| [`main`](https://github.com/yuxuanli224284/g1_agent_system/tree/main) | 通用版 agent：规则状态机或 Qwen3-VL（vLLM）通过工具调用编排找箱、定位条码、走位、扫码；D435i 红外双目立体深度 | 稳定 | [`main`](https://github.com/yuxuanli224284/g1_barcode_sim/tree/main) |
+| [`g1-camera-switch`](https://github.com/yuxuanli224284/g1_agent_system/tree/g1-camera-switch) | 头部相机切换：agent 按机器人报告的相机型号（D435i / 原版单目）自动选设置 | 已合并进 `main`，仅作历史保留 | [`main`](https://github.com/yuxuanli224284/g1_barcode_sim/tree/main) |
+| [`g1v2-scanroom`](https://github.com/yuxuanli224284/g1_agent_system/tree/g1v2-scanroom) | 适配实验室改装版 G1（`g1_v2`）与 5×6 扫码间任务（第 2–4 层逐行扫） | 早期版本，已被下一行取代 | [`g1v2-scanroom`](https://github.com/yuxuanli224284/g1_barcode_sim/tree/g1v2-scanroom) |
+| **`g1v2-scanroom-layout`（当前）** | 在 `g1v2-scanroom` 之上：已知墙面布局、墙面坐标系逐段重新配准、两列一段（strip）扫描、手上 D405 搜箱面 | 最新，18 个码全部扫到（`scanroom6x5_r234_strip_L0`） | [`g1v2-scanroom-layout`](https://github.com/yuxuanli224284/g1_barcode_sim/tree/g1v2-scanroom-layout) |
+| [`t800`](https://github.com/yuxuanli224284/g1_agent_system/tree/t800) | EngineAI T800 Pro 适配（`--robot t800`） | 未完成 | [`t800`](https://github.com/yuxuanli224284/g1_barcode_sim/tree/t800) |
+
+标签：`g1-v1-upstream-cam` = 换 D435i 之前的版本；`g1v2-sub4-run1` = 扫码间 4 箱测试时的状态。
+<!-- branch-overview:end -->
+
 让 Unitree G1 人形机器人在仓库里找到纸箱、定位条码标签、走过去并用左手的手持扫码枪逐个扫码。系统运行在 [g1_barcode_sim](https://github.com/yuxuanli224284/g1_barcode_sim)（Isaac Sim 5.1 / Isaac Lab）仿真环境上：几何计算都放在确定性的工具里，由规则状态机或视觉语言模型（Qwen3-VL-8B，经 vLLM 提供服务）通过工具调用编排。
 
 ![系统总图](docs/images/system_overview.png)
