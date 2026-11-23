@@ -111,13 +111,14 @@ def test_g1_v2_urdf_frames_are_the_simulator_configs():
 def test_g1_v2_urdf_header_and_reexport(tmp_path):
     """The committed asset records its source (path + sha256) and is exactly what the offline exporter writes now."""
     src = open(_v("g1_v2")["robot"]["urdf"]).read()
-    path = re.search(r"source: (\S+)", src).group(1)
+    sys.path.insert(0, os.path.join(config.ROOT, "scripts"))
+    import export_urdf
+    rel = re.search(r"source \(relative to the simulator repository\): (\S+)", src).group(1)
+    path = os.path.join(export_urdf.SIM, rel)
     sha = re.search(r"source sha256: ([0-9a-f]{64})", src).group(1)
     if not os.path.exists(path):
         pytest.skip(f"description URDF {path} not on this machine")
     assert hashlib.sha256(open(path, "rb").read()).hexdigest() == sha, "description URDF changed: re-export the agent URDF"
-    sys.path.insert(0, os.path.join(config.ROOT, "scripts"))
-    import export_urdf
     out = tmp_path / "v2.urdf"
     export_urdf.export_offline("g1_v2", str(out))
     assert out.read_text() == src

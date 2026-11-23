@@ -34,6 +34,21 @@ python scripts/run_task.py --scenario t2_L0_0000 --mode rule             # 桌�
 python scripts/run_task.py --scenario stack4c_L0_0001 --mode agent_full  # 纸箱箱堆，LLM 全程决策
 ```
 
+### 实验室改装版 G1 + 5×6 扫码间（分支 `g1v2-scanroom-layout`）
+
+两个仓库都切到分支 `g1v2-scanroom-layout`（仿真仓库按其文档用 git-lfs 克隆，机器人模型随仓库提供）。机器人型号由 `configs/system.yaml` 的 `sim_server.robot_variant`（默认 `g1_v2`）决定，`G1_ROBOT_VARIANT` 可按服务器覆盖。机器相关的路径（conda 环境目录、HuggingFace 缓存等）写在仓库根目录的 `local.env`（不入库），`scripts/start_*.sh` 和 `scripts/run_batch.sh` 启动时会读取它，例如：
+
+```bash
+# local.env
+export G1_CONDA_PREFIX=/path/to/conda_envs        # conda 环境不是按名字注册时
+export HF_HOME=/path/to/hf_cache
+```
+
+```bash
+python scripts/run_task.py --scenario scanroom6x5_c12r234_strip_L0_0000 --mode agent_full --task 3  # 第一段：左 2 列 × 第 2-4 层，6 个码
+python scripts/run_task.py --scenario scanroom6x5_r234_strip_L0_0000 --mode agent_full --task 3     # 完整：6 列 × 第 2-4 层，18 个码
+```
+
 ## 头部相机：D435i 与原版单目相机
 
 仿真服务器按 `configs/system.yaml` 的 `sim_server.head_camera` 构建头部相机，环境变量 `G1_HEAD_CAMERA` 可以按服务器覆盖它，两种相机的服务器可以同时运行。agent 读取机器人报告的相机型号（robot info `head_camera_model`），自动选用 `configs/robot.yaml` 中 `head_camera.<型号>` 的设置：

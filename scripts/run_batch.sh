@@ -5,8 +5,7 @@
 # usage (detached): CLIENTS='cmd0;cmd1;...' TAG=name setsid nohup bash scripts/run_batch_gpu7.sh > runs/batch_<tag>.out 2>&1 &
 #   one client command per sim instance; each runs with SIM_INSTANCE=i in the g1_agent env, cwd = g1_agent_system.
 cd "$(dirname "$0")/.."
-B=/data/yicheng/HumanoidBarcodeScan
-export PROGRESS_CLIENT_DIR=$HOME/random/switchyard/clients
+[ -f local.env ] && source local.env   # machine-specific settings (G1_CONDA_PREFIX, PROGRESS_CLIENT_DIR, ...), as scripts/start_*.sh
 INST_BASE=${INST_BASE:-0}   # first SIM_INSTANCE (ports + 10*i); use a free range when another batch is running
 TAG=${TAG:?set TAG}; IFS=';' read -ra CLIENTS <<< "${CLIENTS:?set CLIENTS}"; N=${#CLIENTS[@]}
 GPU=${GPU:?set GPU (physical index)}
@@ -42,7 +41,10 @@ done
 echo "SERVERS_READY pids ${SERVERS[*]}"
 
 export G1_EVAL_TOKEN=$(cat runs/.eval_token)
-P=$B/conda_envs/g1_agent/bin/python
+# the harness client env (system.yaml harness_client.conda_env), resolved like the start scripts: $G1_CONDA_PREFIX/<name> or a registered name
+CLIENT_ENV=$(python3 -c "import yaml;print(yaml.safe_load(open('configs/system.yaml'))['harness_client']['conda_env'])")
+P=$(source "$(conda info --base)/etc/profile.d/conda.sh"; set +u; conda activate ${G1_CONDA_PREFIX:+$G1_CONDA_PREFIX/}$CLIENT_ENV && command -v python)
+[ -x "$P" ] || { echo "ABORT client conda env '$CLIENT_ENV' not found (set G1_CONDA_PREFIX in local.env)"; exit 2; }
 CL=()
 for i in $(seq 0 $((N - 1))); do
   # the client's GroundingDINO runs on the approved card too (2026-11-07: without this it defaulted to physical GPU 0,
